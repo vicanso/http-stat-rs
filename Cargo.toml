@@ -1,0 +1,31 @@
+[package]
+name = "http-stat"
+version = "0.1.0"
+authors = ["Tree Xie <tree.xie@outlook.com>"]
+edition = "2021"
+categories = ["multimedia::images"]
+keywords = ["charts", "svg", "plot", "visualization", "graph"]
+description = "A charts library for rust"
+license = "MPL-2.0"
+homepage = "https://github.com/vicanso/http-stat-rs"
+repository = "https://github.com/vicanso/http-stat-rs"
+exclude = ["Cargo.lock"]
+readme = "./README.md"
+rust-version = "1.65"
+
+
+[dependencies]
+bytes = "1.10.1"
+hickory-resolver = { version = "0.25.1", features = ["tokio"] }
+http = "1.3.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.6.0", features = ["full"] }
+hyper-util = { version = "0.1.11", features = ["tokio"] }
+rustls = "0.23.26"
+rustls-native-certs = "0.8.1"
+snafu = "0.8.5"
+tokio = { version = "1.44.2", features = ["rt", "net"] }
+tokio-rustls = { version = "0.26.2", features = [
+    "ring",
+], default-features = false }
+x509-parser = "0.17.0"
