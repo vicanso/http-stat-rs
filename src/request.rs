@@ -28,6 +28,7 @@
 
 use super::error::{Error, Result};
 use bytes::Bytes;
+use heck::ToTrainCase;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
 use http::HeaderMap;
@@ -56,7 +57,6 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use unicode_truncate::Alignment;
 use unicode_truncate::UnicodeTruncateStr;
-// use unicode_width::UnicodeWidthStr;
 
 static ALPN_HTTP2: &str = "h2";
 static ALPN_HTTP1: &str = "http/1.1";
@@ -116,36 +116,44 @@ impl fmt::Display for HttpStat {
             };
             write!(f, "{} {}\n", LightBlue.paint(alpn.to_uppercase()), status)?;
         }
+        if let Some(tls) = &self.tls {
+            write!(f, "{}: {}\n", "tls".to_train_case(), LightBlue.paint(tls))?;
+            write!(
+                f,
+                "{}: {}\n",
+                "cipher".to_train_case(),
+                LightBlue.paint(self.cert_cipher.clone().unwrap_or_default())
+            )?;
+            write!(
+                f,
+                "{}: {}\n",
+                "not before".to_train_case(),
+                LightBlue.paint(self.cert_not_before.clone().unwrap_or_default())
+            )?;
+            write!(
+                f,
+                "{}: {}\n",
+                "not after".to_train_case(),
+                LightBlue.paint(self.cert_not_after.clone().unwrap_or_default())
+            )?;
+            write!(f, "\n")?;
+        }
+
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
                 write!(
                     f,
                     "{}: {}\n",
-                    key,
+                    key.to_string().to_train_case(),
                     LightBlue.paint(value.to_str().unwrap_or_default())
                 )?;
             }
             write!(f, "\n")?;
         }
 
-        if let Some(tls) = &self.tls {
-            write!(f, "tls: {}\n", LightBlue.paint(tls))?;
-            write!(
-                f,
-                "cipher: {}\n",
-                LightBlue.paint(self.cert_cipher.clone().unwrap_or_default())
-            )?;
-            write!(
-                f,
-                "not before: {}\n",
-                LightBlue.paint(self.cert_not_before.clone().unwrap_or_default())
-            )?;
-            write!(
-                f,
-                "not after: {}\n",
-                LightBlue.paint(self.cert_not_after.clone().unwrap_or_default())
-            )?;
-            write!(f, "\n")?;
+        if let Some(body) = &self.body {
+            let text = format!("Body discarded {} bytes", body.len());
+            write!(f, "{} \n", LightBlue.paint(text))?;
         }
 
         let width = 20;
