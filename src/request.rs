@@ -33,12 +33,15 @@ use hickory_resolver::TokioResolver;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Response;
+use http::StatusCode;
 use http::Uri;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use nu_ansi_term::Color::{LightBlue, LightGreen, LightRed};
+use std::fmt;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,6 +54,9 @@ use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+use unicode_truncate::Alignment;
+use unicode_truncate::UnicodeTruncateStr;
+// use unicode_width::UnicodeWidthStr;
 
 static ALPN_HTTP2: &str = "h2";
 static ALPN_HTTP1: &str = "http/1.1";
@@ -64,7 +70,7 @@ pub struct HttpStat {
     pub content_transfer: Option<Duration>,
     pub total: Option<Duration>,
     pub addr: Option<String>,
-    pub status: Option<u16>,
+    pub status: Option<StatusCode>,
     pub tls: Option<String>,
     pub alpn: Option<String>,
     pub cert_not_before: Option<String>,
@@ -74,6 +80,161 @@ pub struct HttpStat {
     pub body: Option<Bytes>,
     pub headers: Option<HeaderMap<HeaderValue>>,
     pub error: Option<String>,
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration > Duration::from_secs(1) {
+        return format!("{:.2}s", duration.as_secs_f64());
+    }
+    if duration > Duration::from_millis(1) {
+        return format!("{}ms", duration.as_millis());
+    }
+    format!("{}µs", duration.as_micros())
+}
+
+struct Timeline {
+    name: String,
+    duration: Duration,
+}
+
+impl fmt::Display for HttpStat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(addr) = &self.addr {
+            write!(
+                f,
+                "{} {}\n\n",
+                LightGreen.paint("Connected to"),
+                LightBlue.paint(addr)
+            )?;
+        }
+        if let Some(status) = &self.status {
+            let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
+            let status = if status.as_u16() < 400 {
+                LightGreen.paint(status.to_string())
+            } else {
+                LightRed.paint(status.to_string())
+            };
+            write!(f, "{} {}\n", LightBlue.paint(alpn.to_uppercase()), status)?;
+        }
+        if let Some(headers) = &self.headers {
+            for (key, value) in headers.iter() {
+                write!(
+                    f,
+                    "{}: {}\n",
+                    key,
+                    LightBlue.paint(value.to_str().unwrap_or_default())
+                )?;
+            }
+            write!(f, "\n")?;
+        }
+
+        if let Some(tls) = &self.tls {
+            write!(f, "tls: {}\n", LightBlue.paint(tls))?;
+            write!(
+                f,
+                "cipher: {}\n",
+                LightBlue.paint(self.cert_cipher.clone().unwrap_or_default())
+            )?;
+            write!(
+                f,
+                "not before: {}\n",
+                LightBlue.paint(self.cert_not_before.clone().unwrap_or_default())
+            )?;
+            write!(
+                f,
+                "not after: {}\n",
+                LightBlue.paint(self.cert_not_after.clone().unwrap_or_default())
+            )?;
+            write!(f, "\n")?;
+        }
+
+        let width = 20;
+
+        let mut timelines = vec![];
+        if let Some(value) = self.dns_lookup {
+            timelines.push(Timeline {
+                name: "DNS Lookup".to_string(),
+                duration: value,
+            });
+        }
+
+        if let Some(value) = self.tcp_connect {
+            timelines.push(Timeline {
+                name: "TCP Connect".to_string(),
+                duration: value,
+            });
+        }
+
+        if let Some(value) = self.tls_handshake {
+            timelines.push(Timeline {
+                name: "TLS Handshake".to_string(),
+                duration: value,
+            });
+        }
+
+        if let Some(value) = self.server_processing {
+            timelines.push(Timeline {
+                name: "Server Processing".to_string(),
+                duration: value,
+            });
+        }
+
+        if let Some(value) = self.content_transfer {
+            timelines.push(Timeline {
+                name: "Content Transfer".to_string(),
+                duration: value,
+            });
+        }
+
+        // print name
+        write!(f, "{}", " ")?;
+        for (i, timeline) in timelines.iter().enumerate() {
+            write!(
+                f,
+                "{}",
+                timeline.name.unicode_pad(width, Alignment::Center, true)
+            )?;
+            if i < timelines.len() - 1 {
+                write!(f, "{}", " ")?;
+            }
+        }
+        write!(f, "\n")?;
+
+        // print duration
+        write!(f, "{}", "[")?;
+        for (i, timeline) in timelines.iter().enumerate() {
+            write!(
+                f,
+                "{}",
+                LightBlue.paint(
+                    format_duration(timeline.duration)
+                        .unicode_pad(width, Alignment::Center, true)
+                        .to_string(),
+                )
+            )?;
+            if i < timelines.len() - 1 {
+                write!(f, "{}", "|")?;
+            }
+        }
+        write!(f, "]\n")?;
+
+        // print | line
+        write!(f, "{}", " ")?;
+        for _ in 0..timelines.len() {
+            write!(f, "{}", " ".repeat(width))?;
+            write!(f, "{}", "|")?;
+        }
+        write!(f, "\n")?;
+
+        write!(f, "{}", " ".repeat(width * timelines.len()))?;
+        write!(
+            f,
+            "total:{}",
+            LightBlue.paint(format_duration(self.total.unwrap_or_default()))
+        )?;
+
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug)]
@@ -302,47 +463,103 @@ async fn send_https2_request(
     Ok(resp)
 }
 
-pub async fn request(http_req: HttpRequest) -> Result<HttpStat> {
+fn finish_with_error(mut stat: HttpStat, error: impl ToString, start: Instant) -> HttpStat {
+    stat.error = Some(error.to_string());
+    stat.total = Some(start.elapsed());
+    stat
+}
+
+pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
     let start = Instant::now();
     let mut stat = HttpStat::default();
-    let (addr, host) = dns_resolve(&http_req, &mut stat).await?;
 
-    let tcp_stream = tcp_connect(addr, &mut stat).await?;
+    // DNS resolution
+    let dns_result = dns_resolve(&http_req, &mut stat).await;
+    let (addr, host) = match dns_result {
+        Ok(result) => result,
+        Err(e) => {
+            return finish_with_error(stat, e, start);
+        }
+    };
+
+    // TCP connection
+    let tcp_stream = match tcp_connect(addr, &mut stat).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            return finish_with_error(stat, e, start);
+        }
+    };
 
     let uri = http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
-    // Send the request
-    let req = Request::builder()
+    // Build the request
+    let req = match Request::builder()
         .uri(&uri)
         .header("Host", host.clone())
         .body(Empty::<Bytes>::new())
-        .map_err(|e| Error::Http { source: e })?;
+    {
+        Ok(req) => req,
+        Err(e) => {
+            return finish_with_error(stat, format!("Failed to build request: {}", e), start);
+        }
+    };
 
     // Create a channel to receive connection errors
     let (tx, mut rx) = oneshot::channel();
 
+    // Send the request based on protocol
     let resp = if is_https {
-        let (tls_stream, is_http2) =
-            tls_handshake(host.clone(), tcp_stream, http_req.alpn_protocols, &mut stat).await?;
+        // TLS handshake
+        let tls_result =
+            tls_handshake(host.clone(), tcp_stream, http_req.alpn_protocols, &mut stat).await;
+        let (tls_stream, is_http2) = match tls_result {
+            Ok(result) => result,
+            Err(e) => {
+                return finish_with_error(stat, e, start);
+            }
+        };
+
+        // Send HTTPS request
         if is_http2 {
-            send_https2_request(req, tls_stream, tx, &mut stat).await?
+            match send_https2_request(req, tls_stream, tx, &mut stat).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return finish_with_error(stat, e, start);
+                }
+            }
         } else {
-            send_https_request(req, tls_stream, tx, &mut stat).await?
+            match send_https_request(req, tls_stream, tx, &mut stat).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return finish_with_error(stat, e, start);
+                }
+            }
         }
     } else {
-        send_http_request(req, tcp_stream, tx, &mut stat).await?
+        // Send HTTP request
+        match send_http_request(req, tcp_stream, tx, &mut stat).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return finish_with_error(stat, e, start);
+            }
+        }
     };
 
-    stat.status = Some(resp.status().into());
+    stat.status = Some(resp.status());
     stat.headers = Some(resp.headers().clone());
+
+    // Read the response body
     let content_transfer_start = Instant::now();
-    // Read and print the response body
-    let body = resp
-        .collect()
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
+    let body_result = resp.collect().await;
+    let body = match body_result {
+        Ok(body) => body,
+        Err(e) => {
+            return finish_with_error(stat, format!("Failed to read response body: {}", e), start);
+        }
+    };
+
     let body_bytes = body.to_bytes();
     stat.body = Some(body_bytes);
     stat.content_transfer = Some(content_transfer_start.elapsed());
@@ -353,5 +570,5 @@ pub async fn request(http_req: HttpRequest) -> Result<HttpStat> {
     }
 
     stat.total = Some(start.elapsed());
-    Ok(stat)
+    stat
 }
