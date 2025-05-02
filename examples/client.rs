@@ -1,4 +1,4 @@
-use http_stat::{request, HttpRequest};
+use http_stat::request;
 
 #[tokio::main]
 async fn main() {
