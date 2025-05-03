@@ -107,9 +107,13 @@ impl fmt::Display for HttpStat {
                 LightBlue.paint(addr)
             )?;
         }
+        if let Some(error) = &self.error {
+            write!(f, "Error: {}\n", LightRed.paint(error))?;
+        }
         if let Some(status) = &self.status {
             let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
-            let status = if status.as_u16() < 400 {
+            let status_code = status.as_u16();
+            let status = if status_code < 400 {
                 LightGreen.paint(status.to_string())
             } else {
                 LightRed.paint(status.to_string())
@@ -151,7 +155,13 @@ impl fmt::Display for HttpStat {
             write!(f, "\n")?;
         }
 
-        if let Some(body) = &self.body {
+        if let Some(status) = &self.status {
+            let status_code = status.as_u16();
+            if status_code >= 400 {
+                let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
+                write!(f, "Body: {}\n", LightRed.paint(body))?;
+            }
+        } else if let Some(body) = &self.body {
             let text = format!("Body discarded {} bytes", body.len());
             write!(f, "{} \n", LightBlue.paint(text))?;
         }
@@ -250,6 +260,7 @@ pub struct HttpRequest {
     pub uri: Uri,
     pub alpn_protocols: Vec<String>,
     pub addr: Option<IpAddr>,
+    pub headers: Option<HeaderMap<HeaderValue>>,
 }
 
 impl TryFrom<&str> for HttpRequest {
@@ -261,6 +272,7 @@ impl TryFrom<&str> for HttpRequest {
             uri,
             alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
             addr: None,
+            headers: None,
         })
     }
 }
@@ -462,6 +474,9 @@ async fn send_https2_request(
         }
     });
 
+    let mut req = req;
+    *req.version_mut() = hyper::Version::HTTP_2;
+
     let server_processing_start = Instant::now();
     let resp = sender
         .send_request(req)
@@ -501,13 +516,22 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
 
     let uri = http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
+    let mut builder = Request::builder().uri(&uri);
+    let mut set_host = false;
+    if let Some(headers) = http_req.headers {
+        for (key, value) in headers.iter() {
+            if key == "Host" {
+                set_host = true;
+            }
+            builder = builder.header(key, value);
+        }
+    }
+    if !set_host {
+        builder = builder.header("Host", host.clone());
+    }
 
     // Build the request
-    let req = match Request::builder()
-        .uri(&uri)
-        .header("Host", host.clone())
-        .body(Empty::<Bytes>::new())
-    {
+    let req = match builder.body(Empty::<Bytes>::new()) {
         Ok(req) => req,
         Err(e) => {
             return finish_with_error(stat, format!("Failed to build request: {}", e), start);

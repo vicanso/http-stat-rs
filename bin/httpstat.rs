@@ -15,7 +15,8 @@
 // limitations under the License.
 
 use clap::Parser;
-use http_stat::request;
+use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http_stat::{request, HttpRequest};
 
 /// HTTP statistics tool
 #[derive(Parser, Debug)]
@@ -24,6 +25,10 @@ struct Args {
     /// URL to request (optional, can be provided as the last argument)
     #[arg(short, long)]
     url: Option<String>,
+
+    /// HTTP headers to set (format: "Header-Name: value")
+    #[arg(short = 'H', help = "HTTP headers to set")]
+    headers: Vec<String>,
 
     /// URL as positional argument
     #[arg(help = "URL to request")]
@@ -39,6 +44,25 @@ async fn main() {
         .or(args.url_arg)
         .expect("URL is required, either via --url or as a positional argument");
 
-    let stat = request(url.as_str().try_into().unwrap()).await;
+    let mut req: HttpRequest = url.as_str().try_into().unwrap();
+
+    // Parse headers if provided
+    if !args.headers.is_empty() {
+        let mut header_map = HeaderMap::new();
+        for header in args.headers {
+            if let Some((name, value)) = header.split_once(':') {
+                let name = name.trim();
+                let value = value.trim();
+                if let Ok(header_name) = name.parse::<HeaderName>() {
+                    if let Ok(header_value) = value.parse::<HeaderValue>() {
+                        header_map.insert(header_name, header_value);
+                    }
+                }
+            }
+        }
+        req.headers = Some(header_map);
+    }
+
+    let stat = request(req).await;
     println!("{}", stat);
 }
