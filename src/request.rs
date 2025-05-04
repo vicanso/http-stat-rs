@@ -128,11 +128,10 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
             .await
             .map_err(|e| Error::Resolve { source: e })?;
         stat.dns_lookup = Some(dns_start.elapsed());
-        let addr = addr.into_iter().next().ok_or(Error::Common {
+        addr.into_iter().next().ok_or(Error::Common {
             category: "http".to_string(),
             message: "dns lookup failed".to_string(),
-        })?;
-        addr
+        })?
     };
     let addr = SocketAddr::new(addr, port);
     stat.addr = Some(addr.to_string());

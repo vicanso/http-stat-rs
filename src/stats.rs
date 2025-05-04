@@ -76,7 +76,7 @@ impl fmt::Display for HttpStat {
             )?;
         }
         if let Some(error) = &self.error {
-            write!(f, "Error: {}\n", LightRed.paint(error))?;
+            writeln!(f, "Error: {}", LightRed.paint(error))?;
         }
         if let Some(status) = &self.status {
             let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
@@ -86,41 +86,41 @@ impl fmt::Display for HttpStat {
             } else {
                 LightRed.paint(status.to_string())
             };
-            write!(f, "{} {}\n", LightBlue.paint(alpn.to_uppercase()), status)?;
+            writeln!(f, "{} {}", LightBlue.paint(alpn.to_uppercase()), status)?;
         }
         if let Some(tls) = &self.tls {
-            write!(f, "{}: {}\n", "tls".to_train_case(), LightBlue.paint(tls))?;
-            write!(
+            writeln!(f, "{}: {}", "tls".to_train_case(), LightBlue.paint(tls))?;
+            writeln!(
                 f,
-                "{}: {}\n",
+                "{}: {}",
                 "cipher".to_train_case(),
                 LightBlue.paint(self.cert_cipher.clone().unwrap_or_default())
             )?;
-            write!(
+            writeln!(
                 f,
-                "{}: {}\n",
+                "{}: {}",
                 "not before".to_train_case(),
                 LightBlue.paint(self.cert_not_before.clone().unwrap_or_default())
             )?;
-            write!(
+            writeln!(
                 f,
-                "{}: {}\n",
+                "{}: {}",
                 "not after".to_train_case(),
                 LightBlue.paint(self.cert_not_after.clone().unwrap_or_default())
             )?;
-            write!(f, "\n")?;
+            writeln!(f)?;
         }
 
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
-                write!(
+                writeln!(
                     f,
-                    "{}: {}\n",
+                    "{}: {}",
                     key.to_string().to_train_case(),
                     LightBlue.paint(value.to_str().unwrap_or_default())
                 )?;
             }
-            write!(f, "\n")?;
+            writeln!(f)?;
         }
 
         if self.body.is_none() {
@@ -128,11 +128,11 @@ impl fmt::Display for HttpStat {
                 let status_code = status.as_u16();
                 if status_code >= 400 {
                     let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
-                    write!(f, "Body: {}\n", LightRed.paint(body))?;
+                    writeln!(f, "Body: {}", LightRed.paint(body))?;
                 }
             } else if let Some(body) = &self.body {
                 let text = format!("Body discarded {} bytes", body.len());
-                write!(f, "{} \n", LightBlue.paint(text))?;
+                writeln!(f, "{}", LightBlue.paint(text))?;
             }
         }
 
@@ -175,7 +175,7 @@ impl fmt::Display for HttpStat {
         }
 
         // print name
-        write!(f, "{}", " ")?;
+        write!(f, " ")?;
         for (i, timeline) in timelines.iter().enumerate() {
             write!(
                 f,
@@ -183,13 +183,13 @@ impl fmt::Display for HttpStat {
                 timeline.name.unicode_pad(width, Alignment::Center, true)
             )?;
             if i < timelines.len() - 1 {
-                write!(f, "{}", " ")?;
+                write!(f, " ")?;
             }
         }
-        write!(f, "\n")?;
+        writeln!(f)?;
 
         // print duration
-        write!(f, "{}", "[")?;
+        write!(f, "[")?;
         for (i, timeline) in timelines.iter().enumerate() {
             write!(
                 f,
@@ -201,18 +201,18 @@ impl fmt::Display for HttpStat {
                 )
             )?;
             if i < timelines.len() - 1 {
-                write!(f, "{}", "|")?;
+                write!(f, "|")?;
             }
         }
-        write!(f, "]\n")?;
+        writeln!(f, "]")?;
 
         // print | line
-        write!(f, "{}", " ")?;
+        write!(f, " ")?;
         for _ in 0..timelines.len() {
             write!(f, "{}", " ".repeat(width))?;
-            write!(f, "{}", "|")?;
+            write!(f, "|")?;
         }
-        write!(f, "\n")?;
+        writeln!(f)?;
 
         write!(f, "{}", " ".repeat(width * timelines.len()))?;
         write!(
