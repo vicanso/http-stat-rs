@@ -20,7 +20,7 @@ use heck::ToTrainCase;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
-use nu_ansi_term::Color::{LightBlue, LightGreen, LightRed};
+use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed};
 use std::fmt;
 use std::time::Duration;
 use unicode_truncate::Alignment;
@@ -72,7 +72,7 @@ impl fmt::Display for HttpStat {
                 f,
                 "{} {}\n\n",
                 LightGreen.paint("Connected to"),
-                LightBlue.paint(addr)
+                LightCyan.paint(addr)
             )?;
         }
         if let Some(error) = &self.error {
@@ -86,27 +86,27 @@ impl fmt::Display for HttpStat {
             } else {
                 LightRed.paint(status.to_string())
             };
-            writeln!(f, "{} {}", LightBlue.paint(alpn.to_uppercase()), status)?;
+            writeln!(f, "{} {}", LightCyan.paint(alpn.to_uppercase()), status)?;
         }
         if let Some(tls) = &self.tls {
-            writeln!(f, "{}: {}", "tls".to_train_case(), LightBlue.paint(tls))?;
+            writeln!(f, "{}: {}", "tls".to_train_case(), LightCyan.paint(tls))?;
             writeln!(
                 f,
                 "{}: {}",
                 "cipher".to_train_case(),
-                LightBlue.paint(self.cert_cipher.clone().unwrap_or_default())
+                LightCyan.paint(self.cert_cipher.clone().unwrap_or_default())
             )?;
             writeln!(
                 f,
                 "{}: {}",
                 "not before".to_train_case(),
-                LightBlue.paint(self.cert_not_before.clone().unwrap_or_default())
+                LightCyan.paint(self.cert_not_before.clone().unwrap_or_default())
             )?;
             writeln!(
                 f,
                 "{}: {}",
                 "not after".to_train_case(),
-                LightBlue.paint(self.cert_not_after.clone().unwrap_or_default())
+                LightCyan.paint(self.cert_not_after.clone().unwrap_or_default())
             )?;
             writeln!(f)?;
         }
@@ -117,22 +117,20 @@ impl fmt::Display for HttpStat {
                     f,
                     "{}: {}",
                     key.to_string().to_train_case(),
-                    LightBlue.paint(value.to_str().unwrap_or_default())
+                    LightCyan.paint(value.to_str().unwrap_or_default())
                 )?;
             }
             writeln!(f)?;
         }
 
-        if self.body.is_none() {
-            if let Some(status) = &self.status {
-                let status_code = status.as_u16();
-                if status_code >= 400 {
-                    let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
-                    writeln!(f, "Body: {}", LightRed.paint(body))?;
-                }
-            } else if let Some(body) = &self.body {
+        if let Some(body) = &self.body {
+            let status = self.status.clone().unwrap_or(StatusCode::OK).as_u16();
+            if status >= 400 {
+                let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
+                writeln!(f, "Body: {}", LightRed.paint(body))?;
+            } else {
                 let text = format!("Body discarded {} bytes", body.len());
-                writeln!(f, "{}", LightBlue.paint(text))?;
+                writeln!(f, "{}", LightCyan.paint(text))?;
             }
         }
 
@@ -194,7 +192,7 @@ impl fmt::Display for HttpStat {
             write!(
                 f,
                 "{}",
-                LightBlue.paint(
+                LightCyan.paint(
                     format_duration(timeline.duration)
                         .unicode_pad(width, Alignment::Center, true)
                         .to_string(),
@@ -218,7 +216,7 @@ impl fmt::Display for HttpStat {
         write!(
             f,
             "total:{}",
-            LightBlue.paint(format_duration(self.total.unwrap_or_default()))
+            LightCyan.paint(format_duration(self.total.unwrap_or_default()))
         )?;
 
         Ok(())

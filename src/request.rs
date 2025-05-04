@@ -56,7 +56,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
     pub uri: Uri,
     pub alpn_protocols: Vec<String>,

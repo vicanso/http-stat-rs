@@ -16,6 +16,8 @@
 
 use clap::Parser;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::StatusCode;
+use http::Uri;
 use http_stat::{request, HttpRequest};
 
 /// HTTP statistics tool
@@ -27,27 +29,34 @@ struct Args {
     url: Option<String>,
 
     /// HTTP headers to set (format: "Header-Name: value")
-    #[arg(short = 'H', help = "HTTP headers to set")]
+    #[arg(
+        short = 'H',
+        help = "set HTTP header; repeatable: -H 'Accept: ...' -H 'Range: ...'"
+    )]
     headers: Vec<String>,
 
     /// Force IPv4
-    #[arg(short = '4', help = "Force IPv4")]
+    #[arg(short = '4', help = "resolve host to ipv4 only")]
     ipv4: bool,
 
-    /// Force IPv4
-    #[arg(short = '6', help = "Force IPv4")]
+    /// Force IPv6
+    #[arg(short = '6', help = "resolve host to ipv6 only")]
     ipv6: bool,
 
     /// Skip verify tls certificate
-    #[arg(short = 'k', help = "Skip verify tls certificate")]
+    #[arg(short = 'k', help = "skip verify tls certificate")]
     skip_verify: bool,
 
     /// Output file
-    #[arg(short = 'o', help = "Output file")]
+    #[arg(short = 'o', help = "output file")]
     output: Option<String>,
 
+    /// follow 30x redirects
+    #[arg(short = 'L', help = "follow 30x redirects")]
+    follow_redirect: bool,
+
     /// URL as positional argument
-    #[arg(help = "URL to request")]
+    #[arg(help = "url to request")]
     url_arg: Option<String>,
 }
 
@@ -88,6 +97,40 @@ async fn main() {
         req.headers = Some(header_map);
     }
 
-    let stat = request(req).await;
+    let mut stat = request(req.clone()).await;
+    if args.follow_redirect {
+        loop {
+            let status = stat.status.unwrap_or(StatusCode::OK);
+            if ![
+                StatusCode::MOVED_PERMANENTLY,
+                StatusCode::FOUND,
+                StatusCode::SEE_OTHER,
+                StatusCode::TEMPORARY_REDIRECT,
+                StatusCode::PERMANENT_REDIRECT,
+            ]
+            .contains(&status)
+            {
+                break;
+            }
+            let redirect_url = stat
+                .headers
+                .as_ref()
+                .and_then(|header| header.get("Location"))
+                .map(|value| value.to_str().unwrap_or(""))
+                .unwrap_or("");
+            if redirect_url.is_empty() {
+                break;
+            }
+            if let Ok(uri) = redirect_url.parse::<Uri>() {
+                req.uri = uri;
+                stat = request(req.clone()).await;
+            }
+        }
+    }
+    // while stat.status_code.is_some_and(|code| code >= 300 && code < 400) {
+    // let redirect_url = stat.redirect_url;
+    // let req = HttpRequest::new(redirect_url);
+    // stat = request(req).await;
+    // }
     println!("{}", stat);
 }
