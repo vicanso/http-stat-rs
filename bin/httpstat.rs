@@ -16,6 +16,7 @@
 
 use clap::Parser;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::Method;
 use http::StatusCode;
 use http::Uri;
 use http_stat::{request, HttpRequest};
@@ -54,6 +55,10 @@ struct Args {
     /// follow 30x redirects
     #[arg(short = 'L', help = "follow 30x redirects")]
     follow_redirect: bool,
+
+    /// HTTP method to use (default GET)
+    #[arg(short = 'X', help = "HTTP method to use (default GET)")]
+    method: Option<String>,
 
     /// URL as positional argument
     #[arg(help = "url to request")]
@@ -96,10 +101,13 @@ async fn main() {
         }
         req.headers = Some(header_map);
     }
+    if let Some(method) = args.method {
+        req.method = Some(method.parse::<Method>().unwrap_or_default());
+    }
 
     let mut stat = request(req.clone()).await;
     if args.follow_redirect {
-        loop {
+        for _ in 0..10 {
             let status = stat.status.unwrap_or(StatusCode::OK);
             if ![
                 StatusCode::MOVED_PERMANENTLY,
@@ -127,10 +135,5 @@ async fn main() {
             }
         }
     }
-    // while stat.status_code.is_some_and(|code| code >= 300 && code < 400) {
-    // let redirect_url = stat.redirect_url;
-    // let req = HttpRequest::new(redirect_url);
-    // stat = request(req).await;
-    // }
     println!("{}", stat);
 }

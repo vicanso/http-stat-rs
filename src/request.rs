@@ -33,11 +33,11 @@ use bytes::Bytes;
 use hickory_resolver::config::LookupIpStrategy;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
-use http::HeaderMap;
 use http::HeaderValue;
 use http::Response;
 use http::Uri;
-use http_body_util::{BodyExt, Empty};
+use http::{HeaderMap, Method};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioExecutor;
@@ -59,12 +59,14 @@ use tokio_rustls::TlsConnector;
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
     pub uri: Uri,
+    pub method: Option<Method>,
     pub alpn_protocols: Vec<String>,
     pub addr: Option<IpAddr>,
     pub headers: Option<HeaderMap<HeaderValue>>,
     pub ip_version: Option<i32>, // -4 for IPv4, -6 for IPv6
     pub skip_verify: bool,
     pub output: Option<String>,
+    pub body: Option<Bytes>,
 }
 
 impl TryFrom<&str> for HttpRequest {
@@ -74,12 +76,14 @@ impl TryFrom<&str> for HttpRequest {
         let uri = url.parse::<Uri>().map_err(|e| Error::Uri { source: e })?;
         Ok(Self {
             uri,
+            method: None,
             alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
             addr: None,
             headers: None,
             ip_version: None,
             skip_verify: false,
             output: None,
+            body: None,
         })
     }
 }
@@ -231,7 +235,7 @@ async fn tls_handshake(
 }
 
 async fn send_http_request(
-    req: Request<Empty<Bytes>>,
+    req: Request<Full<Bytes>>,
     tcp_stream: TcpStream,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
@@ -256,7 +260,7 @@ async fn send_http_request(
 }
 
 async fn send_https_request(
-    req: Request<Empty<Bytes>>,
+    req: Request<Full<Bytes>>,
     tls_stream: TlsStream<TcpStream>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
@@ -281,7 +285,7 @@ async fn send_https_request(
 }
 
 async fn send_https2_request(
-    req: Request<Empty<Bytes>>,
+    req: Request<Full<Bytes>>,
     tls_stream: TlsStream<TcpStream>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
@@ -339,7 +343,9 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
 
     let uri = http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
-    let mut builder = Request::builder().uri(&uri);
+    let mut builder = Request::builder()
+        .uri(&uri)
+        .method(http_req.method.unwrap_or(Method::GET));
     if let Some(headers) = http_req.headers {
         for (key, value) in headers.iter() {
             builder = builder.header(key, value);
@@ -347,7 +353,7 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     }
 
     // Build the request
-    let req = match builder.body(Empty::<Bytes>::new()) {
+    let req = match builder.body(Full::new(http_req.body.unwrap_or_default())) {
         Ok(req) => req,
         Err(e) => {
             return finish_with_error(stat, format!("Failed to build request: {}", e), start);

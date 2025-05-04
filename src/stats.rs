@@ -124,7 +124,7 @@ impl fmt::Display for HttpStat {
         }
 
         if let Some(body) = &self.body {
-            let status = self.status.clone().unwrap_or(StatusCode::OK).as_u16();
+            let status = self.status.unwrap_or(StatusCode::OK).as_u16();
             if status >= 400 {
                 let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
                 writeln!(f, "Body: {}", LightRed.paint(body))?;
