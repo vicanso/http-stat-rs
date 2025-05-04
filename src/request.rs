@@ -27,233 +27,34 @@
 // limitations under the License.
 
 use super::error::{Error, Result};
+use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2};
+use super::SkipVerifier;
 use bytes::Bytes;
-use heck::ToTrainCase;
+use hickory_resolver::config::LookupIpStrategy;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Response;
-use http::StatusCode;
 use http::Uri;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
-use nu_ansi_term::Color::{LightBlue, LightGreen, LightRed};
-use std::fmt;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
-use unicode_truncate::Alignment;
-use unicode_truncate::UnicodeTruncateStr;
-
-static ALPN_HTTP2: &str = "h2";
-static ALPN_HTTP1: &str = "http/1.1";
-
-#[derive(Default, Debug)]
-pub struct HttpStat {
-    pub dns_lookup: Option<Duration>,
-    pub tcp_connect: Option<Duration>,
-    pub tls_handshake: Option<Duration>,
-    pub server_processing: Option<Duration>,
-    pub content_transfer: Option<Duration>,
-    pub total: Option<Duration>,
-    pub addr: Option<String>,
-    pub status: Option<StatusCode>,
-    pub tls: Option<String>,
-    pub alpn: Option<String>,
-    pub cert_not_before: Option<String>,
-    pub cert_not_after: Option<String>,
-    pub cert_cipher: Option<String>,
-    pub cert_domains: Option<Vec<String>>,
-    pub body: Option<Bytes>,
-    pub headers: Option<HeaderMap<HeaderValue>>,
-    pub error: Option<String>,
-}
-
-fn format_duration(duration: Duration) -> String {
-    if duration > Duration::from_secs(1) {
-        return format!("{:.2}s", duration.as_secs_f64());
-    }
-    if duration > Duration::from_millis(1) {
-        return format!("{}ms", duration.as_millis());
-    }
-    format!("{}µs", duration.as_micros())
-}
-
-struct Timeline {
-    name: String,
-    duration: Duration,
-}
-
-impl fmt::Display for HttpStat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(addr) = &self.addr {
-            write!(
-                f,
-                "{} {}\n\n",
-                LightGreen.paint("Connected to"),
-                LightBlue.paint(addr)
-            )?;
-        }
-        if let Some(error) = &self.error {
-            write!(f, "Error: {}\n", LightRed.paint(error))?;
-        }
-        if let Some(status) = &self.status {
-            let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
-            let status_code = status.as_u16();
-            let status = if status_code < 400 {
-                LightGreen.paint(status.to_string())
-            } else {
-                LightRed.paint(status.to_string())
-            };
-            write!(f, "{} {}\n", LightBlue.paint(alpn.to_uppercase()), status)?;
-        }
-        if let Some(tls) = &self.tls {
-            write!(f, "{}: {}\n", "tls".to_train_case(), LightBlue.paint(tls))?;
-            write!(
-                f,
-                "{}: {}\n",
-                "cipher".to_train_case(),
-                LightBlue.paint(self.cert_cipher.clone().unwrap_or_default())
-            )?;
-            write!(
-                f,
-                "{}: {}\n",
-                "not before".to_train_case(),
-                LightBlue.paint(self.cert_not_before.clone().unwrap_or_default())
-            )?;
-            write!(
-                f,
-                "{}: {}\n",
-                "not after".to_train_case(),
-                LightBlue.paint(self.cert_not_after.clone().unwrap_or_default())
-            )?;
-            write!(f, "\n")?;
-        }
-
-        if let Some(headers) = &self.headers {
-            for (key, value) in headers.iter() {
-                write!(
-                    f,
-                    "{}: {}\n",
-                    key.to_string().to_train_case(),
-                    LightBlue.paint(value.to_str().unwrap_or_default())
-                )?;
-            }
-            write!(f, "\n")?;
-        }
-
-        if let Some(status) = &self.status {
-            let status_code = status.as_u16();
-            if status_code >= 400 {
-                let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
-                write!(f, "Body: {}\n", LightRed.paint(body))?;
-            }
-        } else if let Some(body) = &self.body {
-            let text = format!("Body discarded {} bytes", body.len());
-            write!(f, "{} \n", LightBlue.paint(text))?;
-        }
-
-        let width = 20;
-
-        let mut timelines = vec![];
-        if let Some(value) = self.dns_lookup {
-            timelines.push(Timeline {
-                name: "DNS Lookup".to_string(),
-                duration: value,
-            });
-        }
-
-        if let Some(value) = self.tcp_connect {
-            timelines.push(Timeline {
-                name: "TCP Connect".to_string(),
-                duration: value,
-            });
-        }
-
-        if let Some(value) = self.tls_handshake {
-            timelines.push(Timeline {
-                name: "TLS Handshake".to_string(),
-                duration: value,
-            });
-        }
-
-        if let Some(value) = self.server_processing {
-            timelines.push(Timeline {
-                name: "Server Processing".to_string(),
-                duration: value,
-            });
-        }
-
-        if let Some(value) = self.content_transfer {
-            timelines.push(Timeline {
-                name: "Content Transfer".to_string(),
-                duration: value,
-            });
-        }
-
-        // print name
-        write!(f, "{}", " ")?;
-        for (i, timeline) in timelines.iter().enumerate() {
-            write!(
-                f,
-                "{}",
-                timeline.name.unicode_pad(width, Alignment::Center, true)
-            )?;
-            if i < timelines.len() - 1 {
-                write!(f, "{}", " ")?;
-            }
-        }
-        write!(f, "\n")?;
-
-        // print duration
-        write!(f, "{}", "[")?;
-        for (i, timeline) in timelines.iter().enumerate() {
-            write!(
-                f,
-                "{}",
-                LightBlue.paint(
-                    format_duration(timeline.duration)
-                        .unicode_pad(width, Alignment::Center, true)
-                        .to_string(),
-                )
-            )?;
-            if i < timelines.len() - 1 {
-                write!(f, "{}", "|")?;
-            }
-        }
-        write!(f, "]\n")?;
-
-        // print | line
-        write!(f, "{}", " ")?;
-        for _ in 0..timelines.len() {
-            write!(f, "{}", " ".repeat(width))?;
-            write!(f, "{}", "|")?;
-        }
-        write!(f, "\n")?;
-
-        write!(f, "{}", " ".repeat(width * timelines.len()))?;
-        write!(
-            f,
-            "total:{}",
-            LightBlue.paint(format_duration(self.total.unwrap_or_default()))
-        )?;
-
-        Ok(())
-    }
-}
 
 #[derive(Default, Debug)]
 pub struct HttpRequest {
@@ -261,6 +62,9 @@ pub struct HttpRequest {
     pub alpn_protocols: Vec<String>,
     pub addr: Option<IpAddr>,
     pub headers: Option<HeaderMap<HeaderValue>>,
+    pub ip_version: Option<i32>, // -4 for IPv4, -6 for IPv6
+    pub skip_verify: bool,
+    pub output: Option<String>,
 }
 
 impl TryFrom<&str> for HttpRequest {
@@ -273,6 +77,9 @@ impl TryFrom<&str> for HttpRequest {
             alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
             addr: None,
             headers: None,
+            ip_version: None,
+            skip_verify: false,
+            output: None,
         })
     }
 }
@@ -304,9 +111,17 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
         addr
     } else {
         let provider = TokioConnectionProvider::default();
-        let resolver = TokioResolver::builder(provider)
-            .map_err(|e| Error::Resolve { source: e })?
-            .build();
+        let mut builder =
+            TokioResolver::builder(provider).map_err(|e| Error::Resolve { source: e })?;
+        if let Some(ip_version) = req.ip_version {
+            match ip_version {
+                4 => builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only,
+                6 => builder.options_mut().ip_strategy = LookupIpStrategy::Ipv6Only,
+                _ => {}
+            }
+        }
+
+        let resolver = builder.build();
         let dns_start = Instant::now();
         let addr = resolver
             .lookup_ip(&host)
@@ -339,6 +154,7 @@ async fn tls_handshake(
     host: String,
     tcp_stream: TcpStream,
     alpn_protocols: Vec<String>,
+    skip_verify: bool,
     stat: &mut HttpStat,
 ) -> Result<(TlsStream<TcpStream>, bool)> {
     let tls_start = Instant::now();
@@ -353,6 +169,14 @@ async fn tls_handshake(
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
+
+    // Skip certificate verification if requested
+    if skip_verify {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(SkipVerifier));
+    }
+
     config.alpn_protocols = alpn_protocols
         .iter()
         .map(|s| s.as_bytes().to_vec())
@@ -517,17 +341,10 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     let uri = http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
     let mut builder = Request::builder().uri(&uri);
-    let mut set_host = false;
     if let Some(headers) = http_req.headers {
         for (key, value) in headers.iter() {
-            if key == "Host" {
-                set_host = true;
-            }
             builder = builder.header(key, value);
         }
-    }
-    if !set_host {
-        builder = builder.header("Host", host.clone());
     }
 
     // Build the request
@@ -544,8 +361,14 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     // Send the request based on protocol
     let resp = if is_https {
         // TLS handshake
-        let tls_result =
-            tls_handshake(host.clone(), tcp_stream, http_req.alpn_protocols, &mut stat).await;
+        let tls_result = tls_handshake(
+            host.clone(),
+            tcp_stream,
+            http_req.alpn_protocols,
+            http_req.skip_verify,
+            &mut stat,
+        )
+        .await;
         let (tls_stream, is_http2) = match tls_result {
             Ok(result) => result,
             Err(e) => {
@@ -593,7 +416,20 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     };
 
     let body_bytes = body.to_bytes();
-    stat.body = Some(body_bytes);
+    if let Some(output) = http_req.output {
+        match fs::write(output, body_bytes).await {
+            Ok(_) => {}
+            Err(e) => {
+                return finish_with_error(
+                    stat,
+                    format!("Failed to write response body to file: {}", e),
+                    start,
+                );
+            }
+        }
+    } else {
+        stat.body = Some(body_bytes);
+    }
     stat.content_transfer = Some(content_transfer_start.elapsed());
 
     // Check for connection errors

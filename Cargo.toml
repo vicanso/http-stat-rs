@@ -32,7 +32,7 @@ nu-ansi-term = "0.50.1"
 rustls = "0.23.26"
 rustls-native-certs = "0.8.1"
 snafu = "0.8.5"
-tokio = { version = "1.44.2", features = ["rt", "net"] }
+tokio = { version = "1.44.2", features = ["rt", "net", "fs"] }
 tokio-rustls = { version = "0.26.2", features = [
     "ring",
 ], default-features = false }

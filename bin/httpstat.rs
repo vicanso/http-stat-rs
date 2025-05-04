@@ -30,6 +30,22 @@ struct Args {
     #[arg(short = 'H', help = "HTTP headers to set")]
     headers: Vec<String>,
 
+    /// Force IPv4
+    #[arg(short = '4', help = "Force IPv4")]
+    ipv4: bool,
+
+    /// Force IPv4
+    #[arg(short = '6', help = "Force IPv4")]
+    ipv6: bool,
+
+    /// Skip verify tls certificate
+    #[arg(short = 'k', help = "Skip verify tls certificate")]
+    skip_verify: bool,
+
+    /// Output file
+    #[arg(short = 'o', help = "Output file")]
+    output: Option<String>,
+
     /// URL as positional argument
     #[arg(help = "URL to request")]
     url_arg: Option<String>,
@@ -46,6 +62,15 @@ async fn main() {
 
     let mut req: HttpRequest = url.as_str().try_into().unwrap();
 
+    // Set IP version if specified
+    if args.ipv4 {
+        req.ip_version = Some(4);
+    }
+    if args.ipv6 {
+        req.ip_version = Some(6);
+    }
+    req.skip_verify = args.skip_verify;
+    req.output = args.output;
     // Parse headers if provided
     if !args.headers.is_empty() {
         let mut header_map = HeaderMap::new();
