@@ -42,6 +42,7 @@ use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,7 +62,7 @@ pub struct HttpRequest {
     pub uri: Uri,
     pub method: Option<Method>,
     pub alpn_protocols: Vec<String>,
-    pub addr: Option<IpAddr>,
+    pub resolves: Option<HashMap<String, IpAddr>>,
     pub headers: Option<HeaderMap<HeaderValue>>,
     pub ip_version: Option<i32>, // -4 for IPv4, -6 for IPv6
     pub skip_verify: bool,
@@ -78,7 +79,7 @@ impl TryFrom<&str> for HttpRequest {
             uri,
             method: None,
             alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
-            addr: None,
+            resolves: None,
             headers: None,
             ip_version: None,
             skip_verify: false,
@@ -111,32 +112,36 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
         80
     };
     let port = req.uri.port_u16().unwrap_or(default_port);
-    let addr = if let Some(addr) = req.addr {
-        addr
-    } else {
-        let provider = TokioConnectionProvider::default();
-        let mut builder =
-            TokioResolver::builder(provider).map_err(|e| Error::Resolve { source: e })?;
-        if let Some(ip_version) = req.ip_version {
-            match ip_version {
-                4 => builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only,
-                6 => builder.options_mut().ip_strategy = LookupIpStrategy::Ipv6Only,
-                _ => {}
-            }
-        }
 
-        let resolver = builder.build();
-        let dns_start = Instant::now();
-        let addr = resolver
-            .lookup_ip(&host)
-            .await
-            .map_err(|e| Error::Resolve { source: e })?;
-        stat.dns_lookup = Some(dns_start.elapsed());
-        addr.into_iter().next().ok_or(Error::Common {
-            category: "http".to_string(),
-            message: "dns lookup failed".to_string(),
-        })?
-    };
+    // Check if we have a resolve entry for this host:port
+    if let Some(resolves) = &req.resolves {
+        let host_port = format!("{}:{}", host, port);
+        if let Some(ip) = resolves.get(&host_port) {
+            return Ok((SocketAddr::new(*ip, port), host));
+        }
+    }
+
+    let provider = TokioConnectionProvider::default();
+    let mut builder = TokioResolver::builder(provider).map_err(|e| Error::Resolve { source: e })?;
+    if let Some(ip_version) = req.ip_version {
+        match ip_version {
+            4 => builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only,
+            6 => builder.options_mut().ip_strategy = LookupIpStrategy::Ipv6Only,
+            _ => {}
+        }
+    }
+
+    let resolver = builder.build();
+    let dns_start = Instant::now();
+    let addr = resolver
+        .lookup_ip(&host)
+        .await
+        .map_err(|e| Error::Resolve { source: e })?;
+    stat.dns_lookup = Some(dns_start.elapsed());
+    let addr = addr.into_iter().next().ok_or(Error::Common {
+        category: "http".to_string(),
+        message: "dns lookup failed".to_string(),
+    })?;
     let addr = SocketAddr::new(addr, port);
     stat.addr = Some(addr.to_string());
 

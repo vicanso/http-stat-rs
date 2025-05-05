@@ -14,13 +14,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::Bytes;
 use clap::Parser;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::Method;
 use http::StatusCode;
 use http::Uri;
 use http_stat::{request, HttpRequest};
-
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::str::FromStr;
 /// HTTP statistics tool
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -60,9 +63,24 @@ struct Args {
     #[arg(short = 'X', help = "HTTP method to use (default GET)")]
     method: Option<String>,
 
+    /// Data to send
+    #[arg(
+        short = 'd',
+        long = "data",
+        help = "the body of a POST or PUT request; from file use @filename"
+    )]
+    data: Option<String>,
+
     /// URL as positional argument
     #[arg(help = "url to request")]
     url_arg: Option<String>,
+
+    /// Resolve host to specific IP address (format: HOST:PORT:ADDRESS)
+    #[arg(
+        long = "resolve",
+        help = "Resolve host to specific IP address (format: HOST:PORT:ADDRESS, e.g. example.com:80:1.2.3.4)"
+    )]
+    resolve: Vec<String>,
 }
 
 #[tokio::main]
@@ -85,6 +103,20 @@ async fn main() {
     }
     req.skip_verify = args.skip_verify;
     req.output = args.output;
+
+    // Handle resolve parameter
+    if !args.resolve.is_empty() {
+        let mut resolves = HashMap::new();
+        for resolve in args.resolve {
+            if let Some((host_port, ip)) = resolve.rsplit_once(':') {
+                if let Ok(ip_addr) = IpAddr::from_str(ip) {
+                    resolves.insert(host_port.to_string(), ip_addr);
+                }
+            }
+        }
+        req.resolves = Some(resolves);
+    }
+
     // Parse headers if provided
     if !args.headers.is_empty() {
         let mut header_map = HeaderMap::new();
@@ -103,6 +135,10 @@ async fn main() {
     }
     if let Some(method) = args.method {
         req.method = Some(method.parse::<Method>().unwrap_or_default());
+    }
+
+    if let Some(data) = args.data {
+        req.body = Some(Bytes::from(data));
     }
 
     let mut stat = request(req.clone()).await;
