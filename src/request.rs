@@ -117,7 +117,9 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
     if let Some(resolves) = &req.resolves {
         let host_port = format!("{}:{}", host, port);
         if let Some(ip) = resolves.get(&host_port) {
-            return Ok((SocketAddr::new(*ip, port), host));
+            let addr = SocketAddr::new(*ip, port);
+            stat.addr = Some(addr.to_string());
+            return Ok((addr, host));
         }
     }
 
@@ -308,6 +310,8 @@ async fn send_https2_request(
 
     let mut req = req;
     *req.version_mut() = hyper::Version::HTTP_2;
+    // Remove Host header for HTTP/2 as it's replaced by :authority
+    req.headers_mut().remove("Host");
 
     let server_processing_start = Instant::now();
     let resp = sender
@@ -351,10 +355,17 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     let mut builder = Request::builder()
         .uri(&uri)
         .method(http_req.method.unwrap_or(Method::GET));
+    let mut set_host = false;
     if let Some(headers) = http_req.headers {
         for (key, value) in headers.iter() {
             builder = builder.header(key, value);
+            if key.to_string().to_lowercase() == "host" {
+                set_host = true;
+            }
         }
+    }
+    if !set_host {
+        builder = builder.header("Host", host.clone());
     }
 
     // Build the request
