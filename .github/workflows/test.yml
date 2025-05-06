@@ -1,0 +1,51 @@
+name: "publish"
+on:
+  push:
+    # tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    branches: [main]
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        toolchain: [1.81.0, 1.84.0, 1.85.0, stable]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake libclang-dev wget gnupg ca-certificates lsb-release --no-install-recommends 
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Run cargo clippy
+        run: |
+          cargo install typos-cli
+          make lint
+      - name: Run cargo machete
+        run: |
+          cargo install cargo-machete@0.7.0
+          cargo machete
+      - name: Run cargo test
+        run: make test
+      - name: Run cargo msrv
+        run: |
+          cargo install cargo-msrv --version 0.16.3
+          cargo msrv list
+      # - name: Run cargo cov
+      #   run: |
+      #     cargo install cargo-llvm-cov
+      #     cargo llvm-cov
+      - name: Run cargo release
+        run: |
+          make release
+          ldd target/release/pingap
