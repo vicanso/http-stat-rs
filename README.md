@@ -5,15 +5,16 @@ Pure rust version of [httpstat](https://github.com/davecheney/httpstat).
 ![screenshot](./screenshot.png)
 
 
+## Release
+
+[Pre-built binaries](https://github.com/vicanso/http-stat-rs/releases) for windows, macos and linux.
+
 ## Installation
 
 ```
 cargo install http-stat
 ```
 
-## Release
-
-[Pre-built binaries](https://github.com/vicanso/http-stat-rs/releases) for windows, macos and linux.
 
 ## Usage
 ```
