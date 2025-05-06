@@ -43,3 +43,7 @@ Options:
   -h, --help               Print help
   -V, --version            Print version
 ```
+
+## License
+
+http-stats-rs is provided under the MIT license. See [LICENSE](LICENSE).
