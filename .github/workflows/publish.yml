@@ -24,13 +24,13 @@ jobs:
       - name: release
         run: |
           cargo build --release --target=aarch64-apple-darwin
-          mv target/aarch64-apple-darwin/release/httpstat ./httpstat-darwin-aarch64
-          tar -czvf httpstat-darwin-aarch64.tar.gz httpstat-darwin-aarch64
+          mv target/aarch64-apple-darwin/release/httpstat ./httpstat
+          tar -czvf httpstat-darwin-aarch64.tar.gz httpstat
 
         
           cargo build --release --target=x86_64-apple-darwin
-          mv target/x86_64-apple-darwin/release/httpstat ./httpstat-darwin-x86
-          tar -czvf httpstat-darwin-x86.tar.gz httpstat-darwin-x86
+          mv target/x86_64-apple-darwin/release/httpstat ./httpstat
+          tar -czvf httpstat-darwin-x86.tar.gz httpstat
 
 
           ls -lh httpstat*.gz
@@ -51,10 +51,10 @@ jobs:
             apt-get update
             apt-get install protobuf-compiler -y
             make release
-            mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat-linux-musl-x86
+            mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat
       - name: Upload Assets
         run: |
-          tar -czvf httpstat-linux-musl-x86.tar.gz httpstat-linux-musl-x86
+          tar -czvf httpstat-linux-musl-x86.tar.gz httpstat
 
           ls -lh httpstat*.gz
 
@@ -72,10 +72,10 @@ jobs:
           run: |
             apt-get update
             make release
-            mv target/aarch64-unknown-linux-musl/release/httpstat ./httpstat-linux-musl-aarch64
+            mv target/aarch64-unknown-linux-musl/release/httpstat ./httpstat
       - name: Upload Assets
         run: |
-          tar -czvf httpstat-linux-musl-aarch64.tar.gz httpstat-linux-musl-aarch64
+          tar -czvf httpstat-linux-musl-aarch64.tar.gz httpstat
 
           ls -lh httpstat*.gz
 
@@ -129,11 +129,11 @@ jobs:
         run: |
           cargo --version
           cargo build --release 
-          mv target/release/httpstat.exe ./httpstat-windows.exe
+          mv target/release/httpstat.exe ./httpstat.exe
       - name: Zip
         shell: powershell
         run: |
-          Compress-Archive -Path httpstat-windows.exe -Destination httpstat-windows.exe.zip
+          Compress-Archive -Path httpstat.exe -Destination httpstat-windows.exe.zip
       - name: Upload asset
         shell: bash
         run: |

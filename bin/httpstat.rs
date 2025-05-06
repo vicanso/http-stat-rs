@@ -87,10 +87,10 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let url = args
-        .url
-        .or(args.url_arg)
-        .expect("URL is required, either via --url or as a positional argument");
+    let Some(url) = args.url.or(args.url_arg) else {
+        println!("url is required, either via --url or as a positional argument");
+        return;
+    };
 
     let mut req: HttpRequest = url.as_str().try_into().unwrap();
 
