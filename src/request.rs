@@ -57,6 +57,8 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
     pub uri: Uri,
@@ -64,7 +66,7 @@ pub struct HttpRequest {
     pub alpn_protocols: Vec<String>,
     pub resolves: Option<HashMap<String, IpAddr>>,
     pub headers: Option<HeaderMap<HeaderValue>>,
-    pub ip_version: Option<i32>, // -4 for IPv4, -6 for IPv6
+    pub ip_version: Option<i32>, // 4 for IPv4, 6 for IPv6
     pub skip_verify: bool,
     pub output: Option<String>,
     pub body: Option<Bytes>,
@@ -195,15 +197,18 @@ async fn tls_handshake(
     let connector = TlsConnector::from(Arc::new(config));
 
     // Perform TLS handshake
-    let tls_stream = connector
-        .connect(
+    let tls_stream = timeout(
+        Duration::from_secs(30),
+        connector.connect(
             host.clone()
                 .try_into()
                 .map_err(|e| Error::InvalidDnsName { source: e })?,
             tcp_stream,
-        )
-        .await
-        .map_err(|e| Error::Io { source: e })?;
+        ),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Io { source: e })?;
     stat.tls_handshake = Some(tls_start.elapsed());
 
     let (_, session) = tls_stream.get_ref();
@@ -247,9 +252,13 @@ async fn send_http_request(
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream))
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
+    let (mut sender, conn) = timeout(
+        Duration::from_secs(30),
+        hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Hyper { source: e })?;
     // Spawn the connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -272,9 +281,13 @@ async fn send_https_request(
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
+    let (mut sender, conn) = timeout(
+        Duration::from_secs(30),
+        hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Hyper { source: e })?;
     // Spawn the connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -297,10 +310,13 @@ async fn send_https2_request(
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
-    let (mut sender, conn) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
-            .await
-            .map_err(|e| Error::Hyper { source: e })?;
+    let (mut sender, conn) = timeout(
+        Duration::from_secs(30),
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Hyper { source: e })?;
     // Spawn the connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -356,16 +372,22 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
         .uri(&uri)
         .method(http_req.method.unwrap_or(Method::GET));
     let mut set_host = false;
+    let mut set_user_agent = false;
     if let Some(headers) = http_req.headers {
         for (key, value) in headers.iter() {
             builder = builder.header(key, value);
-            if key.to_string().to_lowercase() == "host" {
-                set_host = true;
+            match key.to_string().to_lowercase().as_str() {
+                "host" => set_host = true,
+                "user-agent" => set_user_agent = true,
+                _ => {}
             }
         }
     }
     if !set_host {
         builder = builder.header("Host", host.clone());
+    }
+    if !set_user_agent {
+        builder = builder.header("User-Agent", format!("httpstat.rs/{}", VERSION));
     }
 
     // Build the request
