@@ -11,7 +11,7 @@ homepage = "https://github.com/vicanso/http-stat-rs"
 repository = "https://github.com/vicanso/http-stat-rs"
 exclude = ["Cargo.lock"]
 readme = "./README.md"
-rust-version = "1.81"
+rust-version = "1.82"
 autobins = false
 
 [[bin]]
