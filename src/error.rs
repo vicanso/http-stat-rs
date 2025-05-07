@@ -38,6 +38,12 @@ pub enum Error {
     Hyper { source: hyper::Error },
     #[snafu(display("http error {source}"))]
     Http { source: http::Error },
+    #[snafu(display("quic connect error {source}"))]
+    QuicConnect { source: quinn::ConnectError },
+    #[snafu(display("quic connection error {source}"))]
+    QuicConnection { source: quinn::ConnectionError },
+    #[snafu(display("h3 connection error {source}"))]
+    H3ConnectionError { source: h3::error::ConnectionError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

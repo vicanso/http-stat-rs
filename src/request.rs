@@ -27,19 +27,21 @@
 // limitations under the License.
 
 use super::error::{Error, Result};
-use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2};
+use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
 use super::SkipVerifier;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
+use futures::future;
 use hickory_resolver::config::LookupIpStrategy;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
+use http::request::Builder;
 use http::HeaderValue;
+use http::Request;
 use http::Response;
 use http::Uri;
 use http::{HeaderMap, Method};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::Request;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
@@ -59,6 +61,15 @@ use tokio_rustls::TlsConnector;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn format_tls_protocol(protocol: &str) -> String {
+    match protocol {
+        "TLSv1_3" => "tls v1.3".to_string(),
+        "TLSv1_2" => "tls v1.2".to_string(),
+        "TLSv1_1" => "tls v1.1".to_string(),
+        _ => protocol.to_string(),
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
     pub uri: Uri,
@@ -70,6 +81,36 @@ pub struct HttpRequest {
     pub skip_verify: bool,
     pub output: Option<String>,
     pub body: Option<Bytes>,
+}
+
+impl HttpRequest {
+    fn builder(&self) -> Builder {
+        let uri = &self.uri;
+        let mut builder = Request::builder()
+            .uri(uri)
+            .method(self.method.clone().unwrap_or(Method::GET));
+        let mut set_host = false;
+        let mut set_user_agent = false;
+        if let Some(headers) = &self.headers {
+            for (key, value) in headers.iter() {
+                builder = builder.header(key, value);
+                match key.to_string().to_lowercase().as_str() {
+                    "host" => set_host = true,
+                    "user-agent" => set_user_agent = true,
+                    _ => {}
+                }
+            }
+        }
+        if !set_host {
+            if let Some(host) = uri.host() {
+                builder = builder.header("Host", host);
+            }
+        }
+        if !set_user_agent {
+            builder = builder.header("User-Agent", format!("httpstat.rs/{}", VERSION));
+        }
+        builder
+    }
 }
 
 impl TryFrom<&str> for HttpRequest {
@@ -88,6 +129,15 @@ impl TryFrom<&str> for HttpRequest {
             output: None,
             body: None,
         })
+    }
+}
+
+impl TryFrom<&HttpRequest> for Request<Full<Bytes>> {
+    type Error = Error;
+    fn try_from(req: &HttpRequest) -> Result<Self> {
+        req.builder()
+            .body(Full::new(req.body.clone().unwrap_or_default()))
+            .map_err(|e| Error::Http { source: e })
     }
 }
 
@@ -215,7 +265,7 @@ async fn tls_handshake(
 
     stat.tls = session
         .protocol_version()
-        .map(|v| v.as_str().unwrap_or_default().to_string());
+        .map(|v| format_tls_protocol(v.as_str().unwrap_or_default()));
 
     if let Some(certs) = session.peer_certificates() {
         if let Some(cert) = certs.first() {
@@ -235,7 +285,12 @@ async fn tls_handshake(
         }
     }
     if let Some(cipher) = session.negotiated_cipher_suite() {
-        stat.cert_cipher = Some(format!("{:?}", cipher));
+        let cipher = format!("{:?}", cipher);
+        if let Some((_, cipher)) = cipher.split_once("_") {
+            stat.cert_cipher = Some(cipher.to_string());
+        } else {
+            stat.cert_cipher = Some(cipher);
+        }
     }
     let mut is_http2 = false;
     if let Some(protocol) = session.alpn_protocol() {
@@ -344,8 +399,206 @@ fn finish_with_error(mut stat: HttpStat, error: impl ToString, start: Instant) -
     stat
 }
 
+async fn quic_connect(
+    host: String,
+    addr: SocketAddr,
+    skip_verify: bool,
+    stat: &mut HttpStat,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let quic_start = Instant::now();
+    let mut root_store = RootCertStore::empty();
+    let certs = rustls_native_certs::load_native_certs().certs;
+
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|e| Error::Rustls { source: e })?;
+    }
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    config.enable_early_data = true;
+    config.alpn_protocols = vec![ALPN_HTTP3.as_bytes().to_vec()];
+    // Skip certificate verification if requested
+    if skip_verify {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(SkipVerifier));
+    }
+
+    let mut client_endpoint =
+        h3_quinn::quinn::Endpoint::client("[::]:0".parse().map_err(|_| Error::Common {
+            category: "parse".to_string(),
+            message: "failed to parse address".to_string(),
+        })?)
+        .map_err(|e| Error::Io { source: e })?;
+
+    let h3_config =
+        quinn::crypto::rustls::QuicClientConfig::try_from(config).map_err(|e| Error::Common {
+            category: "quic".to_string(),
+            message: e.to_string(),
+        })?;
+
+    let client_config = quinn::ClientConfig::new(Arc::new(h3_config));
+    client_endpoint.set_default_client_config(client_config);
+
+    let conn = client_endpoint
+        .connect(addr, &host)
+        .map_err(|e| Error::QuicConnect { source: e })?
+        .await
+        .map_err(|e| Error::QuicConnection { source: e })?;
+
+    stat.quic_connect = Some(quic_start.elapsed());
+    Ok((client_endpoint, conn))
+}
+
+async fn http3_request(http_req: HttpRequest) -> HttpStat {
+    let start = Instant::now();
+    let mut stat = HttpStat {
+        alpn: Some(ALPN_HTTP3.to_string()),
+        ..Default::default()
+    };
+
+    // DNS resolution
+    let dns_result = dns_resolve(&http_req, &mut stat).await;
+    let (addr, host) = match dns_result {
+        Ok(result) => result,
+        Err(e) => {
+            return finish_with_error(stat, e, start);
+        }
+    };
+
+    let (client_endpoint, conn) =
+        match quic_connect(host, addr, http_req.skip_verify, &mut stat).await {
+            Ok(result) => result,
+            Err(e) => {
+                return finish_with_error(stat, e, start);
+            }
+        };
+
+    // Get TLS information from the connection
+    stat.tls = Some("tls 1.3".to_string()); // QUIC always uses TLS 1.3
+    stat.alpn = Some(ALPN_HTTP3.to_string()); // We always use HTTP/3 for QUIC
+
+    // Get certificate information from the connection
+    if let Some(peer_identity) = conn.peer_identity() {
+        if let Ok(certs) = peer_identity.downcast::<Vec<rustls::pki_types::CertificateDer>>() {
+            if let Some(cert) = certs.first() {
+                if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+                    let oid_str = match cert.signature_algorithm.algorithm.to_string().as_str() {
+                        "1.2.840.113549.1.1.11" => "AES_256_GCM_SHA384".to_string(),
+                        "1.2.840.113549.1.1.12" => "AES_128_GCM_SHA256".to_string(),
+                        "1.2.840.113549.1.1.13" => "CHACHA20_POLY1305_SHA256".to_string(),
+                        "1.2.840.10045.4.3.2" => "AES_256_GCM_SHA384".to_string(),
+                        "1.2.840.10045.4.3.3" => "AES_128_GCM_SHA256".to_string(),
+                        "1.2.840.10045.4.3.4" => "CHACHA20_POLY1305_SHA256".to_string(),
+                        "1.3.101.112" => "AES_256_GCM_SHA384".to_string(),
+                        "1.3.101.113" => "AES_128_GCM_SHA256".to_string(),
+                        _ => format!("{:?}", cert.signature_algorithm.algorithm),
+                    };
+                    stat.cert_cipher = Some(oid_str);
+                    stat.cert_not_before = Some(cert.validity().not_before.to_string());
+                    stat.cert_not_after = Some(cert.validity().not_after.to_string());
+                    if let Ok(Some(sans)) = cert.subject_alternative_name() {
+                        let mut domains = Vec::new();
+                        for san in sans.value.general_names.iter() {
+                            if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
+                                domains.push(domain.to_string());
+                            }
+                        }
+                        stat.cert_domains = Some(domains);
+                    };
+                }
+            }
+        }
+    }
+
+    let quinn_conn = h3_quinn::Connection::new(conn);
+
+    let (mut driver, mut send_request) = match h3::client::new(quinn_conn)
+        .await
+        .map_err(|e| Error::H3ConnectionError { source: e })
+    {
+        Ok(result) => result,
+        Err(e) => {
+            return finish_with_error(stat, e, start);
+        }
+    };
+
+    let req = match http_req.builder().body(()) {
+        Ok(req) => req,
+        Err(e) => {
+            return finish_with_error(stat, e, start);
+        }
+    };
+    let body = http_req.body.unwrap_or_default();
+
+    let drive = async move {
+        Err::<(), h3::error::ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
+    };
+
+    let request = async move {
+        let mut stream = send_request.send_request(req).await?;
+        stream.send_data(body).await?;
+
+        let mut sub_stat = HttpStat::default();
+
+        // finish on the sending side
+        stream.finish().await?;
+
+        let server_processing_start = Instant::now();
+
+        let resp = stream.recv_response().await?;
+        sub_stat.server_processing = Some(server_processing_start.elapsed());
+
+        sub_stat.status = Some(resp.status());
+        sub_stat.headers = Some(resp.headers().clone());
+
+        let content_transfer_start = Instant::now();
+        let mut buf = BytesMut::new();
+        while let Some(chunk) = stream.recv_data().await? {
+            buf.extend(chunk.chunk());
+        }
+        sub_stat.content_transfer = Some(content_transfer_start.elapsed());
+        sub_stat.body = Some(Bytes::from(buf));
+
+        Ok::<HttpStat, h3::error::StreamError>(sub_stat)
+    };
+
+    let (req_res, drive_res) = tokio::join!(request, drive);
+    match req_res {
+        Ok(sub_stat) => {
+            stat.server_processing = sub_stat.server_processing;
+            stat.content_transfer = sub_stat.content_transfer;
+            stat.status = sub_stat.status;
+            stat.headers = sub_stat.headers;
+            stat.body = sub_stat.body;
+        }
+        Err(err) => {
+            if !err.is_h3_no_error() {
+                stat.error = Some(err.to_string());
+            }
+        }
+    }
+    if let Err(err) = drive_res {
+        if !err.is_h3_no_error() {
+            stat.error = Some(err.to_string());
+        }
+    }
+
+    stat.total = Some(start.elapsed());
+    client_endpoint.wait_idle().await;
+
+    stat
+}
+
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
+
+    if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
+        return http3_request(http_req).await;
+    }
+
     let start = Instant::now();
     let mut stat = HttpStat::default();
 
@@ -358,43 +611,21 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
-    // TCP connection
-    let tcp_stream = match tcp_connect(addr, &mut stat).await {
-        Ok(stream) => stream,
+    let uri = &http_req.uri;
+    let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
+
+    let req: Request<Full<Bytes>> = match (&http_req).try_into() {
+        Ok(req) => req,
         Err(e) => {
             return finish_with_error(stat, e, start);
         }
     };
 
-    let uri = http_req.uri;
-    let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
-    let mut builder = Request::builder()
-        .uri(&uri)
-        .method(http_req.method.unwrap_or(Method::GET));
-    let mut set_host = false;
-    let mut set_user_agent = false;
-    if let Some(headers) = http_req.headers {
-        for (key, value) in headers.iter() {
-            builder = builder.header(key, value);
-            match key.to_string().to_lowercase().as_str() {
-                "host" => set_host = true,
-                "user-agent" => set_user_agent = true,
-                _ => {}
-            }
-        }
-    }
-    if !set_host {
-        builder = builder.header("Host", host.clone());
-    }
-    if !set_user_agent {
-        builder = builder.header("User-Agent", format!("httpstat.rs/{}", VERSION));
-    }
-
-    // Build the request
-    let req = match builder.body(Full::new(http_req.body.unwrap_or_default())) {
-        Ok(req) => req,
+    // TCP connection
+    let tcp_stream = match tcp_connect(addr, &mut stat).await {
+        Ok(stream) => stream,
         Err(e) => {
-            return finish_with_error(stat, format!("Failed to build request: {}", e), start);
+            return finish_with_error(stat, e, start);
         }
     };
 

@@ -20,10 +20,11 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::Method;
 use http::StatusCode;
 use http::Uri;
-use http_stat::{request, HttpRequest};
+use http_stat::{request, HttpRequest, ALPN_HTTP2, ALPN_HTTP3};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
+
 /// HTTP statistics tool
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -81,6 +82,14 @@ struct Args {
         help = "Resolve host to specific IP address (format: HOST:PORT:ADDRESS, e.g. example.com:80:1.2.3.4)"
     )]
     resolve: Vec<String>,
+
+    /// HTTP/3
+    #[arg(long = "http3", help = "use http/3")]
+    http3: bool,
+
+    /// HTTP/2
+    #[arg(long = "http2", help = "use http/2")]
+    http2: bool,
 }
 
 #[tokio::main]
@@ -139,6 +148,13 @@ async fn main() {
 
     if let Some(data) = args.data {
         req.body = Some(Bytes::from(data));
+    }
+
+    if args.http2 {
+        req.alpn_protocols = vec![ALPN_HTTP2.to_string()];
+    }
+    if args.http3 {
+        req.alpn_protocols = vec![ALPN_HTTP3.to_string()];
     }
 
     let mut stat = request(req.clone()).await;

@@ -1,6 +1,11 @@
 # http-stat-rs
 
-Pure rust version of [httpstat](https://github.com/davecheney/httpstat).
+Imitation is the sincerest form of flattery.
+
+Pure rust version of http statistics, which refer to [httpstat](https://github.com/davecheney/httpstat).It supports http1, http2 and http3.
+
+
+[中文](./README_zh.md)
 
 ![screenshot](./screenshot.png)
 
@@ -18,12 +23,14 @@ cargo install http-stat
 
 ## Usage
 ```
-httpstat https://www.baidu.com
+httpstat --http3 https://cloudflare-quic.com/
 ```
 
 ## Features
 
 ```bash
+httpstat visualizes curl(1) statistics in a way of beauty and clarity.
+
 Usage: httpstat [OPTIONS] [URL_ARG]
 
 Arguments:
@@ -40,6 +47,8 @@ Options:
   -X <METHOD>              HTTP method to use (default GET)
   -d, --data <DATA>        the body of a POST or PUT request; from file use @filename
       --resolve <RESOLVE>  Resolve host to specific IP address (format: HOST:PORT:ADDRESS, e.g. example.com:80:1.2.3.4)
+      --http3              use http/3
+      --http2              use http/2
   -h, --help               Print help
   -V, --version            Print version
 ```

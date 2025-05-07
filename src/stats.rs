@@ -28,6 +28,7 @@ use unicode_truncate::UnicodeTruncateStr;
 
 pub static ALPN_HTTP2: &str = "h2";
 pub static ALPN_HTTP1: &str = "http/1.1";
+pub static ALPN_HTTP3: &str = "h3";
 
 fn format_duration(duration: Duration) -> String {
     if duration > Duration::from_secs(1) {
@@ -47,6 +48,7 @@ struct Timeline {
 #[derive(Default, Debug)]
 pub struct HttpStat {
     pub dns_lookup: Option<Duration>,
+    pub quic_connect: Option<Duration>,
     pub tcp_connect: Option<Duration>,
     pub tls_handshake: Option<Duration>,
     pub server_processing: Option<Duration>,
@@ -154,6 +156,12 @@ impl fmt::Display for HttpStat {
         if let Some(value) = self.tls_handshake {
             timelines.push(Timeline {
                 name: "TLS Handshake".to_string(),
+                duration: value,
+            });
+        }
+        if let Some(value) = self.quic_connect {
+            timelines.push(Timeline {
+                name: "QUIC Connect".to_string(),
                 duration: value,
             });
         }
