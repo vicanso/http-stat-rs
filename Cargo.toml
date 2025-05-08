@@ -1,6 +1,6 @@
 [package]
 name = "http-stat"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Tree Xie <tree.xie@outlook.com>"]
 edition = "2021"
 categories = ["multimedia::images"]
