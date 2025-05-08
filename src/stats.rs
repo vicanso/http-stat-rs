@@ -16,6 +16,7 @@
 // limitations under the License.
 
 use bytes::Bytes;
+use bytesize::ByteSize;
 use heck::ToTrainCase;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -131,7 +132,7 @@ impl fmt::Display for HttpStat {
                 let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
                 writeln!(f, "Body: {}", LightRed.paint(body))?;
             } else {
-                let text = format!("Body discarded {} bytes", body.len());
+                let text = format!("Body discarded {}", ByteSize(body.len() as u64));
                 writeln!(f, "{}", LightCyan.paint(text))?;
             }
         }

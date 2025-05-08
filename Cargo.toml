@@ -46,6 +46,8 @@ unicode-truncate = "2.0.0"
 x509-parser = "0.17.0"
 h3 = "0.0.8"
 futures = "0.3.31"
+bytesize = "2.0.1"
+chrono = "0.4.41"
 
 
 [profile.release]

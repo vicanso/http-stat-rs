@@ -30,6 +30,7 @@ use super::error::{Error, Result};
 use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
 use super::SkipVerifier;
 use bytes::{Buf, Bytes, BytesMut};
+use chrono::{Local, TimeZone};
 use futures::future;
 use hickory_resolver::config::LookupIpStrategy;
 use hickory_resolver::name_server::TokioConnectionProvider;
@@ -68,6 +69,11 @@ fn format_tls_protocol(protocol: &str) -> String {
         "TLSv1_1" => "tls v1.1".to_string(),
         _ => protocol.to_string(),
     }
+}
+fn format_time(timestamp_seconds: i64) -> String {
+    Local
+        .timestamp_nanos(timestamp_seconds * 1_000_000_000)
+        .to_string()
 }
 
 #[derive(Default, Debug, Clone)]
@@ -187,9 +193,9 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
 
     let resolver = builder.build();
     let dns_start = Instant::now();
-    let addr = resolver
-        .lookup_ip(&host)
+    let addr = timeout(Duration::from_secs(10), resolver.lookup_ip(&host))
         .await
+        .map_err(|e| Error::Timeout { source: e })?
         .map_err(|e| Error::Resolve { source: e })?;
     stat.dns_lookup = Some(dns_start.elapsed());
     let addr = addr.into_iter().next().ok_or(Error::Common {
@@ -270,8 +276,8 @@ async fn tls_handshake(
     if let Some(certs) = session.peer_certificates() {
         if let Some(cert) = certs.first() {
             if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
-                stat.cert_not_before = Some(cert.validity().not_before.to_string());
-                stat.cert_not_after = Some(cert.validity().not_after.to_string());
+                stat.cert_not_before = Some(format_time(cert.validity().not_before.timestamp()));
+                stat.cert_not_after = Some(format_time(cert.validity().not_after.timestamp()));
                 if let Ok(Some(sans)) = cert.subject_alternative_name() {
                     let mut domains = Vec::new();
                     for san in sans.value.general_names.iter() {
@@ -468,13 +474,20 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
-    let (client_endpoint, conn) =
-        match quic_connect(host, addr, http_req.skip_verify, &mut stat).await {
-            Ok(result) => result,
-            Err(e) => {
-                return finish_with_error(stat, e, start);
-            }
-        };
+    let (client_endpoint, conn) = match timeout(
+        Duration::from_secs(30),
+        quic_connect(host, addr, http_req.skip_verify, &mut stat),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            return finish_with_error(stat, e, start);
+        }
+        Err(e) => {
+            return finish_with_error(stat, e, start);
+        }
+    };
 
     // Get TLS information from the connection
     stat.tls = Some("tls 1.3".to_string()); // QUIC always uses TLS 1.3
@@ -497,8 +510,9 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
                         _ => format!("{:?}", cert.signature_algorithm.algorithm),
                     };
                     stat.cert_cipher = Some(oid_str);
-                    stat.cert_not_before = Some(cert.validity().not_before.to_string());
-                    stat.cert_not_after = Some(cert.validity().not_after.to_string());
+                    stat.cert_not_before =
+                        Some(format_time(cert.validity().not_before.timestamp()));
+                    stat.cert_not_after = Some(format_time(cert.validity().not_after.timestamp()));
                     if let Ok(Some(sans)) = cert.subject_alternative_name() {
                         let mut domains = Vec::new();
                         for san in sans.value.general_names.iter() {
@@ -587,7 +601,8 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     }
 
     stat.total = Some(start.elapsed());
-    client_endpoint.wait_idle().await;
+    // Close the connection immediately instead of waiting for idle
+    client_endpoint.close(0u32.into(), b"done");
 
     stat
 }
