@@ -4,6 +4,10 @@ Imitation is the sincerest form of flattery.
 
 Pure rust version of http statistics, which refer to [httpstat](https://github.com/davecheney/httpstat).It supports http1, http2 and http3, default alpn is `h2, http/1.1`
 
+- Supports http1, http2 and http3
+- Default alpn is `h2, http/1.1`
+- Supports multi compression: `gzip, br, zstd`
+
 
 [中文](./README_zh.md)
 
@@ -47,6 +51,7 @@ Options:
   -X <METHOD>              HTTP method to use (default GET)
   -d, --data <DATA>        the body of a POST or PUT request; from file use @filename
       --resolve <RESOLVE>  Resolve host to specific IP address (format: HOST:PORT:ADDRESS, e.g. example.com:80:1.2.3.4)
+      --compressed         request compressed response: gzip, br, zstd
       --http3              use http/3
       --http2              use http/2
       --http1              use http/1.1

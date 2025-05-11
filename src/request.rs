@@ -15,6 +15,7 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
+use super::decompress::decompress;
 use super::error::{Error, Result};
 use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
 use super::SkipVerifier;
@@ -291,8 +292,10 @@ async fn tls_handshake(
     if let Some(certs) = session.peer_certificates() {
         if let Some(cert) = certs.first() {
             if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+                stat.subject = Some(cert.subject().to_string());
                 stat.cert_not_before = Some(format_time(cert.validity().not_before.timestamp()));
                 stat.cert_not_after = Some(format_time(cert.validity().not_after.timestamp()));
+                stat.issuer = Some(cert.issuer().to_string());
                 if let Ok(Some(sans)) = cert.subject_alternative_name() {
                     let mut domains = Vec::new();
                     for san in sans.value.general_names.iter() {
@@ -544,6 +547,8 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
                         "1.3.101.113" => "AES_128_GCM_SHA256".to_string(),
                         _ => format!("{:?}", cert.signature_algorithm.algorithm),
                     };
+                    stat.subject = Some(cert.subject().to_string());
+                    stat.issuer = Some(cert.issuer().to_string());
                     stat.cert_cipher = Some(oid_str);
                     stat.cert_not_before =
                         Some(format_time(cert.validity().not_before.timestamp()));
@@ -615,7 +620,6 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         }
         sub_stat.content_transfer = Some(content_transfer_start.elapsed());
         sub_stat.body = Some(Bytes::from(buf));
-
         Ok::<HttpStat, h3::error::StreamError>(sub_stat)
     };
 
@@ -648,57 +652,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     stat
 }
 
-/// Performs an HTTP request and returns detailed statistics about the request lifecycle.
-///
-/// This function handles HTTP/1.1, HTTP/2, and HTTP/3 requests with the following features:
-/// - Automatic protocol selection based on ALPN negotiation
-/// - DNS resolution with support for custom IP mappings
-/// - TLS handshake with certificate verification
-/// - Response body handling with optional file output
-/// - Detailed timing statistics for each phase of the request
-///
-/// # Arguments
-///
-/// * `http_req` - An `HttpRequest` struct containing the request configuration including:
-///   - URI and HTTP method
-///   - ALPN protocols to negotiate
-///   - Custom DNS resolutions
-///   - Headers and request body
-///   - TLS verification settings
-///   - Output file path (optional)
-///
-/// # Returns
-///
-/// Returns an `HttpStat` struct containing:
-/// - DNS lookup time
-/// - QUIC connection time
-/// - TCP connection time
-/// - TLS handshake time (for HTTPS)
-/// - Server processing time
-/// - Content transfer time
-/// - Total request time
-/// - Response status and headers
-/// - Response body (if not written to file)
-/// - TLS and certificate information (for HTTPS)
-/// - Any errors that occurred during the request
-///
-/// # Examples
-///
-/// ```rust
-/// let http_req = HttpRequest {
-///     uri: "https://example.com".parse().unwrap(),
-///     ..Default::default()
-/// };
-/// let stats = request(http_req).await;
-/// ```
-pub async fn request(http_req: HttpRequest) -> HttpStat {
-    ensure_crypto_provider();
-
-    // Handle HTTP/3 request
-    if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
-        return http3_request(http_req).await;
-    }
-
+async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
     let start = Instant::now();
     let mut stat = HttpStat::default();
 
@@ -792,20 +746,7 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     };
 
     let body_bytes = body.to_bytes();
-    if let Some(output) = http_req.output {
-        match fs::write(output, body_bytes).await {
-            Ok(_) => {}
-            Err(e) => {
-                return finish_with_error(
-                    stat,
-                    format!("Failed to write response body to file: {}", e),
-                    start,
-                );
-            }
-        }
-    } else {
-        stat.body = Some(body_bytes);
-    }
+    stat.body = Some(body_bytes);
     stat.content_transfer = Some(content_transfer_start.elapsed());
 
     // Check for connection errors
@@ -814,5 +755,93 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     }
 
     stat.total = Some(start.elapsed());
+    stat
+}
+
+/// Performs an HTTP request and returns detailed statistics about the request lifecycle.
+///
+/// This function handles HTTP/1.1, HTTP/2, and HTTP/3 requests with the following features:
+/// - Automatic protocol selection based on ALPN negotiation
+/// - DNS resolution with support for custom IP mappings
+/// - TLS handshake with certificate verification
+/// - Response body handling with optional file output
+/// - Detailed timing statistics for each phase of the request
+///
+/// # Arguments
+///
+/// * `http_req` - An `HttpRequest` struct containing the request configuration including:
+///   - URI and HTTP method
+///   - ALPN protocols to negotiate
+///   - Custom DNS resolutions
+///   - Headers and request body
+///   - TLS verification settings
+///   - Output file path (optional)
+///
+/// # Returns
+///
+/// Returns an `HttpStat` struct containing:
+/// - DNS lookup time
+/// - QUIC connection time
+/// - TCP connection time
+/// - TLS handshake time (for HTTPS)
+/// - Server processing time
+/// - Content transfer time
+/// - Total request time
+/// - Response status and headers
+/// - Response body (if not written to file)
+/// - TLS and certificate information (for HTTPS)
+/// - Any errors that occurred during the request
+///
+/// # Examples
+///
+/// ```rust
+/// let http_req = HttpRequest {
+///     uri: "https://example.com".parse().unwrap(),
+///     ..Default::default()
+/// };
+/// let stats = request(http_req).await;
+/// ```
+pub async fn request(http_req: HttpRequest) -> HttpStat {
+    ensure_crypto_provider();
+    let output = http_req.output.clone();
+
+    // Handle HTTP/3 request
+    let mut stat = if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
+        http3_request(http_req).await
+    } else {
+        http1_2_request(http_req).await
+    };
+    if let Some(body) = &stat.body {
+        stat.body_size = Some(body.len());
+    }
+    let encoding = if let Some(headers) = &stat.headers {
+        headers
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap_or_default())
+            .unwrap_or_default()
+    } else {
+        ""
+    };
+
+    if !encoding.is_empty() {
+        if let Some(body) = &stat.body {
+            match decompress(encoding, body) {
+                Ok(data) => {
+                    stat.body = Some(data);
+                }
+                Err(e) => {
+                    stat.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+    if let Some(body) = &stat.body {
+        if let Some(output) = output {
+            if let Err(e) = fs::write(output, body).await {
+                stat.error = Some(e.to_string());
+            }
+        }
+    }
+
     stat
 }

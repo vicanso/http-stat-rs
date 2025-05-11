@@ -84,11 +84,14 @@ pub struct HttpStat {
     pub status: Option<StatusCode>,
     pub tls: Option<String>,
     pub alpn: Option<String>,
+    pub subject: Option<String>,
+    pub issuer: Option<String>,
     pub cert_not_before: Option<String>,
     pub cert_not_after: Option<String>,
     pub cert_cipher: Option<String>,
     pub cert_domains: Option<Vec<String>>,
     pub body: Option<Bytes>,
+    pub body_size: Option<usize>,
     pub headers: Option<HeaderMap<HeaderValue>>,
     pub error: Option<String>,
 }
@@ -154,10 +157,13 @@ impl fmt::Display for HttpStat {
         if let Some(body) = &self.body {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();
             if status >= 400 {
-                let body = std::str::from_utf8(self.body.as_ref().unwrap()).unwrap_or_default();
+                let body = std::str::from_utf8(body.as_ref()).unwrap_or_default();
                 writeln!(f, "Body: {}", LightRed.paint(body))?;
             } else {
-                let text = format!("Body discarded {}", ByteSize(body.len() as u64));
+                let text = format!(
+                    "Body discarded {}",
+                    ByteSize(self.body_size.unwrap_or(0) as u64)
+                );
                 writeln!(f, "{}", LightCyan.paint(text))?;
             }
         }

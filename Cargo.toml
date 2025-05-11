@@ -48,6 +48,9 @@ h3 = "0.0.8"
 futures = "0.3.31"
 bytesize = "2.0.1"
 chrono = "0.4.41"
+flate2 = { version = "1.1.1", default-features = false, features = ["zlib"] }
+brotli-decompressor = "5.0.0"
+zstd = { version = "0.13.3", default-features = false }
 
 
 [profile.release]

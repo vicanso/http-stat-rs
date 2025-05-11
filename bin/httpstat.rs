@@ -83,6 +83,13 @@ struct Args {
     )]
     resolve: Vec<String>,
 
+    /// Compressed
+    #[arg(
+        long = "compressed",
+        help = "request compressed response: gzip, br, zstd"
+    )]
+    compressed: bool,
+
     /// HTTP/3
     #[arg(long = "http3", help = "use http/3")]
     http3: bool,
@@ -146,6 +153,17 @@ async fn main() {
         }
         req.headers = Some(header_map);
     }
+    if args.compressed {
+        let value = HeaderValue::from_static("zstd, br, gzip");
+        if let Some(header_map) = req.headers.as_mut() {
+            header_map.insert(http::header::ACCEPT_ENCODING, value);
+        } else {
+            let mut header_map = HeaderMap::new();
+            header_map.insert(http::header::ACCEPT_ENCODING, value);
+            req.headers = Some(header_map);
+        }
+    }
+
     if let Some(method) = args.method {
         req.method = Some(method.parse::<Method>().unwrap_or_default());
     }

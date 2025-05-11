@@ -2,7 +2,11 @@
 
 模仿是最真诚的致敬。
 
-纯 Rust 版本的 HTTP 统计工具，参考了 [httpstat](https://github.com/davecheney/httpstat)。支持 HTTP/1、HTTP/2 和 HTTP/3，默认的alpn是`h2, http/1.1`。
+纯 Rust 版本的 HTTP 统计工具，参考了 [httpstat](https://github.com/davecheney/httpstat)。
+
+- 支持http1， http2 以及 http3
+- 默认的alpn是 `h2, http/1.1`
+- 支持多种压缩算法：`gzip, br, zstd`
 
 ![截图](./screenshot.png)
 
