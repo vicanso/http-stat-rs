@@ -12,19 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Copyright 2025 Tree xie.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
+// It includes features like DNS resolution, TLS handshake, and request/response handling
 
 use super::error::{Error, Result};
 use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
@@ -60,8 +49,10 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
+// Version information from Cargo.toml
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// Format TLS protocol version for display
 fn format_tls_protocol(protocol: &str) -> String {
     match protocol {
         "TLSv1_3" => "tls v1.3".to_string(),
@@ -70,26 +61,30 @@ fn format_tls_protocol(protocol: &str) -> String {
         _ => protocol.to_string(),
     }
 }
+
+// Format timestamp to human-readable string
 fn format_time(timestamp_seconds: i64) -> String {
     Local
         .timestamp_nanos(timestamp_seconds * 1_000_000_000)
         .to_string()
 }
 
+// HttpRequest struct to hold request configuration
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
-    pub uri: Uri,
-    pub method: Option<Method>,
-    pub alpn_protocols: Vec<String>,
-    pub resolves: Option<HashMap<String, IpAddr>>,
-    pub headers: Option<HeaderMap<HeaderValue>>,
-    pub ip_version: Option<i32>, // 4 for IPv4, 6 for IPv6
-    pub skip_verify: bool,
-    pub output: Option<String>,
-    pub body: Option<Bytes>,
+    pub uri: Uri,                                  // Target URI
+    pub method: Option<Method>,                    // HTTP method (GET, POST, etc.)
+    pub alpn_protocols: Vec<String>,               // Supported ALPN protocols
+    pub resolves: Option<HashMap<String, IpAddr>>, // Custom DNS resolutions
+    pub headers: Option<HeaderMap<HeaderValue>>,   // Custom HTTP headers
+    pub ip_version: Option<i32>,                   // IP version (4 for IPv4, 6 for IPv6)
+    pub skip_verify: bool,                         // Skip TLS certificate verification
+    pub output: Option<String>,                    // Output file path
+    pub body: Option<Bytes>,                       // Request body
 }
 
 impl HttpRequest {
+    // Build HTTP request with proper headers
     fn builder(&self) -> Builder {
         let uri = &self.uri;
         let mut builder = Request::builder()
@@ -97,6 +92,8 @@ impl HttpRequest {
             .method(self.method.clone().unwrap_or(Method::GET));
         let mut set_host = false;
         let mut set_user_agent = false;
+
+        // Add custom headers if provided
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
                 builder = builder.header(key, value);
@@ -107,11 +104,15 @@ impl HttpRequest {
                 }
             }
         }
+
+        // Set default Host header if not provided
         if !set_host {
             if let Some(host) = uri.host() {
                 builder = builder.header("Host", host);
             }
         }
+
+        // Set default User-Agent if not provided
         if !set_user_agent {
             builder = builder.header("User-Agent", format!("httpstat.rs/{}", VERSION));
         }
@@ -119,6 +120,7 @@ impl HttpRequest {
     }
 }
 
+// Convert string URL to HttpRequest
 impl TryFrom<&str> for HttpRequest {
     type Error = Error;
 
@@ -138,6 +140,7 @@ impl TryFrom<&str> for HttpRequest {
     }
 }
 
+// Convert HttpRequest to hyper Request
 impl TryFrom<&HttpRequest> for Request<Full<Bytes>> {
     type Error = Error;
     fn try_from(req: &HttpRequest) -> Result<Self> {
@@ -147,6 +150,7 @@ impl TryFrom<&HttpRequest> for Request<Full<Bytes>> {
     }
 }
 
+// Initialize crypto provider once
 static INIT: Once = Once::new();
 
 fn ensure_crypto_provider() {
@@ -155,6 +159,7 @@ fn ensure_crypto_provider() {
     });
 }
 
+// Perform DNS resolution
 async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAddr, String)> {
     let host = req
         .uri
@@ -171,7 +176,7 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
     };
     let port = req.uri.port_u16().unwrap_or(default_port);
 
-    // Check if we have a resolve entry for this host:port
+    // Check custom DNS resolutions first
     if let Some(resolves) = &req.resolves {
         let host_port = format!("{}:{}", host, port);
         if let Some(ip) = resolves.get(&host_port) {
@@ -181,6 +186,7 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
         }
     }
 
+    // Configure DNS resolver
     let provider = TokioConnectionProvider::default();
     let mut builder = TokioResolver::builder(provider).map_err(|e| Error::Resolve { source: e })?;
     if let Some(ip_version) = req.ip_version {
@@ -191,6 +197,7 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
         }
     }
 
+    // Perform DNS lookup
     let resolver = builder.build();
     let dns_start = Instant::now();
     let addr = timeout(Duration::from_secs(10), resolver.lookup_ip(&host))
@@ -208,6 +215,7 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
     Ok((addr, host))
 }
 
+// Establish TCP connection
 async fn tcp_connect(addr: SocketAddr, stat: &mut HttpStat) -> Result<TcpStream> {
     let tcp_start = Instant::now();
     let tcp_stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
@@ -218,6 +226,7 @@ async fn tcp_connect(addr: SocketAddr, stat: &mut HttpStat) -> Result<TcpStream>
     Ok(tcp_stream)
 }
 
+// Perform TLS handshake
 async fn tls_handshake(
     host: String,
     tcp_stream: TcpStream,
@@ -229,11 +238,14 @@ async fn tls_handshake(
     let mut root_store = RootCertStore::empty();
     let certs = rustls_native_certs::load_native_certs().certs;
 
+    // Add root certificates
     for cert in certs {
         root_store
             .add(cert)
             .map_err(|e| Error::Rustls { source: e })?;
     }
+
+    // Configure TLS client
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
@@ -245,6 +257,7 @@ async fn tls_handshake(
             .set_certificate_verifier(Arc::new(SkipVerifier));
     }
 
+    // Set ALPN protocols
     config.alpn_protocols = alpn_protocols
         .iter()
         .map(|s| s.as_bytes().to_vec())
@@ -267,12 +280,14 @@ async fn tls_handshake(
     .map_err(|e| Error::Io { source: e })?;
     stat.tls_handshake = Some(tls_start.elapsed());
 
+    // Get TLS session information
     let (_, session) = tls_stream.get_ref();
 
     stat.tls = session
         .protocol_version()
         .map(|v| format_tls_protocol(v.as_str().unwrap_or_default()));
 
+    // Extract certificate information
     if let Some(certs) = session.peer_certificates() {
         if let Some(cert) = certs.first() {
             if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
@@ -290,6 +305,8 @@ async fn tls_handshake(
             }
         }
     }
+
+    // Get cipher suite information
     if let Some(cipher) = session.negotiated_cipher_suite() {
         let cipher = format!("{:?}", cipher);
         if let Some((_, cipher)) = cipher.split_once("_") {
@@ -298,6 +315,8 @@ async fn tls_handshake(
             stat.cert_cipher = Some(cipher);
         }
     }
+
+    // Check if HTTP/2 is negotiated
     let mut is_http2 = false;
     if let Some(protocol) = session.alpn_protocol() {
         let alpn = String::from_utf8_lossy(protocol).to_string();
@@ -307,6 +326,7 @@ async fn tls_handshake(
     Ok((tls_stream, is_http2))
 }
 
+// Send HTTP/1.1 request
 async fn send_http_request(
     req: Request<Full<Bytes>>,
     tcp_stream: TcpStream,
@@ -320,7 +340,8 @@ async fn send_http_request(
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
-    // Spawn the connection task
+
+    // Spawn connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             let _ = tx.send(e.to_string());
@@ -336,6 +357,7 @@ async fn send_http_request(
     Ok(resp)
 }
 
+// Send HTTPS request
 async fn send_https_request(
     req: Request<Full<Bytes>>,
     tls_stream: TlsStream<TcpStream>,
@@ -349,7 +371,8 @@ async fn send_https_request(
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
-    // Spawn the connection task
+
+    // Spawn connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             let _ = tx.send(e.to_string());
@@ -365,6 +388,7 @@ async fn send_https_request(
     Ok(resp)
 }
 
+// Send HTTP/2 request
 async fn send_https2_request(
     req: Request<Full<Bytes>>,
     tls_stream: TlsStream<TcpStream>,
@@ -378,7 +402,8 @@ async fn send_https2_request(
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
-    // Spawn the connection task
+
+    // Spawn connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             let _ = tx.send(e.to_string());
@@ -399,12 +424,14 @@ async fn send_https2_request(
     Ok(resp)
 }
 
+// Handle request error and update statistics
 fn finish_with_error(mut stat: HttpStat, error: impl ToString, start: Instant) -> HttpStat {
     stat.error = Some(error.to_string());
     stat.total = Some(start.elapsed());
     stat
 }
 
+// Establish QUIC connection for HTTP/3
 async fn quic_connect(
     host: String,
     addr: SocketAddr,
@@ -415,16 +442,20 @@ async fn quic_connect(
     let mut root_store = RootCertStore::empty();
     let certs = rustls_native_certs::load_native_certs().certs;
 
+    // Add root certificates
     for cert in certs {
         root_store
             .add(cert)
             .map_err(|e| Error::Rustls { source: e })?;
     }
+
+    // Configure QUIC client
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
     config.enable_early_data = true;
     config.alpn_protocols = vec![ALPN_HTTP3.as_bytes().to_vec()];
+
     // Skip certificate verification if requested
     if skip_verify {
         config
@@ -432,6 +463,7 @@ async fn quic_connect(
             .set_certificate_verifier(Arc::new(SkipVerifier));
     }
 
+    // Create QUIC endpoint
     let mut client_endpoint =
         h3_quinn::quinn::Endpoint::client("[::]:0".parse().map_err(|_| Error::Common {
             category: "parse".to_string(),
@@ -448,6 +480,7 @@ async fn quic_connect(
     let client_config = quinn::ClientConfig::new(Arc::new(h3_config));
     client_endpoint.set_default_client_config(client_config);
 
+    // Establish QUIC connection
     let conn = client_endpoint
         .connect(addr, &host)
         .map_err(|e| Error::QuicConnect { source: e })?
@@ -458,6 +491,7 @@ async fn quic_connect(
     Ok((client_endpoint, conn))
 }
 
+// Handle HTTP/3 request
 async fn http3_request(http_req: HttpRequest) -> HttpStat {
     let start = Instant::now();
     let mut stat = HttpStat {
@@ -474,6 +508,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
+    // Establish QUIC connection
     let (client_endpoint, conn) = match timeout(
         Duration::from_secs(30),
         quic_connect(host, addr, http_req.skip_verify, &mut stat),
@@ -489,11 +524,11 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
-    // Get TLS information from the connection
+    // Set TLS information
     stat.tls = Some("tls 1.3".to_string()); // QUIC always uses TLS 1.3
     stat.alpn = Some(ALPN_HTTP3.to_string()); // We always use HTTP/3 for QUIC
 
-    // Get certificate information from the connection
+    // Extract certificate information
     if let Some(peer_identity) = conn.peer_identity() {
         if let Ok(certs) = peer_identity.downcast::<Vec<rustls::pki_types::CertificateDer>>() {
             if let Some(cert) = certs.first() {
@@ -527,6 +562,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         }
     }
 
+    // Create HTTP/3 connection
     let quinn_conn = h3_quinn::Connection::new(conn);
 
     let (mut driver, mut send_request) = match h3::client::new(quinn_conn)
@@ -539,6 +575,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
+    // Prepare request
     let req = match http_req.builder().body(()) {
         Ok(req) => req,
         Err(e) => {
@@ -547,17 +584,19 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     };
     let body = http_req.body.unwrap_or_default();
 
+    // Handle connection driver
     let drive = async move {
         Err::<(), h3::error::ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
     };
 
+    // Send request and handle response
     let request = async move {
         let mut stream = send_request.send_request(req).await?;
         stream.send_data(body).await?;
 
         let mut sub_stat = HttpStat::default();
 
-        // finish on the sending side
+        // Finish sending
         stream.finish().await?;
 
         let server_processing_start = Instant::now();
@@ -568,6 +607,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         sub_stat.status = Some(resp.status());
         sub_stat.headers = Some(resp.headers().clone());
 
+        // Receive response body
         let content_transfer_start = Instant::now();
         let mut buf = BytesMut::new();
         while let Some(chunk) = stream.recv_data().await? {
@@ -579,6 +619,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         Ok::<HttpStat, h3::error::StreamError>(sub_stat)
     };
 
+    // Execute request and handle results
     let (req_res, drive_res) = tokio::join!(request, drive);
     match req_res {
         Ok(sub_stat) => {
@@ -607,9 +648,53 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     stat
 }
 
+/// Performs an HTTP request and returns detailed statistics about the request lifecycle.
+///
+/// This function handles HTTP/1.1, HTTP/2, and HTTP/3 requests with the following features:
+/// - Automatic protocol selection based on ALPN negotiation
+/// - DNS resolution with support for custom IP mappings
+/// - TLS handshake with certificate verification
+/// - Response body handling with optional file output
+/// - Detailed timing statistics for each phase of the request
+///
+/// # Arguments
+///
+/// * `http_req` - An `HttpRequest` struct containing the request configuration including:
+///   - URI and HTTP method
+///   - ALPN protocols to negotiate
+///   - Custom DNS resolutions
+///   - Headers and request body
+///   - TLS verification settings
+///   - Output file path (optional)
+///
+/// # Returns
+///
+/// Returns an `HttpStat` struct containing:
+/// - DNS lookup time
+/// - QUIC connection time
+/// - TCP connection time
+/// - TLS handshake time (for HTTPS)
+/// - Server processing time
+/// - Content transfer time
+/// - Total request time
+/// - Response status and headers
+/// - Response body (if not written to file)
+/// - TLS and certificate information (for HTTPS)
+/// - Any errors that occurred during the request
+///
+/// # Examples
+///
+/// ```rust
+/// let http_req = HttpRequest {
+///     uri: "https://example.com".parse().unwrap(),
+///     ..Default::default()
+/// };
+/// let stats = request(http_req).await;
+/// ```
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
 
+    // Handle HTTP/3 request
     if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
         return http3_request(http_req).await;
     }
@@ -629,6 +714,7 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     let uri = &http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
+    // Convert request to hyper Request
     let req: Request<Full<Bytes>> = match (&http_req).try_into() {
         Ok(req) => req,
         Err(e) => {
@@ -644,10 +730,10 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
-    // Create a channel to receive connection errors
+    // Create channel for connection errors
     let (tx, mut rx) = oneshot::channel();
 
-    // Send the request based on protocol
+    // Send request based on protocol
     let resp = if is_https {
         // TLS handshake
         let tls_result = tls_handshake(
@@ -691,10 +777,11 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
+    // Process response
     stat.status = Some(resp.status());
     stat.headers = Some(resp.headers().clone());
 
-    // Read the response body
+    // Read response body
     let content_transfer_start = Instant::now();
     let body_result = resp.collect().await;
     let body = match body_result {

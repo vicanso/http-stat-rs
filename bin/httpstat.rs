@@ -20,7 +20,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::Method;
 use http::StatusCode;
 use http::Uri;
-use http_stat::{request, HttpRequest, ALPN_HTTP2, ALPN_HTTP3};
+use http_stat::{request, HttpRequest, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -90,6 +90,10 @@ struct Args {
     /// HTTP/2
     #[arg(long = "http2", help = "use http/2")]
     http2: bool,
+
+    /// HTTP/1.1
+    #[arg(long = "http1", help = "use http/1.1")]
+    http1: bool,
 }
 
 #[tokio::main]
@@ -150,6 +154,9 @@ async fn main() {
         req.body = Some(Bytes::from(data));
     }
 
+    if args.http1 {
+        req.alpn_protocols = vec![ALPN_HTTP1.to_string()];
+    }
     if args.http2 {
         req.alpn_protocols = vec![ALPN_HTTP2.to_string()];
     }

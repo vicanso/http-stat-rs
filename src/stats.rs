@@ -46,6 +46,31 @@ struct Timeline {
     duration: Duration,
 }
 
+/// Statistics and information collected during an HTTP request.
+///
+/// This struct contains timing information for each phase of the request,
+/// connection details, TLS information, and response data.
+///
+/// # Fields
+///
+/// * `dns_lookup` - Time taken for DNS resolution
+/// * `quic_connect` - Time taken to establish QUIC connection (for HTTP/3)
+/// * `tcp_connect` - Time taken to establish TCP connection
+/// * `tls_handshake` - Time taken for TLS handshake (for HTTPS)
+/// * `server_processing` - Time taken for server to process the request
+/// * `content_transfer` - Time taken to transfer the response body
+/// * `total` - Total time taken for the entire request
+/// * `addr` - Resolved IP address and port
+/// * `status` - HTTP response status code
+/// * `tls` - TLS protocol version used
+/// * `alpn` - Application-Layer Protocol Negotiation (ALPN) protocol selected
+/// * `cert_not_before` - Certificate validity start time
+/// * `cert_not_after` - Certificate validity end time
+/// * `cert_cipher` - TLS cipher suite used
+/// * `cert_domains` - List of domains in the certificate's Subject Alternative Names
+/// * `body` - Response body content
+/// * `headers` - Response headers
+/// * `error` - Any error that occurred during the request
 #[derive(Default, Debug)]
 pub struct HttpStat {
     pub dns_lookup: Option<Duration>,

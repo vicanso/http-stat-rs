@@ -49,6 +49,7 @@ Options:
       --resolve <RESOLVE>  Resolve host to specific IP address (format: HOST:PORT:ADDRESS, e.g. example.com:80:1.2.3.4)
       --http3              use http/3
       --http2              use http/2
+      --http1              use http/1.1
   -h, --help               Print help
   -V, --version            Print version
 ```
