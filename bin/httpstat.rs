@@ -101,6 +101,48 @@ struct Args {
     /// HTTP/1.1
     #[arg(long = "http1", help = "use http/1.1")]
     http1: bool,
+
+    /// Silent mode
+    #[arg(short = 's', help = "silent mode")]
+    silent: bool,
+
+    /// IPs
+    #[arg(long = "ips", help = "multiple ips for host")]
+    ips: Option<String>,
+}
+
+async fn do_request(mut req: HttpRequest, follow_redirect: bool) {
+    let mut stat = request(req.clone()).await;
+    if follow_redirect {
+        for _ in 0..10 {
+            let status = stat.status.unwrap_or(StatusCode::OK);
+            if ![
+                StatusCode::MOVED_PERMANENTLY,
+                StatusCode::FOUND,
+                StatusCode::SEE_OTHER,
+                StatusCode::TEMPORARY_REDIRECT,
+                StatusCode::PERMANENT_REDIRECT,
+            ]
+            .contains(&status)
+            {
+                break;
+            }
+            let redirect_url = stat
+                .headers
+                .as_ref()
+                .and_then(|header| header.get("Location"))
+                .map(|value| value.to_str().unwrap_or(""))
+                .unwrap_or("");
+            if redirect_url.is_empty() {
+                break;
+            }
+            if let Ok(uri) = redirect_url.parse::<Uri>() {
+                req.uri = uri;
+                stat = request(req.clone()).await;
+            }
+        }
+    }
+    println!("{}", stat);
 }
 
 #[tokio::main]
@@ -181,36 +223,21 @@ async fn main() {
     if args.http3 {
         req.alpn_protocols = vec![ALPN_HTTP3.to_string()];
     }
+    req.silent = args.silent;
 
-    let mut stat = request(req.clone()).await;
-    if args.follow_redirect {
-        for _ in 0..10 {
-            let status = stat.status.unwrap_or(StatusCode::OK);
-            if ![
-                StatusCode::MOVED_PERMANENTLY,
-                StatusCode::FOUND,
-                StatusCode::SEE_OTHER,
-                StatusCode::TEMPORARY_REDIRECT,
-                StatusCode::PERMANENT_REDIRECT,
-            ]
-            .contains(&status)
-            {
-                break;
-            }
-            let redirect_url = stat
-                .headers
-                .as_ref()
-                .and_then(|header| header.get("Location"))
-                .map(|value| value.to_str().unwrap_or(""))
-                .unwrap_or("");
-            if redirect_url.is_empty() {
-                break;
-            }
-            if let Ok(uri) = redirect_url.parse::<Uri>() {
-                req.uri = uri;
-                stat = request(req.clone()).await;
-            }
+    if let Some(ips) = args.ips {
+        let ips = ips.split(',').collect::<Vec<&str>>();
+        let host = req.uri.host().unwrap_or_default();
+        for ip in ips {
+            let mut req = req.clone();
+            let Ok(ip) = ip.parse::<IpAddr>() else {
+                continue;
+            };
+            let host_port = format!("{}:{}", host, req.get_port());
+            req.resolves = Some(HashMap::from([(host_port, ip)]));
+            do_request(req, args.follow_redirect).await;
         }
+    } else {
+        do_request(req, args.follow_redirect).await;
     }
-    println!("{}", stat);
 }

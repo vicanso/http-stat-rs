@@ -82,9 +82,18 @@ pub struct HttpRequest {
     pub skip_verify: bool,                         // Skip TLS certificate verification
     pub output: Option<String>,                    // Output file path
     pub body: Option<Bytes>,                       // Request body
+    pub silent: bool,                              // Silent mode
 }
 
 impl HttpRequest {
+    pub fn get_port(&self) -> u16 {
+        let default_port = if self.uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
+            443
+        } else {
+            80
+        };
+        self.uri.port_u16().unwrap_or(default_port)
+    }
     // Build HTTP request with proper headers
     fn builder(&self) -> Builder {
         let uri = &self.uri;
@@ -129,14 +138,8 @@ impl TryFrom<&str> for HttpRequest {
         let uri = url.parse::<Uri>().map_err(|e| Error::Uri { source: e })?;
         Ok(Self {
             uri,
-            method: None,
             alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
-            resolves: None,
-            headers: None,
-            ip_version: None,
-            skip_verify: false,
-            output: None,
-            body: None,
+            ..Default::default()
         })
     }
 }
@@ -170,12 +173,7 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
             message: "host is required".to_string(),
         })?
         .to_string();
-    let default_port = if req.uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
-        443
-    } else {
-        80
-    };
-    let port = req.uri.port_u16().unwrap_or(default_port);
+    let port = req.get_port();
 
     // Check custom DNS resolutions first
     if let Some(resolves) = &req.resolves {
@@ -803,6 +801,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
 /// ```
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
+    let silent = http_req.silent;
     let output = http_req.output.clone();
 
     // Handle HTTP/3 request
@@ -842,6 +841,7 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
             }
         }
     }
+    stat.silent = silent;
 
     stat
 }

@@ -94,20 +94,40 @@ pub struct HttpStat {
     pub body_size: Option<usize>,
     pub headers: Option<HeaderMap<HeaderValue>>,
     pub error: Option<String>,
+    pub silent: bool,
 }
 
 impl fmt::Display for HttpStat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(addr) = &self.addr {
-            write!(
-                f,
-                "{} {}\n\n",
+            let mut text = format!(
+                "{} {}",
                 LightGreen.paint("Connected to"),
                 LightCyan.paint(addr)
-            )?;
+            );
+            if self.silent {
+                if let Some(status) = &self.status {
+                    let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
+                    let status_code = status.as_u16();
+                    let status = if status_code < 400 {
+                        LightGreen.paint(status.to_string())
+                    } else {
+                        LightRed.paint(status.to_string())
+                    };
+                    text = format!(
+                        "{text} --> {} {}",
+                        LightCyan.paint(alpn.to_uppercase()),
+                        status
+                    );
+                }
+            }
+            writeln!(f, "{}", text)?;
         }
         if let Some(error) = &self.error {
             writeln!(f, "Error: {}", LightRed.paint(error))?;
+        }
+        if self.silent {
+            return Ok(());
         }
         if let Some(status) = &self.status {
             let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
@@ -119,6 +139,7 @@ impl fmt::Display for HttpStat {
             };
             writeln!(f, "{} {}", LightCyan.paint(alpn.to_uppercase()), status)?;
         }
+
         if let Some(tls) = &self.tls {
             writeln!(f, "{}: {}", "tls".to_train_case(), LightCyan.paint(tls))?;
             writeln!(

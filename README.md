@@ -2,7 +2,7 @@
 
 Imitation is the sincerest form of flattery.
 
-Pure rust version of http statistics, which refer to [httpstat](https://github.com/davecheney/httpstat).It supports http1, http2 and http3, default alpn is `h2, http/1.1`
+Pure rust version of http statistics, which refer to [httpstat](https://github.com/davecheney/httpstat).
 
 - Supports http1, http2 and http3
 - Default alpn is `h2, http/1.1`
