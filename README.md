@@ -7,7 +7,7 @@ Pure rust version of http statistics, which refer to [httpstat](https://github.c
 - Supports http1, http2 and http3
 - Default alpn is `h2, http/1.1`
 - Supports multi compression: `gzip, br, zstd`
-- Supports testing multiple IPs simultaneously for a specified domain
+- Supports testing multiple IPs simultaneously for a specified host 
 
 
 [中文](./README_zh.md)
