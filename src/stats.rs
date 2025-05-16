@@ -119,6 +119,8 @@ impl fmt::Display for HttpStat {
                         LightCyan.paint(alpn.to_uppercase()),
                         status
                     );
+                } else {
+                    text = format!("{text} --> {}", LightRed.paint("FAIL"));
                 }
             }
             writeln!(f, "{}", text)?;
