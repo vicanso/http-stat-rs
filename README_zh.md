@@ -7,6 +7,7 @@
 - 支持http1， http2 以及 http3
 - 默认的alpn是 `h2, http/1.1`
 - 支持多种压缩算法：`gzip, br, zstd`
+- 允许指定域名对应多个ip同时检测
 
 ![截图](./screenshot.png)
 
@@ -23,6 +24,8 @@ cargo install http-stat
 ## 使用方法
 ```
 httpstat --http3 https://cloudflare-quic.com/
+
+httpstat --resolve=183.240.99.169,2409:8c54:870:310:0:ff:b0ed:40ac -s https://www.baidu.com/
 ```
 
 ## 功能特性
@@ -45,9 +48,10 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
   -L                       跟随 30x 重定向
   -X <METHOD>              使用的 HTTP 方法（默认为 GET）
   -d, --data <DATA>        POST 或 PUT 请求的请求体；从文件读取使用 @文件名
-      --resolve <RESOLVE>  将主机解析到特定 IP 地址（格式：HOST:PORT:ADDRESS，例如 example.com:80:1.2.3.4）
+      --resolve <RESOLVE>  解析域名到指定ip(e.g. 1.2.3.4,1.2.3.5)
       --http3              使用 HTTP/3
       --http2              使用 HTTP/2
+  -s                       安静模式，输入更少的数据
   -h, --help               显示帮助信息
   -V, --version            显示版本信息
 ```

@@ -7,6 +7,7 @@ Pure rust version of http statistics, which refer to [httpstat](https://github.c
 - Supports http1, http2 and http3
 - Default alpn is `h2, http/1.1`
 - Supports multi compression: `gzip, br, zstd`
+- Supports testing multiple IPs simultaneously for a specified domain
 
 
 [中文](./README_zh.md)
@@ -28,6 +29,8 @@ cargo install http-stat
 ## Usage
 ```
 httpstat --http3 https://cloudflare-quic.com/
+
+httpstat --resolve=183.240.99.169,2409:8c54:870:310:0:ff:b0ed:40ac -s https://www.baidu.com/
 ```
 
 ## Features
@@ -50,11 +53,12 @@ Options:
   -L                       follow 30x redirects
   -X <METHOD>              HTTP method to use (default GET)
   -d, --data <DATA>        the body of a POST or PUT request; from file use @filename
-      --resolve <RESOLVE>  Resolve host to specific IP address (format: HOST:PORT:ADDRESS, e.g. example.com:80:1.2.3.4)
+      --resolve <RESOLVE>  resolve the request host to specific ip address (e.g. 1.2.3.4,1.2.3.5)
       --compressed         request compressed response: gzip, br, zstd
       --http3              use http/3
       --http2              use http/2
       --http1              use http/1.1
+  -s                       silent mode
   -h, --help               Print help
   -V, --version            Print version
 ```
