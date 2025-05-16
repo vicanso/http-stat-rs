@@ -30,13 +30,13 @@ jobs:
         
           cargo build --release --target=x86_64-apple-darwin
           mv target/x86_64-apple-darwin/release/httpstat ./httpstat
-          tar -czvf httpstat-darwin-x86.tar.gz httpstat
+          tar -czvf httpstat-darwin-x86_64.tar.gz httpstat
 
 
           ls -lh httpstat*.gz
 
           ./.github/workflows/upload_asset.sh ./httpstat-darwin-aarch64.tar.gz $GITHUB_TOKEN
-          ./.github/workflows/upload_asset.sh ./httpstat-darwin-x86.tar.gz $GITHUB_TOKEN
+          ./.github/workflows/upload_asset.sh ./httpstat-darwin-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-x86:
     runs-on: ubuntu-22.04
@@ -54,11 +54,11 @@ jobs:
             mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat
       - name: Upload Assets
         run: |
-          tar -czvf httpstat-linux-musl-x86.tar.gz httpstat
+          tar -czvf httpstat-linux-musl-x86_64.tar.gz httpstat
 
           ls -lh httpstat*.gz
 
-          ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-x86.tar.gz $GITHUB_TOKEN
+          ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-aarch64:
     runs-on: ubuntu-22.04
