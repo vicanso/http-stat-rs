@@ -20,10 +20,8 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::Method;
 use http::StatusCode;
 use http::Uri;
-use http_stat::{request, HttpRequest, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
-use std::collections::HashMap;
+use http_stat::{request, HttpRequest, HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
 use std::net::IpAddr;
-use std::str::FromStr;
 
 /// HTTP statistics tool
 #[derive(Parser, Debug)]
@@ -79,9 +77,9 @@ struct Args {
     /// Resolve host to specific IP address (format: HOST:PORT:ADDRESS)
     #[arg(
         long = "resolve",
-        help = "Resolve host to specific IP address (format: HOST:PORT:ADDRESS, e.g. example.com:80:1.2.3.4)"
+        help = "resolve the request host to specific ip address (e.g. 1.2.3.4,1.2.3.5)"
     )]
-    resolve: Vec<String>,
+    resolve: Option<String>,
 
     /// Compressed
     #[arg(
@@ -105,13 +103,9 @@ struct Args {
     /// Silent mode
     #[arg(short = 's', help = "silent mode")]
     silent: bool,
-
-    /// IPs
-    #[arg(long = "ips", help = "multiple ips for host")]
-    ips: Option<String>,
 }
 
-async fn do_request(mut req: HttpRequest, follow_redirect: bool) {
+async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
     let mut stat = request(req.clone()).await;
     if follow_redirect {
         for _ in 0..10 {
@@ -142,7 +136,7 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) {
             }
         }
     }
-    println!("{}", stat);
+    stat
 }
 
 #[tokio::main]
@@ -165,19 +159,6 @@ async fn main() {
     }
     req.skip_verify = args.skip_verify;
     req.output = args.output;
-
-    // Handle resolve parameter
-    if !args.resolve.is_empty() {
-        let mut resolves = HashMap::new();
-        for resolve in args.resolve {
-            if let Some((host_port, ip)) = resolve.rsplit_once(':') {
-                if let Ok(ip_addr) = IpAddr::from_str(ip) {
-                    resolves.insert(host_port.to_string(), ip_addr);
-                }
-            }
-        }
-        req.resolves = Some(resolves);
-    }
 
     // Parse headers if provided
     if !args.headers.is_empty() {
@@ -225,19 +206,29 @@ async fn main() {
     }
     req.silent = args.silent;
 
-    if let Some(ips) = args.ips {
-        let ips = ips.split(',').collect::<Vec<&str>>();
-        let host = req.uri.host().unwrap_or_default();
+    if let Some(resolve) = args.resolve {
+        let ips = resolve.split(',').collect::<Vec<&str>>();
+        let mut stats_list = vec![];
         for ip in ips {
             let mut req = req.clone();
             let Ok(ip) = ip.parse::<IpAddr>() else {
                 continue;
             };
-            let host_port = format!("{}:{}", host, req.get_port());
-            req.resolves = Some(HashMap::from([(host_port, ip)]));
-            do_request(req, args.follow_redirect).await;
+            req.resolve = Some(ip);
+            let stat = do_request(req, args.follow_redirect).await;
+            stats_list.push(stat);
+        }
+        // error request last
+        stats_list.sort_by(|item1, item2| {
+            let value1 = item1.error.is_some();
+            let value2 = item2.error.is_some();
+            value1.cmp(&value2)
+        });
+        for stat in stats_list {
+            println!("{}", stat);
         }
     } else {
-        do_request(req, args.follow_redirect).await;
+        let stat = do_request(req, args.follow_redirect).await;
+        println!("{}", stat);
     }
 }

@@ -35,7 +35,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -73,16 +72,16 @@ fn format_time(timestamp_seconds: i64) -> String {
 // HttpRequest struct to hold request configuration
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
-    pub uri: Uri,                                  // Target URI
-    pub method: Option<Method>,                    // HTTP method (GET, POST, etc.)
-    pub alpn_protocols: Vec<String>,               // Supported ALPN protocols
-    pub resolves: Option<HashMap<String, IpAddr>>, // Custom DNS resolutions
-    pub headers: Option<HeaderMap<HeaderValue>>,   // Custom HTTP headers
-    pub ip_version: Option<i32>,                   // IP version (4 for IPv4, 6 for IPv6)
-    pub skip_verify: bool,                         // Skip TLS certificate verification
-    pub output: Option<String>,                    // Output file path
-    pub body: Option<Bytes>,                       // Request body
-    pub silent: bool,                              // Silent mode
+    pub uri: Uri,                                // Target URI
+    pub method: Option<Method>,                  // HTTP method (GET, POST, etc.)
+    pub alpn_protocols: Vec<String>,             // Supported ALPN protocols
+    pub resolve: Option<IpAddr>,                 // Custom DNS resolution
+    pub headers: Option<HeaderMap<HeaderValue>>, // Custom HTTP headers
+    pub ip_version: Option<i32>,                 // IP version (4 for IPv4, 6 for IPv6)
+    pub skip_verify: bool,                       // Skip TLS certificate verification
+    pub output: Option<String>,                  // Output file path
+    pub body: Option<Bytes>,                     // Request body
+    pub silent: bool,                            // Silent mode
 }
 
 impl HttpRequest {
@@ -176,13 +175,10 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
     let port = req.get_port();
 
     // Check custom DNS resolutions first
-    if let Some(resolves) = &req.resolves {
-        let host_port = format!("{}:{}", host, port);
-        if let Some(ip) = resolves.get(&host_port) {
-            let addr = SocketAddr::new(*ip, port);
-            stat.addr = Some(addr.to_string());
-            return Ok((addr, host));
-        }
+    if let Some(resolve) = &req.resolve {
+        let addr = SocketAddr::new(*resolve, port);
+        stat.addr = Some(addr.to_string());
+        return Ok((addr, host));
     }
 
     // Configure DNS resolver
