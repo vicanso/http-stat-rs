@@ -101,7 +101,10 @@ struct Args {
     http1: bool,
 
     /// Silent mode
-    #[arg(short = 's', help = "silent mode")]
+    #[arg(
+        short = 's',
+        help = "silent mode, only output the connect address and result"
+    )]
     silent: bool,
 }
 
@@ -177,7 +180,7 @@ async fn main() {
         req.headers = Some(header_map);
     }
     if args.compressed {
-        let value = HeaderValue::from_static("zstd, br, gzip");
+        let value = HeaderValue::from_static("gzip, br, zstd");
         if let Some(header_map) = req.headers.as_mut() {
             header_map.insert(http::header::ACCEPT_ENCODING, value);
         } else {

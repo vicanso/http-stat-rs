@@ -20,7 +20,12 @@ Pure rust version of http statistics, which refer to [httpstat](https://github.c
 [Pre-built binaries](https://github.com/vicanso/http-stat-rs/releases) for windows, macos and linux.
 
 ```bash
-curl -L https://github.com/vicanso/http-stat-rs/releases/download/v0.3.5/httpstat-linux-musl-$(uname -m).tar.gz | tar -xzf -
+## linux
+curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/httpstat-linux-musl-$(uname -m).tar.gz | tar -xzf -
+sudo mv httpstat /usr/local/bin/
+
+## macos
+curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/httpstat-darwin-$(uname -m).tar.gz | tar -xzf -
 sudo mv httpstat /usr/local/bin/
 ```
 

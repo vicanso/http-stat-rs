@@ -25,7 +25,7 @@ jobs:
         run: |
           cargo build --release --target=aarch64-apple-darwin
           mv target/aarch64-apple-darwin/release/httpstat ./httpstat
-          tar -czvf httpstat-darwin-aarch64.tar.gz httpstat
+          tar -czvf httpstat-darwin-arm64.tar.gz httpstat
 
         
           cargo build --release --target=x86_64-apple-darwin
@@ -35,7 +35,7 @@ jobs:
 
           ls -lh httpstat*.gz
 
-          ./.github/workflows/upload_asset.sh ./httpstat-darwin-aarch64.tar.gz $GITHUB_TOKEN
+          ./.github/workflows/upload_asset.sh ./httpstat-darwin-arm64.tar.gz $GITHUB_TOKEN
           ./.github/workflows/upload_asset.sh ./httpstat-darwin-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-x86:
