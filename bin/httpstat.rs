@@ -106,6 +106,12 @@ struct Args {
         help = "silent mode, only output the connect address and result"
     )]
     silent: bool,
+    /// DNS servers
+    #[arg(
+        long = "dns-servers",
+        help = "dns server address to use, format: 8.8.8.8,8.8.4.4"
+    )]
+    dns_servers: Option<String>,
 }
 
 async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
@@ -162,6 +168,10 @@ async fn main() {
     }
     req.skip_verify = args.skip_verify;
     req.output = args.output;
+
+    if let Some(dns_servers) = args.dns_servers {
+        req.dns_servers = Some(dns_servers.split(',').map(|s| s.to_string()).collect());
+    }
 
     // Parse headers if provided
     if !args.headers.is_empty() {

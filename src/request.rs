@@ -22,7 +22,7 @@ use super::SkipVerifier;
 use bytes::{Buf, Bytes, BytesMut};
 use chrono::{Local, TimeZone};
 use futures::future;
-use hickory_resolver::config::LookupIpStrategy;
+use hickory_resolver::config::{LookupIpStrategy, NameServerConfigGroup, ResolverConfig};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
 use http::request::Builder;
@@ -82,6 +82,7 @@ pub struct HttpRequest {
     pub output: Option<String>,                  // Output file path
     pub body: Option<Bytes>,                     // Request body
     pub silent: bool,                            // Silent mode
+    pub dns_servers: Option<Vec<String>>,        // DNS servers
 }
 
 impl HttpRequest {
@@ -183,7 +184,22 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
 
     // Configure DNS resolver
     let provider = TokioConnectionProvider::default();
-    let mut builder = TokioResolver::builder(provider).map_err(|e| Error::Resolve { source: e })?;
+
+    let mut builder = if let Some(dns_servers) = &req.dns_servers {
+        let servers: Vec<_> = dns_servers
+            .iter()
+            .flat_map(|server| server.parse::<IpAddr>().ok())
+            .collect();
+
+        let mut config = ResolverConfig::new();
+        for server in NameServerConfigGroup::from_ips_clear(&servers, 53, true).into_inner() {
+            config.add_name_server(server);
+        }
+        TokioResolver::builder_with_config(config, provider)
+    } else {
+        TokioResolver::builder(provider).map_err(|e| Error::Resolve { source: e })?
+    };
+
     if let Some(ip_version) = req.ip_version {
         match ip_version {
             4 => builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only,
