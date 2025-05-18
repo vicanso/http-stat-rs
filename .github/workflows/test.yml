@@ -49,3 +49,9 @@ jobs:
         run: |
           make release
           ldd target/release/httpstat
+      - name: Run upx
+        run: |
+          ls -lh target/release/httpstat
+          curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
+          ./upx-5.0.1-amd64_linux/upx target/release/httpstat
+          ls -lh target/release/httpstat

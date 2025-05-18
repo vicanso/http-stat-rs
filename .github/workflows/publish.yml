@@ -49,7 +49,6 @@ jobs:
           options: -v ${{ github.workspace }}:/home/rust/src
           run: |
             apt-get update
-            apt-get install protobuf-compiler -y
             make release
             mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat
       - name: Upload Assets
