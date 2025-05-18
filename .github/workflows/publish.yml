@@ -65,7 +65,7 @@ jobs:
           ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-aarch64:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-arm64
     steps:
       - uses: actions/checkout@v4
       - name: release
