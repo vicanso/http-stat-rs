@@ -22,6 +22,7 @@ use http::StatusCode;
 use http::Uri;
 use http_stat::{request, HttpRequest, HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
 use std::net::IpAddr;
+use tokio::fs;
 
 /// HTTP statistics tool
 #[derive(Parser, Debug)]
@@ -148,6 +149,17 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
     stat
 }
 
+async fn handle_output(body: Option<Bytes>, output: Option<String>) {
+    let Some(output) = output else {
+        return;
+    };
+    let Some(body) = body else {
+        return;
+    };
+    if let Err(e) = fs::write(output, body).await {
+        println!("write output error: {}", e);
+    }
+}
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -167,7 +179,7 @@ async fn main() {
         req.ip_version = Some(6);
     }
     req.skip_verify = args.skip_verify;
-    req.output = args.output;
+    // req.output = args.output;
 
     if let Some(dns_servers) = args.dns_servers {
         req.dns_servers = Some(dns_servers.split(',').map(|s| s.to_string()).collect());
@@ -217,6 +229,7 @@ async fn main() {
     if args.http3 {
         req.alpn_protocols = vec![ALPN_HTTP3.to_string()];
     }
+    let output = args.output;
     req.silent = args.silent;
 
     if let Some(resolve) = args.resolve {
@@ -238,10 +251,14 @@ async fn main() {
             value1.cmp(&value2)
         });
         for stat in stats_list {
+            let body = stat.body.clone();
             println!("{}", stat);
+            handle_output(body, output.clone()).await;
         }
     } else {
         let stat = do_request(req, args.follow_redirect).await;
+        let body = stat.body.clone();
         println!("{}", stat);
+        handle_output(body, output.clone()).await;
     }
 }

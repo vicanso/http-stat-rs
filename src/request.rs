@@ -41,7 +41,6 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -79,7 +78,6 @@ pub struct HttpRequest {
     pub headers: Option<HeaderMap<HeaderValue>>, // Custom HTTP headers
     pub ip_version: Option<i32>,                 // IP version (4 for IPv4, 6 for IPv6)
     pub skip_verify: bool,                       // Skip TLS certificate verification
-    pub output: Option<String>,                  // Output file path
     pub body: Option<Bytes>,                     // Request body
     pub silent: bool,                            // Silent mode
     pub dns_servers: Option<Vec<String>>,        // DNS servers
@@ -814,7 +812,6 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
     let silent = http_req.silent;
-    let output = http_req.output.clone();
 
     // Handle HTTP/3 request
     let mut stat = if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
@@ -846,13 +843,7 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
             }
         }
     }
-    if let Some(body) = &stat.body {
-        if let Some(output) = output {
-            if let Err(e) = fs::write(output, body).await {
-                stat.error = Some(e.to_string());
-            }
-        }
-    }
+
     stat.silent = silent;
 
     stat
