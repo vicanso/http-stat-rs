@@ -165,30 +165,23 @@ impl fmt::Display for HttpStat {
             writeln!(f)?;
         }
 
+        let mut is_text = false;
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
+                let value = value.to_str().unwrap_or_default();
+                if key.to_string().to_lowercase() == "content-type" {
+                    if value.contains("text/") || value.contains("application/json") {
+                        is_text = true;
+                    }
+                }
                 writeln!(
                     f,
                     "{}: {}",
                     key.to_string().to_train_case(),
-                    LightCyan.paint(value.to_str().unwrap_or_default())
+                    LightCyan.paint(value)
                 )?;
             }
             writeln!(f)?;
-        }
-
-        if let Some(body) = &self.body {
-            let status = self.status.unwrap_or(StatusCode::OK).as_u16();
-            if status >= 400 {
-                let body = std::str::from_utf8(body.as_ref()).unwrap_or_default();
-                writeln!(f, "Body: {}", LightRed.paint(body))?;
-            } else {
-                let text = format!(
-                    "Body discarded {}",
-                    ByteSize(self.body_size.unwrap_or(0) as u64)
-                );
-                writeln!(f, "{}", LightCyan.paint(text))?;
-            }
         }
 
         let width = 20;
@@ -278,9 +271,27 @@ impl fmt::Display for HttpStat {
         write!(f, "{}", " ".repeat(width * timelines.len()))?;
         write!(
             f,
-            "total:{}",
+            "total:{}\n\n",
             LightCyan.paint(format_duration(self.total.unwrap_or_default()))
         )?;
+
+        if let Some(body) = &self.body {
+            let status = self.status.unwrap_or(StatusCode::OK).as_u16();
+            if status >= 400 {
+                let body = std::str::from_utf8(body.as_ref()).unwrap_or_default();
+                writeln!(f, "{}", LightRed.paint(body))?;
+            } else {
+                if is_text && body.len() < 1024 {
+                    writeln!(f, "{}", std::string::String::from_utf8_lossy(body))?;
+                } else {
+                    let text = format!(
+                        "Body discarded {}",
+                        ByteSize(self.body_size.unwrap_or(0) as u64)
+                    );
+                    writeln!(f, "{}", LightCyan.paint(text))?;
+                }
+            }
+        }
 
         Ok(())
     }
