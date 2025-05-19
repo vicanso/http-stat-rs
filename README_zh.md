@@ -15,12 +15,14 @@
 
 为 Windows、macOS 和 Linux 提供[预编译二进制文件](https://github.com/vicanso/http-stat-rs/releases)。
 
+### linux
 ```bash
-## linux
 curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/httpstat-linux-musl-$(uname -m).tar.gz | tar -xzf -
 sudo mv httpstat /usr/local/bin/
+```
 
-## macos
+### macos
+```bash
 curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/httpstat-darwin-$(uname -m).tar.gz | tar -xzf -
 sudo mv httpstat /usr/local/bin/
 ```
