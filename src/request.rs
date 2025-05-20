@@ -81,6 +81,11 @@ pub struct HttpRequest {
     pub body: Option<Bytes>,                     // Request body
     pub silent: bool,                            // Silent mode
     pub dns_servers: Option<Vec<String>>,        // DNS servers
+    pub dns_timeout: Option<Duration>,           // DNS resolution timeout
+    pub tcp_timeout: Option<Duration>,           // TCP connection timeout
+    pub tls_timeout: Option<Duration>,           // TLS handshake timeout
+    pub request_timeout: Option<Duration>,       // HTTP request timeout
+    pub quic_timeout: Option<Duration>,          // QUIC connection timeout
 }
 
 impl HttpRequest {
@@ -133,7 +138,12 @@ impl TryFrom<&str> for HttpRequest {
     type Error = Error;
 
     fn try_from(url: &str) -> Result<Self> {
-        let uri = url.parse::<Uri>().map_err(|e| Error::Uri { source: e })?;
+        let value = if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else {
+            format!("http://{}", url)
+        };
+        let uri = value.parse::<Uri>().map_err(|e| Error::Uri { source: e })?;
         Ok(Self {
             uri,
             alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
@@ -209,10 +219,13 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
     // Perform DNS lookup
     let resolver = builder.build();
     let dns_start = Instant::now();
-    let addr = timeout(Duration::from_secs(10), resolver.lookup_ip(&host))
-        .await
-        .map_err(|e| Error::Timeout { source: e })?
-        .map_err(|e| Error::Resolve { source: e })?;
+    let addr = timeout(
+        req.dns_timeout.unwrap_or(Duration::from_secs(5)),
+        resolver.lookup_ip(&host),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Resolve { source: e })?;
     stat.dns_lookup = Some(dns_start.elapsed());
     let addr = addr.into_iter().next().ok_or(Error::Common {
         category: "http".to_string(),
@@ -225,12 +238,19 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
 }
 
 // Establish TCP connection
-async fn tcp_connect(addr: SocketAddr, stat: &mut HttpStat) -> Result<TcpStream> {
+async fn tcp_connect(
+    addr: SocketAddr,
+    tcp_timeout: Option<Duration>,
+    stat: &mut HttpStat,
+) -> Result<TcpStream> {
     let tcp_start = Instant::now();
-    let tcp_stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
-        .await
-        .map_err(|e| Error::Timeout { source: e })?
-        .map_err(|e| Error::Io { source: e })?;
+    let tcp_stream = timeout(
+        tcp_timeout.unwrap_or(Duration::from_secs(5)),
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Io { source: e })?;
     stat.tcp_connect = Some(tcp_start.elapsed());
     Ok(tcp_stream)
 }
@@ -239,6 +259,7 @@ async fn tcp_connect(addr: SocketAddr, stat: &mut HttpStat) -> Result<TcpStream>
 async fn tls_handshake(
     host: String,
     tcp_stream: TcpStream,
+    tls_timeout: Option<Duration>,
     alpn_protocols: Vec<String>,
     skip_verify: bool,
     stat: &mut HttpStat,
@@ -276,7 +297,7 @@ async fn tls_handshake(
 
     // Perform TLS handshake
     let tls_stream = timeout(
-        Duration::from_secs(30),
+        tls_timeout.unwrap_or(Duration::from_secs(5)),
         connector.connect(
             host.clone()
                 .try_into()
@@ -341,11 +362,12 @@ async fn tls_handshake(
 async fn send_http_request(
     req: Request<Full<Bytes>>,
     tcp_stream: TcpStream,
+    request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
-        Duration::from_secs(30),
+        request_timeout.unwrap_or(Duration::from_secs(30)),
         hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)),
     )
     .await
@@ -372,11 +394,12 @@ async fn send_http_request(
 async fn send_https_request(
     req: Request<Full<Bytes>>,
     tls_stream: TlsStream<TcpStream>,
+    request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
-        Duration::from_secs(30),
+        request_timeout.unwrap_or(Duration::from_secs(30)),
         hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)),
     )
     .await
@@ -521,7 +544,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
 
     // Establish QUIC connection
     let (client_endpoint, conn) = match timeout(
-        Duration::from_secs(30),
+        http_req.quic_timeout.unwrap_or(Duration::from_secs(30)),
         quic_connect(host, addr, http_req.skip_verify, &mut stat),
     )
     .await
@@ -578,11 +601,16 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     // Create HTTP/3 connection
     let quinn_conn = h3_quinn::Connection::new(conn);
 
-    let (mut driver, mut send_request) = match h3::client::new(quinn_conn)
-        .await
-        .map_err(|e| Error::H3ConnectionError { source: e })
+    let (mut driver, mut send_request) = match timeout(
+        http_req.request_timeout.unwrap_or(Duration::from_secs(30)),
+        h3::client::new(quinn_conn),
+    )
+    .await
     {
-        Ok(result) => result,
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            return finish_with_error(stat, e, start);
+        }
         Err(e) => {
             return finish_with_error(stat, e, start);
         }
@@ -685,7 +713,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
     };
 
     // TCP connection
-    let tcp_stream = match tcp_connect(addr, &mut stat).await {
+    let tcp_stream = match tcp_connect(addr, http_req.tcp_timeout, &mut stat).await {
         Ok(stream) => stream,
         Err(e) => {
             return finish_with_error(stat, e, start);
@@ -701,6 +729,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
         let tls_result = tls_handshake(
             host.clone(),
             tcp_stream,
+            http_req.tls_timeout,
             http_req.alpn_protocols,
             http_req.skip_verify,
             &mut stat,
@@ -722,7 +751,8 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
                 }
             }
         } else {
-            match send_https_request(req, tls_stream, tx, &mut stat).await {
+            match send_https_request(req, tls_stream, http_req.request_timeout, tx, &mut stat).await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     return finish_with_error(stat, e, start);
@@ -731,7 +761,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
         }
     } else {
         // Send HTTP request
-        match send_http_request(req, tcp_stream, tx, &mut stat).await {
+        match send_http_request(req, tcp_stream, http_req.request_timeout, tx, &mut stat).await {
             Ok(resp) => resp,
             Err(e) => {
                 return finish_with_error(stat, e, start);
