@@ -228,37 +228,39 @@ impl fmt::Display for HttpStat {
             });
         }
 
-        // print name
-        write!(f, " ")?;
-        for (i, timeline) in timelines.iter().enumerate() {
-            write!(
-                f,
-                "{}",
-                timeline.name.unicode_pad(width, Alignment::Center, true)
-            )?;
-            if i < timelines.len() - 1 {
-                write!(f, " ")?;
+        if !timelines.is_empty() {
+            // print name
+            write!(f, " ")?;
+            for (i, timeline) in timelines.iter().enumerate() {
+                write!(
+                    f,
+                    "{}",
+                    timeline.name.unicode_pad(width, Alignment::Center, true)
+                )?;
+                if i < timelines.len() - 1 {
+                    write!(f, " ")?;
+                }
             }
-        }
-        writeln!(f)?;
+            writeln!(f)?;
 
-        // print duration
-        write!(f, "[")?;
-        for (i, timeline) in timelines.iter().enumerate() {
-            write!(
-                f,
-                "{}",
-                LightCyan.paint(
-                    format_duration(timeline.duration)
-                        .unicode_pad(width, Alignment::Center, true)
-                        .to_string(),
-                )
-            )?;
-            if i < timelines.len() - 1 {
-                write!(f, "|")?;
+            // print duration
+            write!(f, "[")?;
+            for (i, timeline) in timelines.iter().enumerate() {
+                write!(
+                    f,
+                    "{}",
+                    LightCyan.paint(
+                        format_duration(timeline.duration)
+                            .unicode_pad(width, Alignment::Center, true)
+                            .to_string(),
+                    )
+                )?;
+                if i < timelines.len() - 1 {
+                    write!(f, "|")?;
+                }
             }
+            writeln!(f, "]")?;
         }
-        writeln!(f, "]")?;
 
         // print | line
         write!(f, " ")?;
@@ -267,11 +269,10 @@ impl fmt::Display for HttpStat {
             write!(f, "|")?;
         }
         writeln!(f)?;
-
         write!(f, "{}", " ".repeat(width * timelines.len()))?;
         write!(
             f,
-            "total:{}\n\n",
+            "Total:{}\n\n",
             LightCyan.paint(format_duration(self.total.unwrap_or_default()))
         )?;
 
