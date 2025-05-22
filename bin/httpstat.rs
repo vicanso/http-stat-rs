@@ -17,7 +17,6 @@
 use bytes::Bytes;
 use clap::Parser;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
-use http::Method;
 use http::StatusCode;
 use http::Uri;
 use http_stat::{request, HttpRequest, HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
@@ -212,9 +211,7 @@ async fn main() {
         }
     }
 
-    if let Some(method) = args.method {
-        req.method = Some(method.parse::<Method>().unwrap_or_default());
-    }
+    req.method = args.method;
 
     if let Some(data) = args.data {
         req.body = Some(Bytes::from(data));

@@ -37,6 +37,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
@@ -72,7 +73,7 @@ fn format_time(timestamp_seconds: i64) -> String {
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
     pub uri: Uri,                                // Target URI
-    pub method: Option<Method>,                  // HTTP method (GET, POST, etc.)
+    pub method: Option<String>,                  // HTTP method (GET, POST, etc.)
     pub alpn_protocols: Vec<String>,             // Supported ALPN protocols
     pub resolve: Option<IpAddr>,                 // Custom DNS resolution
     pub headers: Option<HeaderMap<HeaderValue>>, // Custom HTTP headers
@@ -100,9 +101,12 @@ impl HttpRequest {
     // Build HTTP request with proper headers
     fn builder(&self) -> Builder {
         let uri = &self.uri;
-        let mut builder = Request::builder()
-            .uri(uri)
-            .method(self.method.clone().unwrap_or(Method::GET));
+        let method = if let Some(method) = &self.method {
+            Method::from_str(method).unwrap_or(Method::GET)
+        } else {
+            Method::GET
+        };
+        let mut builder = Request::builder().uri(uri).method(method);
         let mut set_host = false;
         let mut set_user_agent = false;
 
