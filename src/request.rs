@@ -187,6 +187,12 @@ async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Result<(SocketAd
         .to_string();
     let port = req.get_port();
 
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        let addr = SocketAddr::new(addr, port);
+        stat.addr = Some(addr.to_string());
+        return Ok((addr, host));
+    }
+
     // Check custom DNS resolutions first
     if let Some(resolve) = &req.resolve {
         let addr = SocketAddr::new(*resolve, port);
