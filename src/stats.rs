@@ -122,6 +122,7 @@ impl fmt::Display for HttpStat {
                 } else {
                     text = format!("{text} --> {}", LightRed.paint("FAIL"));
                 }
+                text = format!("{text} {}", format_duration(self.total.unwrap_or_default()));
             }
             writeln!(f, "{}", text)?;
         }
