@@ -7,7 +7,7 @@
 - 支持http1， http2 以及 http3
 - 默认的alpn是 `h2, http/1.1`
 - 支持多种压缩算法：`gzip, br, zstd`
-- 允许指定域名对应多个ip同时检测
+- 允许指定域名对应多个ip同时检测或者指定dns服务器
 
 ![截图](./screenshot.png)
 
@@ -36,6 +36,8 @@ cargo install http-stat
 ## 使用方法
 ```
 httpstat --http3 https://cloudflare-quic.com/
+
+httpstat https://www.xiaohongshu.com/explore --http3 --compressed 
 
 httpstat --resolve=183.240.99.169,2409:8c54:870:310:0:ff:b0ed:40ac -s https://www.baidu.com/
 ```

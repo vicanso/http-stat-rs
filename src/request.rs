@@ -839,15 +839,6 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
 /// - Response body (if not written to file)
 /// - TLS and certificate information (for HTTPS)
 /// - Any errors that occurred during the request
-///
-/// # Examples
-///
-/// ```rust
-/// let http_req = HttpRequest {
-///     uri: "https://example.com".parse().unwrap(),
-///     ..Default::default()
-/// };
-/// let stats = request(http_req).await;
 /// ```
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
