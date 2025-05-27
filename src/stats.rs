@@ -279,11 +279,13 @@ impl fmt::Display for HttpStat {
 
         if let Some(body) = &self.body {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();
-            if status >= 400 {
-                let body = std::str::from_utf8(body.as_ref()).unwrap_or_default();
-                writeln!(f, "{}", LightRed.paint(body))?;
-            } else if is_text && body.len() < 1024 {
-                writeln!(f, "{}", std::string::String::from_utf8_lossy(body))?;
+            let body = std::str::from_utf8(body.as_ref()).unwrap_or_default();
+            if is_text && body.len() < 1024 {
+                if status >= 400 {
+                    writeln!(f, "{}", LightRed.paint(body))?;
+                } else {
+                    writeln!(f, "{}", body)?;
+                }
             } else {
                 let text = format!(
                     "Body discarded {}",
