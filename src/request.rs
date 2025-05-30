@@ -32,6 +32,7 @@ use http::HeaderValue;
 use http::Request;
 use http::Response;
 use http::Uri;
+use http::Version;
 use http::{HeaderMap, Method};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -648,12 +649,13 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     };
 
     // Prepare request
-    let req = match http_req.builder().body(()) {
+    let mut req = match http_req.builder().body(()) {
         Ok(req) => req,
         Err(e) => {
             return finish_with_error(stat, e, start);
         }
     };
+    *req.version_mut() = Version::HTTP_3;
     let body = http_req.body.unwrap_or_default();
 
     // Handle connection driver

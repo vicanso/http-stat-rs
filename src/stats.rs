@@ -281,6 +281,11 @@ impl fmt::Display for HttpStat {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();
             let body = std::str::from_utf8(body.as_ref()).unwrap_or_default();
             if is_text && body.len() < 1024 {
+                let text = format!(
+                    "Body size: {}",
+                    ByteSize(self.body_size.unwrap_or(0) as u64)
+                );
+                writeln!(f, "{}\n", LightCyan.paint(text))?;
                 if status >= 400 {
                     writeln!(f, "{}", LightRed.paint(body))?;
                 } else {
