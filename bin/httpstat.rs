@@ -165,7 +165,7 @@ async fn main() {
 
     let Some(url) = args.url.or(args.url_arg) else {
         println!("url is required, either via --url or as a positional argument");
-        return;
+        std::process::exit(1);
     };
 
     let mut req: HttpRequest = url.as_str().try_into().unwrap();
@@ -228,6 +228,7 @@ async fn main() {
     }
     let output = args.output;
     req.silent = args.silent;
+    let mut is_failed = false;
 
     if let Some(resolve) = args.resolve {
         let ips = resolve.split(',').collect::<Vec<&str>>();
@@ -251,11 +252,20 @@ async fn main() {
             let body = stat.body.clone();
             println!("{}", stat);
             handle_output(body, output.clone()).await;
+            if !stat.is_success() {
+                is_failed = true;
+            }
         }
     } else {
         let stat = do_request(req, args.follow_redirect).await;
         let body = stat.body.clone();
         println!("{}", stat);
         handle_output(body, output.clone()).await;
+        if !stat.is_success() {
+            is_failed = true;
+        }
+    }
+    if is_failed {
+        std::process::exit(1);
     }
 }

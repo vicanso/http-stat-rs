@@ -97,6 +97,21 @@ pub struct HttpStat {
     pub silent: bool,
 }
 
+impl HttpStat {
+    pub fn is_success(&self) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
+        let Some(status) = &self.status else {
+            return false;
+        };
+        if status.as_u16() >= 400 {
+            return false;
+        }
+        true
+    }
+}
+
 impl fmt::Display for HttpStat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(addr) = &self.addr {
