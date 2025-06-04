@@ -95,6 +95,8 @@ pub struct HttpStat {
     pub headers: Option<HeaderMap<HeaderValue>>,
     pub error: Option<String>,
     pub silent: bool,
+    pub verbose: bool,
+    pub pretty: bool,
 }
 
 impl HttpStat {
@@ -159,25 +161,40 @@ impl fmt::Display for HttpStat {
         }
 
         if let Some(tls) = &self.tls {
-            writeln!(f, "{}: {}", "tls".to_train_case(), LightCyan.paint(tls))?;
+            writeln!(f)?;
+            writeln!(f, "Tls: {}", LightCyan.paint(tls))?;
             writeln!(
                 f,
-                "{}: {}",
-                "cipher".to_train_case(),
+                "Cipher: {}",
                 LightCyan.paint(self.cert_cipher.clone().unwrap_or_default())
             )?;
             writeln!(
                 f,
-                "{}: {}",
-                "not before".to_train_case(),
+                "Not Before: {}",
                 LightCyan.paint(self.cert_not_before.clone().unwrap_or_default())
             )?;
             writeln!(
                 f,
-                "{}: {}",
-                "not after".to_train_case(),
+                "Not After: {}",
                 LightCyan.paint(self.cert_not_after.clone().unwrap_or_default())
             )?;
+            if self.verbose {
+                writeln!(
+                    f,
+                    "Subject: {}",
+                    LightCyan.paint(self.subject.clone().unwrap_or_default())
+                )?;
+                writeln!(
+                    f,
+                    "Issuer: {}",
+                    LightCyan.paint(self.issuer.clone().unwrap_or_default())
+                )?;
+                writeln!(
+                    f,
+                    "Certificate Domains: {}",
+                    LightCyan.paint(self.cert_domains.clone().unwrap_or_default().join(", "))
+                )?;
+            }
             writeln!(f)?;
         }
 
@@ -294,8 +311,17 @@ impl fmt::Display for HttpStat {
 
         if let Some(body) = &self.body {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();
-            let body = std::str::from_utf8(body.as_ref()).unwrap_or_default();
-            if is_text && body.len() < 1024 {
+            let mut body = std::str::from_utf8(body.as_ref())
+                .unwrap_or_default()
+                .to_string();
+            if self.pretty {
+                if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Ok(value) = serde_json::to_string_pretty(&json_body) {
+                        body = value;
+                    }
+                }
+            }
+            if self.verbose || (is_text && body.len() < 1024) {
                 let text = format!(
                     "Body size: {}",
                     ByteSize(self.body_size.unwrap_or(0) as u64)

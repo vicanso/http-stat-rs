@@ -112,6 +112,13 @@ struct Args {
         help = "dns server address to use, format: 8.8.8.8,8.8.4.4"
     )]
     dns_servers: Option<String>,
+    /// Verbose mode
+    #[arg(short = 'v', long = "verbose", help = "verbose mode")]
+    verbose: bool,
+
+    /// Pretty mode
+    #[arg(long = "pretty", help = "pretty mode")]
+    pretty: bool,
 }
 
 async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
@@ -178,7 +185,6 @@ async fn main() {
         req.ip_version = Some(6);
     }
     req.skip_verify = args.skip_verify;
-    // req.output = args.output;
 
     if let Some(dns_servers) = args.dns_servers {
         req.dns_servers = Some(dns_servers.split(',').map(|s| s.to_string()).collect());
@@ -227,7 +233,6 @@ async fn main() {
         req.alpn_protocols = vec![ALPN_HTTP3.to_string()];
     }
     let output = args.output;
-    req.silent = args.silent;
     let mut is_failed = false;
 
     if let Some(resolve) = args.resolve {
@@ -248,7 +253,10 @@ async fn main() {
             let value2 = item2.error.is_some();
             value1.cmp(&value2)
         });
-        for stat in stats_list {
+        for mut stat in stats_list {
+            stat.verbose = args.verbose;
+            stat.silent = args.silent;
+            stat.pretty = args.pretty;
             let body = stat.body.clone();
             println!("{}", stat);
             handle_output(body, output.clone()).await;
@@ -257,7 +265,10 @@ async fn main() {
             }
         }
     } else {
-        let stat = do_request(req, args.follow_redirect).await;
+        let mut stat = do_request(req, args.follow_redirect).await;
+        stat.verbose = args.verbose;
+        stat.silent = args.silent;
+        stat.pretty = args.pretty;
         let body = stat.body.clone();
         println!("{}", stat);
         handle_output(body, output.clone()).await;

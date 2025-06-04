@@ -83,7 +83,6 @@ pub struct HttpRequest {
     pub ip_version: Option<i32>,                 // IP version (4 for IPv4, 6 for IPv6)
     pub skip_verify: bool,                       // Skip TLS certificate verification
     pub body: Option<Bytes>,                     // Request body
-    pub silent: bool,                            // Silent mode
     pub dns_servers: Option<Vec<String>>,        // DNS servers
     pub dns_timeout: Option<Duration>,           // DNS resolution timeout
     pub tcp_timeout: Option<Duration>,           // TCP connection timeout
@@ -865,7 +864,6 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
 /// ```
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
-    let silent = http_req.silent;
 
     // Handle HTTP/3 request
     let mut stat = if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
@@ -897,8 +895,6 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
             }
         }
     }
-
-    stat.silent = silent;
 
     stat
 }
