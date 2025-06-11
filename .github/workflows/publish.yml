@@ -1,82 +1,88 @@
 name: "publish"
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
-    # branches: []
+    # tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    branches: [main]
 
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
   CARGO_TERM_COLOR: always
 
 jobs:
-  macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.86.0
-      - name: Install target
-        run: |
-          rustup update
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-apple-darwin
-      - name: release
-        run: |
-          cargo build --release --target=aarch64-apple-darwin
-          mv target/aarch64-apple-darwin/release/httpstat ./httpstat
-          tar -czvf httpstat-darwin-arm64.tar.gz httpstat
+  # macos:
+  #   runs-on: macos-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions-rs/toolchain@v1
+  #       with:
+  #         toolchain: 1.86.0
+  #     - name: Install target
+  #       run: |
+  #         rustup update
+  #         rustup target add aarch64-apple-darwin
+  #         rustup target add x86_64-apple-darwin
+  #     - name: release
+  #       run: |
+  #         cargo build --release --target=aarch64-apple-darwin
+  #         mv target/aarch64-apple-darwin/release/httpstat ./httpstat
+  #         tar -czvf httpstat-darwin-arm64.tar.gz httpstat
 
         
-          cargo build --release --target=x86_64-apple-darwin
-          mv target/x86_64-apple-darwin/release/httpstat ./httpstat
-          tar -czvf httpstat-darwin-x86_64.tar.gz httpstat
+  #         cargo build --release --target=x86_64-apple-darwin
+  #         mv target/x86_64-apple-darwin/release/httpstat ./httpstat
+  #         tar -czvf httpstat-darwin-x86_64.tar.gz httpstat
 
 
-          ls -lh httpstat*.gz
+  #         ls -lh httpstat*.gz
 
-          ./.github/workflows/upload_asset.sh ./httpstat-darwin-arm64.tar.gz $GITHUB_TOKEN
-          ./.github/workflows/upload_asset.sh ./httpstat-darwin-x86_64.tar.gz $GITHUB_TOKEN
+  #         ./.github/workflows/upload_asset.sh ./httpstat-darwin-arm64.tar.gz $GITHUB_TOKEN
+  #         ./.github/workflows/upload_asset.sh ./httpstat-darwin-x86_64.tar.gz $GITHUB_TOKEN
 
-  linux-musl-x86:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: release
-        uses: addnab/docker-run-action@v3
-        with:
-          image: messense/rust-musl-cross:x86_64-musl
-          options: -v ${{ github.workspace }}:/home/rust/src
-          run: |
-            apt-get update
-            make release
-            mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat
-            curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
-            ./upx-5.0.1-amd64_linux/upx httpstat
-            ls -lh httpstat
-      - name: Upload Assets
-        run: |
-          tar -czvf httpstat-linux-musl-x86_64.tar.gz httpstat
+  # linux-musl-x86:
+  #   runs-on: ubuntu-22.04
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: release
+  #       uses: addnab/docker-run-action@v3
+  #       with:
+  #         image: messense/rust-musl-cross:x86_64-musl
+  #         options: -v ${{ github.workspace }}:/home/rust/src
+  #         run: |
+  #           apt-get update
+  #           make release
+  #           mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat
+  #           curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
+  #           ./upx-5.0.1-amd64_linux/upx httpstat
+  #           ls -lh httpstat
+  #     - name: Upload Assets
+  #       run: |
+  #         tar -czvf httpstat-linux-musl-x86_64.tar.gz httpstat
 
-          ls -lh httpstat*.gz
+  #         ls -lh httpstat*.gz
 
-          ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
+  #         ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-aarch64:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: setup qemu
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - name: release
         uses: addnab/docker-run-action@v3
         with:
           image: messense/rust-musl-cross:aarch64-musl
           options: -v ${{ github.workspace }}:/home/rust/src
+          platform: linux/arm64
           run: |
+            arch
             apt-get update
             make release
             mv target/aarch64-unknown-linux-musl/release/httpstat ./httpstat
-            curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-arm64_linux.tar.xz | tar --xz -xvf -
-            ./upx-5.0.1-arm64_linux/upx httpstat
+            # curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-arm64_linux.tar.xz | tar --xz -xvf -
+            # ./upx-5.0.1-arm64_linux/upx httpstat
             ls -lh httpstat
       - name: Upload Assets
         run: |
@@ -87,59 +93,59 @@ jobs:
           ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-aarch64.tar.gz $GITHUB_TOKEN
 
 
-  windows:
-    runs-on: windows-latest
-    name: ${{ matrix.target }}
-    env:
-      CFG_RELEASE_CHANNEL: ${{ matrix.cfg_release_channel }}
-    strategy:
-      # https://help.github.com/en/actions/getting-started-with-github-actions/about-github-actions#usage-limits
-      # There's a limit of 60 concurrent jobs across all repos in the rust-lang organization.
-      # In order to prevent overusing too much of that 60 limit, we throttle the
-      # number of rustfmt jobs that will run concurrently.
-      matrix:
-        target: [x86_64-pc-windows-msvc]
+  # windows:
+  #   runs-on: windows-latest
+  #   name: ${{ matrix.target }}
+  #   env:
+  #     CFG_RELEASE_CHANNEL: ${{ matrix.cfg_release_channel }}
+  #   strategy:
+  #     # https://help.github.com/en/actions/getting-started-with-github-actions/about-github-actions#usage-limits
+  #     # There's a limit of 60 concurrent jobs across all repos in the rust-lang organization.
+  #     # In order to prevent overusing too much of that 60 limit, we throttle the
+  #     # number of rustfmt jobs that will run concurrently.
+  #     matrix:
+  #       target: [x86_64-pc-windows-msvc]
 
-    steps:
-      # The Windows runners have autocrlf enabled by default
-      # which causes failures for some of rustfmt's line-ending sensitive tests
-      - name: disable git eol translation
-        run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
+  #   steps:
+  #     # The Windows runners have autocrlf enabled by default
+  #     # which causes failures for some of rustfmt's line-ending sensitive tests
+  #     - name: disable git eol translation
+  #       run: git config --global core.autocrlf false
+  #     - uses: actions/checkout@v4
 
-        # Run build
-      - name: Install Rustup using win.rustup.rs
-        run: |
-          # Disable the download progress bar which can cause perf issues
-          $ProgressPreference = "SilentlyContinue"
-          Invoke-WebRequest https://win.rustup.rs/ -OutFile rustup-init.exe
-          .\rustup-init.exe -y --default-host=x86_64-pc-windows-msvc --default-toolchain=none
-          del rustup-init.exe
-          rustup target add ${{ matrix.target }}
-        shell: powershell
+  #       # Run build
+  #     - name: Install Rustup using win.rustup.rs
+  #       run: |
+  #         # Disable the download progress bar which can cause perf issues
+  #         $ProgressPreference = "SilentlyContinue"
+  #         Invoke-WebRequest https://win.rustup.rs/ -OutFile rustup-init.exe
+  #         .\rustup-init.exe -y --default-host=x86_64-pc-windows-msvc --default-toolchain=none
+  #         del rustup-init.exe
+  #         rustup target add ${{ matrix.target }}
+  #       shell: powershell
 
-      - name: Add mingw64 to path for x86_64-gnu
-        run: echo "C:\msys64\mingw64\bin" >> $GITHUB_PATH
-        if: matrix.target == 'x86_64-pc-windows-gnu' && matrix.channel == 'nightly'
-        shell: bash
+  #     - name: Add mingw64 to path for x86_64-gnu
+  #       run: echo "C:\msys64\mingw64\bin" >> $GITHUB_PATH
+  #       if: matrix.target == 'x86_64-pc-windows-gnu' && matrix.channel == 'nightly'
+  #       shell: bash
 
-      - name: Set Perl environment variables
-        if: runner.os == 'Windows'
-        run: |
-          echo "PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          echo "OPENSSL_SRC_PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+  #     - name: Set Perl environment variables
+  #       if: runner.os == 'Windows'
+  #       run: |
+  #         echo "PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+  #         echo "OPENSSL_SRC_PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Run cargo release
-        shell: bash
-        run: |
-          cargo --version
-          cargo build --release 
-          mv target/release/httpstat.exe ./httpstat.exe
-      - name: Zip
-        shell: powershell
-        run: |
-          Compress-Archive -Path httpstat.exe -Destination httpstat-windows.exe.zip
-      - name: Upload asset
-        shell: bash
-        run: |
-          ./.github/workflows/upload_asset.sh ./httpstat-windows.exe.zip $GITHUB_TOKEN
+  #     - name: Run cargo release
+  #       shell: bash
+  #       run: |
+  #         cargo --version
+  #         cargo build --release 
+  #         mv target/release/httpstat.exe ./httpstat.exe
+  #     - name: Zip
+  #       shell: powershell
+  #       run: |
+  #         Compress-Archive -Path httpstat.exe -Destination httpstat-windows.exe.zip
+  #     - name: Upload asset
+  #       shell: bash
+  #       run: |
+  #         ./.github/workflows/upload_asset.sh ./httpstat-windows.exe.zip $GITHUB_TOKEN
