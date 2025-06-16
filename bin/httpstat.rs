@@ -171,7 +171,7 @@ async fn main() {
     let args = Args::parse();
 
     let Some(url) = args.url.or(args.url_arg) else {
-        println!("url is required, either via --url or as a positional argument");
+        println!("httpstat: try 'httpstat -h' or 'httpstat --help' for more information");
         std::process::exit(1);
     };
 
