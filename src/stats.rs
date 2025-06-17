@@ -331,12 +331,10 @@ impl fmt::Display for HttpStat {
             let mut body = std::str::from_utf8(body.as_ref())
                 .unwrap_or_default()
                 .to_string();
-            if self.pretty {
-                if is_json {
-                    if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Ok(value) = serde_json::to_string_pretty(&json_body) {
-                            body = value;
-                        }
+            if self.pretty && is_json {
+                if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Ok(value) = serde_json::to_string_pretty(&json_body) {
+                        body = value;
                     }
                 }
             }
