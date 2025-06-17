@@ -655,6 +655,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         }
     };
     *req.version_mut() = Version::HTTP_3;
+    stat.request_headers = req.headers().clone();
     let body = http_req.body.unwrap_or_default();
 
     // Handle connection driver
@@ -743,6 +744,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
             return finish_with_error(stat, e, start);
         }
     };
+    stat.request_headers = req.headers().clone();
 
     // TCP connection
     let tcp_stream = match tcp_connect(addr, http_req.tcp_timeout, &mut stat).await {

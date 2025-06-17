@@ -73,6 +73,7 @@ struct Timeline {
 /// * `error` - Any error that occurred during the request
 #[derive(Default, Debug)]
 pub struct HttpStat {
+    pub request_headers: HeaderMap<HeaderValue>,
     pub dns_lookup: Option<Duration>,
     pub quic_connect: Option<Duration>,
     pub tcp_connect: Option<Duration>,
@@ -149,6 +150,18 @@ impl fmt::Display for HttpStat {
         if self.silent {
             return Ok(());
         }
+        if self.verbose {
+            for (key, value) in self.request_headers.iter() {
+                writeln!(
+                    f,
+                    "{}: {}",
+                    key.to_string().to_train_case(),
+                    LightCyan.paint(value.to_str().unwrap_or_default())
+                )?;
+            }
+            writeln!(f)?;
+        }
+
         if let Some(status) = &self.status {
             let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
             let status_code = status.as_u16();
@@ -199,13 +212,17 @@ impl fmt::Display for HttpStat {
         }
 
         let mut is_text = false;
+        let mut is_json = false;
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
                 let value = value.to_str().unwrap_or_default();
-                if key.to_string().to_lowercase() == "content-type"
-                    && (value.contains("text/") || value.contains("application/json"))
-                {
-                    is_text = true;
+                if key.to_string().to_lowercase() == "content-type" {
+                    if value.contains("text/") || value.contains("application/json") {
+                        is_text = true;
+                    }
+                    if value.contains("application/json") {
+                        is_json = true;
+                    }
                 }
                 writeln!(
                     f,
@@ -315,9 +332,11 @@ impl fmt::Display for HttpStat {
                 .unwrap_or_default()
                 .to_string();
             if self.pretty {
-                if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if let Ok(value) = serde_json::to_string_pretty(&json_body) {
-                        body = value;
+                if is_json {
+                    if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Ok(value) = serde_json::to_string_pretty(&json_body) {
+                            body = value;
+                        }
                     }
                 }
             }
