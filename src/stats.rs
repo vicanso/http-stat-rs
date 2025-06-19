@@ -23,7 +23,9 @@ use http::HeaderValue;
 use http::StatusCode;
 use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed};
 use std::fmt;
+use std::io::Write;
 use std::time::Duration;
+use tempfile::NamedTempFile;
 use unicode_truncate::Alignment;
 use unicode_truncate::UnicodeTruncateStr;
 
@@ -350,11 +352,18 @@ impl fmt::Display for HttpStat {
                     writeln!(f, "{}", body)?;
                 }
             } else {
+                let mut save_tips = "".to_string();
+                if let Ok(mut file) = NamedTempFile::new() {
+                    if let Ok(()) = file.write_all(body.as_bytes()) {
+                        save_tips = format!("saved to: {}", file.path().display());
+                        let _ = file.keep();
+                    }
+                }
                 let text = format!(
                     "Body discarded {}",
                     ByteSize(self.body_size.unwrap_or(0) as u64)
                 );
-                writeln!(f, "{}", LightCyan.paint(text))?;
+                writeln!(f, "{} {}", LightCyan.paint(text), save_tips)?;
             }
         }
 
