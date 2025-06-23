@@ -17,7 +17,10 @@
 
 use super::decompress::decompress;
 use super::error::{Error, Result};
-use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
+use super::finish_with_error;
+use super::grpc::grpc_request;
+use super::stats::{HttpStat, ALPN_HTTP2, ALPN_HTTP3};
+use super::HttpRequest;
 use super::SkipVerifier;
 use bytes::{Buf, Bytes, BytesMut};
 use chrono::{Local, TimeZone};
@@ -27,20 +30,15 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
-use http::request::Builder;
-use http::HeaderValue;
 use http::Request;
 use http::Response;
-use http::Uri;
 use http::Version;
-use http::{HeaderMap, Method};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
@@ -51,9 +49,6 @@ use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
-
-// Version information from Cargo.toml
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Format TLS protocol version for display
 fn format_tls_protocol(protocol: &str) -> String {
@@ -70,102 +65,6 @@ fn format_time(timestamp_seconds: i64) -> String {
     Local
         .timestamp_nanos(timestamp_seconds * 1_000_000_000)
         .to_string()
-}
-
-// HttpRequest struct to hold request configuration
-#[derive(Default, Debug, Clone)]
-pub struct HttpRequest {
-    pub uri: Uri,                                // Target URI
-    pub method: Option<String>,                  // HTTP method (GET, POST, etc.)
-    pub alpn_protocols: Vec<String>,             // Supported ALPN protocols
-    pub resolve: Option<IpAddr>,                 // Custom DNS resolution
-    pub headers: Option<HeaderMap<HeaderValue>>, // Custom HTTP headers
-    pub ip_version: Option<i32>,                 // IP version (4 for IPv4, 6 for IPv6)
-    pub skip_verify: bool,                       // Skip TLS certificate verification
-    pub body: Option<Bytes>,                     // Request body
-    pub dns_servers: Option<Vec<String>>,        // DNS servers
-    pub dns_timeout: Option<Duration>,           // DNS resolution timeout
-    pub tcp_timeout: Option<Duration>,           // TCP connection timeout
-    pub tls_timeout: Option<Duration>,           // TLS handshake timeout
-    pub request_timeout: Option<Duration>,       // HTTP request timeout
-    pub quic_timeout: Option<Duration>,          // QUIC connection timeout
-}
-
-impl HttpRequest {
-    pub fn get_port(&self) -> u16 {
-        let default_port = if self.uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
-            443
-        } else {
-            80
-        };
-        self.uri.port_u16().unwrap_or(default_port)
-    }
-    // Build HTTP request with proper headers
-    fn builder(&self) -> Builder {
-        let uri = &self.uri;
-        let method = if let Some(method) = &self.method {
-            Method::from_str(method).unwrap_or(Method::GET)
-        } else {
-            Method::GET
-        };
-        let mut builder = Request::builder().uri(uri).method(method);
-        let mut set_host = false;
-        let mut set_user_agent = false;
-
-        // Add custom headers if provided
-        if let Some(headers) = &self.headers {
-            for (key, value) in headers.iter() {
-                builder = builder.header(key, value);
-                match key.to_string().to_lowercase().as_str() {
-                    "host" => set_host = true,
-                    "user-agent" => set_user_agent = true,
-                    _ => {}
-                }
-            }
-        }
-
-        // Set default Host header if not provided
-        if !set_host {
-            if let Some(host) = uri.host() {
-                builder = builder.header("Host", host);
-            }
-        }
-
-        // Set default User-Agent if not provided
-        if !set_user_agent {
-            builder = builder.header("User-Agent", format!("httpstat.rs/{}", VERSION));
-        }
-        builder
-    }
-}
-
-// Convert string URL to HttpRequest
-impl TryFrom<&str> for HttpRequest {
-    type Error = Error;
-
-    fn try_from(url: &str) -> Result<Self> {
-        let value = if url.starts_with("http://") || url.starts_with("https://") {
-            url.to_string()
-        } else {
-            format!("http://{}", url)
-        };
-        let uri = value.parse::<Uri>().map_err(|e| Error::Uri { source: e })?;
-        Ok(Self {
-            uri,
-            alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
-            ..Default::default()
-        })
-    }
-}
-
-// Convert HttpRequest to hyper Request
-impl TryFrom<&HttpRequest> for Request<Full<Bytes>> {
-    type Error = Error;
-    fn try_from(req: &HttpRequest) -> Result<Self> {
-        req.builder()
-            .body(Full::new(req.body.clone().unwrap_or_default()))
-            .map_err(|e| Error::Http { source: e })
-    }
 }
 
 // Initialize crypto provider once
@@ -487,13 +386,6 @@ async fn send_https2_request(
         .map_err(|e| Error::Hyper { source: e })?;
     stat.server_processing = Some(server_processing_start.elapsed());
     Ok(resp)
-}
-
-// Handle request error and update statistics
-fn finish_with_error(mut stat: HttpStat, error: impl ToString, start: Instant) -> HttpStat {
-    stat.error = Some(error.to_string());
-    stat.total = Some(start.elapsed());
-    stat
 }
 
 // Establish QUIC connection for HTTP/3
@@ -866,9 +758,16 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
 /// ```
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
+    let schema = if let Some(schema) = http_req.uri.scheme() {
+        schema.to_string()
+    } else {
+        "".to_string()
+    };
 
     // Handle HTTP/3 request
-    let mut stat = if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
+    let mut stat = if ["grpc", "grpcs"].contains(&schema.as_str()) {
+        grpc_request(http_req).await
+    } else if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
         http3_request(http_req).await
     } else {
         http1_2_request(http_req).await
