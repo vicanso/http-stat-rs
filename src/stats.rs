@@ -73,8 +73,9 @@ struct Timeline {
 /// * `body` - Response body content
 /// * `headers` - Response headers
 /// * `error` - Any error that occurred during the request
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct HttpStat {
+    pub is_grpc: bool,
     pub request_headers: HeaderMap<HeaderValue>,
     pub dns_lookup: Option<Duration>,
     pub quic_connect: Option<Duration>,
@@ -84,6 +85,7 @@ pub struct HttpStat {
     pub content_transfer: Option<Duration>,
     pub total: Option<Duration>,
     pub addr: Option<String>,
+    pub grpc_status: Option<String>,
     pub status: Option<StatusCode>,
     pub tls: Option<String>,
     pub alpn: Option<String>,
@@ -105,6 +107,12 @@ pub struct HttpStat {
 impl HttpStat {
     pub fn is_success(&self) -> bool {
         if self.error.is_some() {
+            return false;
+        }
+        if self.is_grpc {
+            if let Some(grpc_status) = &self.grpc_status {
+                return grpc_status == "0";
+            }
             return false;
         }
         let Some(status) = &self.status else {
@@ -173,6 +181,12 @@ impl fmt::Display for HttpStat {
                 LightRed.paint(status.to_string())
             };
             writeln!(f, "{} {}", LightCyan.paint(alpn.to_uppercase()), status)?;
+        }
+        if self.is_grpc {
+            if self.is_success() {
+                writeln!(f, "{}", LightGreen.paint("GRPC OK"))?;
+            }
+            writeln!(f)?;
         }
 
         if let Some(tls) = &self.tls {

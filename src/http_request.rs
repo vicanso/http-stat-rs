@@ -64,7 +64,13 @@ pub struct HttpRequest {
 
 impl HttpRequest {
     pub fn get_port(&self) -> u16 {
-        let default_port = if self.uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
+        let schema = if let Some(scheme) = self.uri.scheme() {
+            scheme.to_string()
+        } else {
+            "".to_string()
+        };
+
+        let default_port = if ["https", "grpcs"].contains(&schema.as_str()) {
             443
         } else {
             80
