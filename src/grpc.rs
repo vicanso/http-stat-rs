@@ -86,7 +86,7 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
         ..Default::default()
     }));
     let endpoint = tonic::transport::Endpoint::from(http_req.uri.clone());
-    let endpoint = match endpoint.user_agent(format!("httpstat.rs/{}", VERSION)) {
+    let endpoint = match endpoint.user_agent(format!("httpstat.rs/{VERSION}")) {
         Ok(endpoint) => endpoint,
         Err(e) => {
             let stat = stat.lock().await;
@@ -141,7 +141,7 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
         stat.grpc_status = Some(grpc_status.to_str().unwrap_or_default().to_string());
     }
     stat.headers = Some(meta.into_headers());
-    stat.body = Some(format!("{:?}", message).into());
+    stat.body = Some(format!("{message:?}").into());
     stat.total = Some(start.elapsed());
     stat
 }

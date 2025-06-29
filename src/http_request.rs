@@ -119,7 +119,7 @@ impl HttpRequest {
 
         // Set default User-Agent if not provided
         if !set_user_agent {
-            builder = builder.header("User-Agent", format!("httpstat.rs/{}", VERSION));
+            builder = builder.header("User-Agent", format!("httpstat.rs/{VERSION}"));
         }
         builder
     }
@@ -135,7 +135,7 @@ impl TryFrom<&str> for HttpRequest {
         let value = if prefixes.iter().any(|prefix| url.starts_with(prefix)) {
             url.to_string()
         } else {
-            format!("http://{}", url)
+            format!("http://{url}")
         };
         let uri = value.parse::<Uri>().map_err(|e| Error::Uri { source: e })?;
         Ok(Self {

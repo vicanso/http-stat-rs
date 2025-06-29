@@ -4,5 +4,5 @@ use http_stat::request;
 async fn main() {
     let stat = request("https://www.baidu.com/".try_into().unwrap()).await;
     // println!("{:?}", stat);
-    println!("{}", stat);
+    println!("{stat}");
 }

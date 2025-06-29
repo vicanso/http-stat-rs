@@ -250,7 +250,7 @@ pub(crate) async fn tls_handshake(
 
     // Get cipher suite information
     if let Some(cipher) = session.negotiated_cipher_suite() {
-        let cipher = format!("{:?}", cipher);
+        let cipher = format!("{cipher:?}");
         if let Some((_, cipher)) = cipher.split_once("_") {
             stat.cert_cipher = Some(cipher.to_string());
         } else {

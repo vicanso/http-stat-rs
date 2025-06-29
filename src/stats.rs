@@ -152,7 +152,7 @@ impl fmt::Display for HttpStat {
                 }
                 text = format!("{text} {}", format_duration(self.total.unwrap_or_default()));
             }
-            writeln!(f, "{}", text)?;
+            writeln!(f, "{text}")?;
         }
         if let Some(error) = &self.error {
             writeln!(f, "Error: {}", LightRed.paint(error))?;
@@ -363,7 +363,7 @@ impl fmt::Display for HttpStat {
                 if status >= 400 {
                     writeln!(f, "{}", LightRed.paint(body))?;
                 } else {
-                    writeln!(f, "{}", body)?;
+                    writeln!(f, "{body}")?;
                 }
             } else {
                 let mut save_tips = "".to_string();

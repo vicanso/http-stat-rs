@@ -163,7 +163,7 @@ async fn handle_output(body: Option<Bytes>, output: Option<String>) {
         return;
     };
     if let Err(e) = fs::write(output, body).await {
-        println!("write output error: {}", e);
+        println!("write output error: {e}");
     }
 }
 #[tokio::main]
@@ -258,7 +258,7 @@ async fn main() {
             stat.silent = args.silent;
             stat.pretty = args.pretty;
             let body = stat.body.clone();
-            println!("{}", stat);
+            println!("{stat}");
             handle_output(body, output.clone()).await;
             if !stat.is_success() {
                 is_failed = true;
@@ -270,7 +270,7 @@ async fn main() {
         stat.silent = args.silent;
         stat.pretty = args.pretty;
         let body = stat.body.clone();
-        println!("{}", stat);
+        println!("{stat}");
         handle_output(body, output.clone()).await;
         if !stat.is_success() {
             is_failed = true;

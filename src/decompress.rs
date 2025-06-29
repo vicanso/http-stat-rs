@@ -27,7 +27,7 @@ fn decompress_gzip(data: &[u8]) -> Result<Bytes> {
     let mut decompressed = Vec::new();
     std::io::Read::read_to_end(&mut decoder, &mut decompressed).map_err(|e| Error::Common {
         category: "gzip".to_string(),
-        message: format!("Failed to decompress gzip data: {}", e),
+        message: format!("Failed to decompress gzip data: {e}"),
     })?;
     Ok(Bytes::from(decompressed))
 }
@@ -38,7 +38,7 @@ fn decompress_brotli(data: &[u8]) -> Result<Bytes> {
     std::io::Read::read_to_end(&mut decompressor, &mut decompressed).map_err(|e| {
         Error::Common {
             category: "brotli".to_string(),
-            message: format!("Failed to decompress brotli data: {}", e),
+            message: format!("Failed to decompress brotli data: {e}"),
         }
     })?;
     Ok(Bytes::from(decompressed))
@@ -47,13 +47,13 @@ fn decompress_brotli(data: &[u8]) -> Result<Bytes> {
 fn decompress_zstd(data: &[u8]) -> Result<Bytes> {
     let mut decompressor = Decoder::new(data).map_err(|e| Error::Common {
         category: "zstd".to_string(),
-        message: format!("Failed to create zstd decoder: {}", e),
+        message: format!("Failed to create zstd decoder: {e}"),
     })?;
     let mut decompressed = Vec::new();
     std::io::Read::read_to_end(&mut decompressor, &mut decompressed).map_err(|e| {
         Error::Common {
             category: "zstd".to_string(),
-            message: format!("Failed to decompress zstd data: {}", e),
+            message: format!("Failed to decompress zstd data: {e}"),
         }
     })?;
     Ok(Bytes::from(decompressed))

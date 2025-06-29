@@ -436,7 +436,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
     let body = match body_result {
         Ok(body) => body,
         Err(e) => {
-            return finish_with_error(stat, format!("Failed to read response body: {}", e), start);
+            return finish_with_error(stat, format!("Failed to read response body: {e}"), start);
         }
     };
 
