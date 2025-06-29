@@ -78,14 +78,23 @@ impl HttpRequest {
         self.uri.port_u16().unwrap_or(default_port)
     }
     // Build HTTP request with proper headers
-    pub fn builder(&self) -> Builder {
+    pub fn builder(&self, is_http1: bool) -> Builder {
         let uri = &self.uri;
         let method = if let Some(method) = &self.method {
             Method::from_str(method).unwrap_or(Method::GET)
         } else {
             Method::GET
         };
-        let mut builder = Request::builder().uri(uri).method(method);
+        let mut builder = if is_http1 {
+            if let Some(value) = uri.path_and_query() {
+                Request::builder().uri(value.to_string())
+            } else {
+                Request::builder().uri(uri)
+            }
+        } else {
+            Request::builder().uri(uri)
+        };
+        builder = builder.method(method);
         let mut set_host = false;
         let mut set_user_agent = false;
 
@@ -141,8 +150,17 @@ impl TryFrom<&str> for HttpRequest {
 impl TryFrom<&HttpRequest> for Request<Full<Bytes>> {
     type Error = Error;
     fn try_from(req: &HttpRequest) -> Result<Self> {
-        req.builder()
+        req.builder(true)
             .body(Full::new(req.body.clone().unwrap_or_default()))
             .map_err(|e| Error::Http { source: e })
     }
+}
+
+pub(crate) fn build_http_request(
+    req: &HttpRequest,
+    is_http1: bool,
+) -> Result<Request<Full<Bytes>>> {
+    req.builder(is_http1)
+        .body(Full::new(req.body.clone().unwrap_or_default()))
+        .map_err(|e| Error::Http { source: e })
 }

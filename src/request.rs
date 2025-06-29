@@ -15,6 +15,7 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
+use super::build_http_request;
 use super::decompress::decompress;
 use super::error::{Error, Result};
 use super::finish_with_error;
@@ -249,7 +250,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     };
 
     // Prepare request
-    let mut req = match http_req.builder().body(()) {
+    let mut req = match http_req.builder(false).body(()) {
         Ok(req) => req,
         Err(e) => {
             return finish_with_error(stat, e, start);
@@ -338,14 +339,14 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
     let uri = &http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
-    // Convert request to hyper Request
-    let req: Request<Full<Bytes>> = match (&http_req).try_into() {
-        Ok(req) => req,
-        Err(e) => {
-            return finish_with_error(stat, e, start);
-        }
-    };
-    stat.request_headers = req.headers().clone();
+    // // Convert request to hyper Request
+    // let req: Request<Full<Bytes>> = match (&http_req).try_into() {
+    //     Ok(req) => req,
+    //     Err(e) => {
+    //         return finish_with_error(stat, e, start);
+    //     }
+    // };
+    // stat.request_headers = req.headers().clone();
 
     // TCP connection
     let tcp_stream = match tcp_connect(addr, http_req.tcp_timeout, &mut stat).await {
@@ -365,7 +366,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
             host.clone(),
             tcp_stream,
             http_req.tls_timeout,
-            http_req.alpn_protocols,
+            http_req.alpn_protocols.clone(),
             http_req.skip_verify,
             &mut stat,
         )
@@ -379,6 +380,13 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
 
         // Send HTTPS request
         if is_http2 {
+            let req = match build_http_request(&http_req, false) {
+                Ok(req) => req,
+                Err(e) => {
+                    return finish_with_error(stat, e, start);
+                }
+            };
+            stat.request_headers = req.headers().clone();
             match send_https2_request(req, tls_stream, tx, &mut stat).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -386,6 +394,13 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
                 }
             }
         } else {
+            let req = match build_http_request(&http_req, true) {
+                Ok(req) => req,
+                Err(e) => {
+                    return finish_with_error(stat, e, start);
+                }
+            };
+            stat.request_headers = req.headers().clone();
             match send_https_request(req, tls_stream, http_req.request_timeout, tx, &mut stat).await
             {
                 Ok(resp) => resp,
@@ -395,6 +410,13 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
             }
         }
     } else {
+        let req = match build_http_request(&http_req, true) {
+            Ok(req) => req,
+            Err(e) => {
+                return finish_with_error(stat, e, start);
+            }
+        };
+        stat.request_headers = req.headers().clone();
         // Send HTTP request
         match send_http_request(req, tcp_stream, http_req.request_timeout, tx, &mut stat).await {
             Ok(resp) => resp,
