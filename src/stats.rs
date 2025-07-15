@@ -95,6 +95,7 @@ pub struct HttpStat {
     pub cert_not_after: Option<String>,
     pub cert_cipher: Option<String>,
     pub cert_domains: Option<Vec<String>>,
+    pub certificates: Option<Vec<Certificate>>,
     pub body: Option<Bytes>,
     pub body_size: Option<usize>,
     pub headers: Option<HeaderMap<HeaderValue>>,
@@ -102,6 +103,14 @@ pub struct HttpStat {
     pub silent: bool,
     pub verbose: bool,
     pub pretty: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Certificate {
+    pub subject: String,
+    pub issuer: String,
+    pub not_before: String,
+    pub not_after: String,
 }
 
 impl HttpStat {
@@ -225,6 +234,31 @@ impl fmt::Display for HttpStat {
                 )?;
             }
             writeln!(f)?;
+
+            if self.verbose {
+                if let Some(certificates) = &self.certificates {
+                    writeln!(f, "Certificate Chain")?;
+                    for (index, cert) in certificates.iter().enumerate() {
+                        writeln!(
+                            f,
+                            " {index} Subject: {}",
+                            LightCyan.paint(cert.subject.clone())
+                        )?;
+                        writeln!(f, "   Issuer: {}", LightCyan.paint(cert.issuer.clone()))?;
+                        writeln!(
+                            f,
+                            "   Not Before: {}",
+                            LightCyan.paint(cert.not_before.clone())
+                        )?;
+                        writeln!(
+                            f,
+                            "   Not After: {}",
+                            LightCyan.paint(cert.not_after.clone())
+                        )?;
+                        writeln!(f)?;
+                    }
+                }
+            }
         }
 
         let mut is_text = false;

@@ -16,7 +16,7 @@
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
 use super::error::{Error, Result};
-use super::stats::{HttpStat, ALPN_HTTP2, ALPN_HTTP3};
+use super::stats::{Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
 use super::HttpRequest;
 use super::SkipVerifier;
 use chrono::{Local, TimeZone};
@@ -228,24 +228,42 @@ pub(crate) async fn tls_handshake(
         .map(|v| format_tls_protocol(v.as_str().unwrap_or_default()));
 
     // Extract certificate information
+    let mut certificates = vec![];
     if let Some(certs) = session.peer_certificates() {
-        if let Some(cert) = certs.first() {
+        for (index, cert) in certs.iter().enumerate() {
             if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
-                stat.subject = Some(cert.subject().to_string());
-                stat.cert_not_before = Some(format_time(cert.validity().not_before.timestamp()));
-                stat.cert_not_after = Some(format_time(cert.validity().not_after.timestamp()));
-                stat.issuer = Some(cert.issuer().to_string());
-                if let Ok(Some(sans)) = cert.subject_alternative_name() {
-                    let mut domains = Vec::new();
-                    for san in sans.value.general_names.iter() {
-                        if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
-                            domains.push(domain.to_string());
+                let subject = cert.subject().to_string();
+                let issuer = cert.issuer().to_string();
+                let not_before = format_time(cert.validity().not_before.timestamp());
+                let not_after = format_time(cert.validity().not_after.timestamp());
+                if index == 0 {
+                    stat.subject = Some(subject);
+                    stat.cert_not_before = Some(not_before);
+                    stat.cert_not_after = Some(not_after);
+                    stat.issuer = Some(issuer);
+                    if let Ok(Some(sans)) = cert.subject_alternative_name() {
+                        let mut domains = vec![];
+                        for san in sans.value.general_names.iter() {
+                            if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
+                                domains.push(domain.to_string());
+                            }
                         }
-                    }
-                    stat.cert_domains = Some(domains);
-                };
+                        stat.cert_domains = Some(domains);
+                    };
+                    continue;
+                }
+
+                certificates.push(Certificate {
+                    subject,
+                    issuer,
+                    not_before,
+                    not_after,
+                });
             }
         }
+    }
+    if !certificates.is_empty() {
+        stat.certificates = Some(certificates);
     }
 
     // Get cipher suite information

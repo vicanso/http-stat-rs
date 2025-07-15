@@ -21,7 +21,7 @@ use super::error::{Error, Result};
 use super::finish_with_error;
 use super::grpc::grpc_request;
 use super::net::{dns_resolve, quic_connect, tcp_connect, tls_handshake};
-use super::stats::{HttpStat, ALPN_HTTP3};
+use super::stats::{Certificate, HttpStat, ALPN_HTTP3};
 use super::HttpRequest;
 use bytes::{Buf, Bytes, BytesMut};
 use chrono::{Local, TimeZone};
@@ -196,9 +196,10 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     stat.alpn = Some(ALPN_HTTP3.to_string()); // We always use HTTP/3 for QUIC
 
     // Extract certificate information
+    let mut certificates = vec![];
     if let Some(peer_identity) = conn.peer_identity() {
         if let Ok(certs) = peer_identity.downcast::<Vec<rustls::pki_types::CertificateDer>>() {
-            if let Some(cert) = certs.first() {
+            for (index, cert) in certs.iter().enumerate() {
                 if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
                     let oid_str = match cert.signature_algorithm.algorithm.to_string().as_str() {
                         "1.2.840.113549.1.1.11" => "AES_256_GCM_SHA384".to_string(),
@@ -211,24 +212,39 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
                         "1.3.101.113" => "AES_128_GCM_SHA256".to_string(),
                         _ => format!("{:?}", cert.signature_algorithm.algorithm),
                     };
-                    stat.subject = Some(cert.subject().to_string());
-                    stat.issuer = Some(cert.issuer().to_string());
-                    stat.cert_cipher = Some(oid_str);
-                    stat.cert_not_before =
-                        Some(format_time(cert.validity().not_before.timestamp()));
-                    stat.cert_not_after = Some(format_time(cert.validity().not_after.timestamp()));
-                    if let Ok(Some(sans)) = cert.subject_alternative_name() {
-                        let mut domains = Vec::new();
-                        for san in sans.value.general_names.iter() {
-                            if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
-                                domains.push(domain.to_string());
+                    let subject = cert.subject().to_string();
+                    let issuer = cert.issuer().to_string();
+                    let not_before = format_time(cert.validity().not_before.timestamp());
+                    let not_after = format_time(cert.validity().not_after.timestamp());
+                    if index == 0 {
+                        stat.cert_cipher = Some(oid_str);
+                        stat.cert_not_before = Some(not_before);
+                        stat.cert_not_after = Some(not_after);
+                        stat.subject = Some(subject);
+                        stat.issuer = Some(issuer);
+                        if let Ok(Some(sans)) = cert.subject_alternative_name() {
+                            let mut domains = vec![];
+                            for san in sans.value.general_names.iter() {
+                                if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
+                                    domains.push(domain.to_string());
+                                }
                             }
-                        }
-                        stat.cert_domains = Some(domains);
-                    };
+                            stat.cert_domains = Some(domains);
+                        };
+                        continue;
+                    }
+                    certificates.push(Certificate {
+                        subject,
+                        issuer,
+                        not_before,
+                        not_after,
+                    });
                 }
             }
         }
+    }
+    if !certificates.is_empty() {
+        stat.certificates = Some(certificates);
     }
 
     // Create HTTP/3 connection
@@ -338,15 +354,6 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
 
     let uri = &http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
-
-    // // Convert request to hyper Request
-    // let req: Request<Full<Bytes>> = match (&http_req).try_into() {
-    //     Ok(req) => req,
-    //     Err(e) => {
-    //         return finish_with_error(stat, e, start);
-    //     }
-    // };
-    // stat.request_headers = req.headers().clone();
 
     // TCP connection
     let tcp_stream = match tcp_connect(addr, http_req.tcp_timeout, &mut stat).await {

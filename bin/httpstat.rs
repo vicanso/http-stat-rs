@@ -258,8 +258,11 @@ async fn main() {
             stat.silent = args.silent;
             stat.pretty = args.pretty;
             let body = stat.body.clone();
-            println!("{stat}");
             handle_output(body, output.clone()).await;
+            if output.is_some() {
+                stat.body = None;
+            }
+            println!("{stat}");
             if !stat.is_success() {
                 is_failed = true;
             }
@@ -270,8 +273,11 @@ async fn main() {
         stat.silent = args.silent;
         stat.pretty = args.pretty;
         let body = stat.body.clone();
-        println!("{stat}");
         handle_output(body, output.clone()).await;
+        if output.is_some() {
+            stat.body = None;
+        }
+        println!("{stat}");
         if !stat.is_success() {
             is_failed = true;
         }
