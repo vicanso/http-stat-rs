@@ -119,6 +119,10 @@ struct Args {
     /// Pretty mode
     #[arg(long = "pretty", help = "pretty mode")]
     pretty: bool,
+
+    /// Timeout
+    #[arg(long = "timeout", help = "timeout")]
+    timeout: Option<String>,
 }
 
 async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
@@ -188,6 +192,15 @@ async fn main() {
 
     if let Some(dns_servers) = args.dns_servers {
         req.dns_servers = Some(dns_servers.split(',').map(|s| s.to_string()).collect());
+    }
+
+    if let Some(timeout) = args.timeout {
+        let timeout = timeout.parse::<humantime::Duration>().unwrap().into();
+        req.dns_timeout = Some(timeout);
+        req.tcp_timeout = Some(timeout);
+        req.tls_timeout = Some(timeout);
+        req.request_timeout = Some(timeout);
+        req.quic_timeout = Some(timeout);
     }
 
     // Parse headers if provided
