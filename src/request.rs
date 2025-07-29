@@ -437,6 +437,10 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
     stat.status = Some(resp.status());
     stat.headers = Some(resp.headers().clone());
 
+    // Check for connection errors
+    if let Ok(error) = rx.try_recv() {
+        stat.error = Some(error);
+    }
     // Read response body
     let content_transfer_start = Instant::now();
     let body_result = resp.collect().await;
@@ -450,11 +454,6 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
     let body_bytes = body.to_bytes();
     stat.body = Some(body_bytes);
     stat.content_transfer = Some(content_transfer_start.elapsed());
-
-    // Check for connection errors
-    if let Ok(error) = rx.try_recv() {
-        stat.error = Some(error);
-    }
 
     stat.total = Some(start.elapsed());
     stat

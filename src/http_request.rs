@@ -113,7 +113,12 @@ impl HttpRequest {
         // Set default Host header if not provided
         if !set_host {
             if let Some(host) = uri.host() {
-                builder = builder.header("Host", host);
+                let port = self.get_port();
+                if port != 80 && port != 443 {
+                    builder = builder.header("Host", format!("{}:{}", host, port));
+                } else {
+                    builder = builder.header("Host", host);
+                }
             }
         }
 

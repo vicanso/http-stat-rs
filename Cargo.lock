@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "http-stat"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "brotli-decompressor",
  "bytes",
