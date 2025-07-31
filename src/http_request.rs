@@ -115,7 +115,7 @@ impl HttpRequest {
             if let Some(host) = uri.host() {
                 let port = self.get_port();
                 if port != 80 && port != 443 {
-                    builder = builder.header("Host", format!("{}:{}", host, port));
+                    builder = builder.header("Host", format!("{host}:{port}"));
                 } else {
                     builder = builder.header("Host", host);
                 }
