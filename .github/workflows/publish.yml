@@ -51,8 +51,6 @@ jobs:
             apt-get update
             make release
             mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat
-            curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
-            ./upx-5.0.1-amd64_linux/upx httpstat
             ls -lh httpstat
       - name: Upload Assets
         run: |
@@ -75,8 +73,6 @@ jobs:
             apt-get update
             make release
             mv target/aarch64-unknown-linux-musl/release/httpstat ./httpstat
-            curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-arm64_linux.tar.xz | tar --xz -xvf -
-            ./upx-5.0.1-arm64_linux/upx httpstat
             ls -lh httpstat
       - name: Upload Assets
         run: |

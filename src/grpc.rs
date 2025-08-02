@@ -25,12 +25,8 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tonic::codegen::GrpcMethod;
-use tonic::IntoRequest;
-use tonic_health::{
-    pb::{HealthCheckRequest, HealthCheckResponse},
-    ServingStatus,
-};
+use tonic_health::pb::health_client::HealthClient;
+use tonic_health::{pb::HealthCheckRequest, ServingStatus};
 use tower_service::Service;
 
 // Version information from Cargo.toml
@@ -107,23 +103,9 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
             return finish_with_error(stat.clone(), e, start);
         }
     };
-
-    let mut grpc = tonic::client::Grpc::new(conn);
-    match grpc.ready().await {
-        Ok(_) => {}
-        Err(e) => {
-            let stat = stat.lock().await;
-            return finish_with_error(stat.clone(), e, start);
-        }
-    }
-
+    let mut client = HealthClient::new(conn);
     let server_processing_start = Instant::now();
-    let codec = tonic::codec::ProstCodec::<HealthCheckRequest, HealthCheckResponse>::default();
-    let path = http::uri::PathAndQuery::from_static("/grpc.health.v1.Health/Check");
-    let mut req = HealthCheckRequest::default().into_request();
-    req.extensions_mut()
-        .insert(GrpcMethod::new("grpc.health.v1.Health", "Check"));
-    let resp = match grpc.unary(req, path, codec).await {
+    let resp = match client.check(HealthCheckRequest::default()).await {
         Ok(resp) => resp,
         Err(e) => {
             let stat = stat.lock().await;
