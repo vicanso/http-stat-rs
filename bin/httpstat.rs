@@ -170,7 +170,7 @@ async fn handle_output(body: Option<Bytes>, output: Option<String>) {
         println!("write output error: {e}");
     }
 }
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
 
