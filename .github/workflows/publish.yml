@@ -45,10 +45,9 @@ jobs:
       - name: release
         uses: addnab/docker-run-action@v3
         with:
-          image: messense/rust-musl-cross:x86_64-musl
-          options: -v ${{ github.workspace }}:/home/rust/src
+          image: clux/muslrust:1.89.0-stable
+          options: -v ${{ github.workspace }}:/volume
           run: |
-            apt-get update
             make release
             mv target/x86_64-unknown-linux-musl/release/httpstat ./httpstat
             ls -lh httpstat
@@ -61,16 +60,15 @@ jobs:
           ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-aarch64:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
       - name: release
         uses: addnab/docker-run-action@v3
         with:
-          image: messense/rust-musl-cross:aarch64-musl
-          options: -v ${{ github.workspace }}:/home/rust/src
+          image: clux/muslrust:1.89.0-stable
+          options: -v ${{ github.workspace }}:/volume
           run: |
-            apt-get update
             make release
             mv target/aarch64-unknown-linux-musl/release/httpstat ./httpstat
             ls -lh httpstat
