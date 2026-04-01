@@ -10,6 +10,7 @@
 
 - **HTTP/1.1、HTTP/2 和 HTTP/3 (QUIC)** — 全面支持现代协议，一个参数即可切换
 - **gRPC 健康检查** — 使用 `grpc://` 或 `grpcs://` 协议直接探测 gRPC 服务
+- **基准测试模式** — `-n 10` 重复请求 N 次，按阶段输出 min/max/avg/p50/p95/p99 统计
 - **多 IP 并发测试** — `--resolve` 同时测试多个 IP，结果按成功/失败排序
 - **透明解压** — `--compressed` 自动解码 `gzip`、`br`、`zstd` 响应
 - **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`
@@ -66,6 +67,9 @@ httpstat --dns-servers=cloudflare https://example.com
 # JSON 响应格式化输出
 httpstat --pretty https://httpbin.org/get
 
+# 基准测试 — 重复 10 次，输出百分位统计
+httpstat -n 10 https://example.com
+
 # 设置超时时间
 httpstat --timeout 5s https://example.com
 ```
@@ -100,6 +104,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
   -v, --verbose                    详细模式
       --pretty                     格式化输出模式
       --timeout <TIMEOUT>          超时时间
+  -n, --count <COUNT>              基准测试请求次数，输出 min/max/avg/p50/p95/p99 统计
   -h, --help                       显示帮助信息
   -V, --version                    显示版本信息
 ```

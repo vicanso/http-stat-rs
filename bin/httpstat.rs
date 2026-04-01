@@ -19,7 +19,9 @@ use clap::Parser;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::StatusCode;
 use http::Uri;
-use http_stat::{request, HttpRequest, HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3};
+use http_stat::{
+    request, BenchmarkSummary, HttpRequest, HttpStat, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3,
+};
 use std::net::IpAddr;
 use tokio::fs;
 
@@ -123,6 +125,14 @@ struct Args {
     /// Timeout
     #[arg(long = "timeout", help = "timeout")]
     timeout: Option<String>,
+
+    /// Number of requests to make for benchmarking
+    #[arg(
+        short = 'n',
+        long = "count",
+        help = "number of requests for benchmarking, show min/max/avg/p50/p95/p99 stats"
+    )]
+    count: Option<usize>,
 }
 
 async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
@@ -268,6 +278,7 @@ async fn main() {
         req.alpn_protocols = vec![ALPN_HTTP3.to_string()];
     }
     let output = args.output;
+    let count = args.count.unwrap_or(1).max(1);
     let mut is_failed = false;
 
     if let Some(resolve) = args.resolve {
@@ -302,6 +313,22 @@ async fn main() {
                 is_failed = true;
             }
         }
+    } else if count > 1 {
+        // Benchmark mode
+        let width = count.to_string().len();
+        let mut stats = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut stat = do_request(req.clone(), args.follow_redirect).await;
+            stat.silent = true;
+            print!("[{:>width$}/{count}] {stat}", i + 1);
+            if !stat.is_success() {
+                is_failed = true;
+            }
+            stat.body = None;
+            stats.push(stat);
+        }
+        let summary = BenchmarkSummary { stats };
+        println!("{summary}");
     } else {
         let mut stat = do_request(req, args.follow_redirect).await;
         stat.verbose = args.verbose;

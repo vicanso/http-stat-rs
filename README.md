@@ -12,6 +12,7 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 
 - **HTTP/1.1, HTTP/2 & HTTP/3 (QUIC)** — first-class support for all modern protocols, switch with a single flag
 - **gRPC health check** — use `grpc://` or `grpcs://` scheme to probe gRPC services
+- **Benchmark mode** — `-n 10` repeats the request N times, reports min/max/avg/p50/p95/p99 per phase
 - **Multi-IP concurrent testing** — `--resolve` tests multiple IPs in parallel, results sorted by success
 - **Transparent decompression** — auto-decodes `gzip`, `br`, `zstd` responses with `--compressed`
 - **Custom DNS** — specify DNS servers by IP or use built-in presets: `google`, `cloudflare`, `quad9`
@@ -68,6 +69,9 @@ httpstat --dns-servers=cloudflare https://example.com
 # Pretty-print JSON response
 httpstat --pretty https://httpbin.org/get
 
+# Benchmark — repeat 10 times, show percentile stats
+httpstat -n 10 https://example.com
+
 # Set timeout
 httpstat --timeout 5s https://example.com
 ```
@@ -102,6 +106,7 @@ Options:
   -v, --verbose                    verbose mode
       --pretty                     pretty mode
       --timeout <TIMEOUT>          timeout
+  -n, --count <COUNT>              number of requests for benchmarking, show min/max/avg/p50/p95/p99 stats
   -h, --help                       Print help
   -V, --version                    Print version
 ```

@@ -426,3 +426,123 @@ impl fmt::Display for HttpStat {
         Ok(())
     }
 }
+
+pub struct BenchmarkSummary {
+    pub stats: Vec<HttpStat>,
+}
+
+impl BenchmarkSummary {
+    fn collect_sorted(&self, f: impl Fn(&HttpStat) -> Option<Duration>) -> Vec<Duration> {
+        let mut v: Vec<Duration> = self.stats.iter().filter_map(f).collect();
+        v.sort();
+        v
+    }
+
+    fn percentile(sorted: &[Duration], p: f64) -> Option<Duration> {
+        if sorted.is_empty() {
+            return None;
+        }
+        let idx = ((p * sorted.len() as f64).ceil() as usize).saturating_sub(1);
+        Some(sorted[idx.min(sorted.len() - 1)])
+    }
+}
+
+impl fmt::Display for BenchmarkSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total = self.stats.len();
+        if total == 0 {
+            return Ok(());
+        }
+
+        let phases: Vec<(&str, Vec<Duration>)> = [
+            ("DNS Lookup", self.collect_sorted(|s| s.dns_lookup)),
+            ("TCP Connect", self.collect_sorted(|s| s.tcp_connect)),
+            ("TLS Handshake", self.collect_sorted(|s| s.tls_handshake)),
+            ("QUIC Connect", self.collect_sorted(|s| s.quic_connect)),
+            (
+                "Server Process",
+                self.collect_sorted(|s| s.server_processing),
+            ),
+            ("Content Xfer", self.collect_sorted(|s| s.content_transfer)),
+            ("Total", self.collect_sorted(|s| s.total)),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+
+        if phases.is_empty() {
+            return Ok(());
+        }
+
+        writeln!(f)?;
+        writeln!(
+            f,
+            "{}",
+            LightGreen.paint(format!("--- Benchmark Results ({total} requests) ---"))
+        )?;
+        writeln!(f)?;
+
+        let col_w = 18;
+        let label_w = 6;
+
+        // Header row
+        write!(f, "{:>label_w$} ", "")?;
+        for (name, _) in &phases {
+            write!(f, "{}", name.unicode_pad(col_w, Alignment::Center, true))?;
+        }
+        writeln!(f)?;
+
+        // Stats rows
+        let rows: [(&str, f64); 6] = [
+            ("min", 0.0),
+            ("max", f64::INFINITY),
+            ("avg", f64::NAN),
+            ("p50", 0.5),
+            ("p95", 0.95),
+            ("p99", 0.99),
+        ];
+
+        for (label, p) in &rows {
+            write!(f, "{} ", LightGreen.paint(format!("{label:>label_w$}")))?;
+            for (_, sorted) in &phases {
+                let val = if p.is_nan() {
+                    // avg
+                    if sorted.is_empty() {
+                        None
+                    } else {
+                        let sum: Duration = sorted.iter().sum();
+                        Some(sum / sorted.len() as u32)
+                    }
+                } else if *p == 0.0 {
+                    sorted.first().copied()
+                } else if p.is_infinite() {
+                    sorted.last().copied()
+                } else {
+                    Self::percentile(sorted, *p)
+                };
+                let text = match val {
+                    Some(d) => format_duration(d),
+                    None => "-".to_string(),
+                };
+                write!(
+                    f,
+                    "{}",
+                    LightCyan.paint(text.unicode_pad(col_w, Alignment::Center, true).to_string())
+                )?;
+            }
+            writeln!(f)?;
+        }
+
+        writeln!(f)?;
+        let success = self.stats.iter().filter(|s| s.is_success()).count();
+        let pct = (success as f64 / total as f64) * 100.0;
+        let success_text = format!("Success: {success}/{total} ({pct:.1}%)");
+        if success == total {
+            writeln!(f, "  {}", LightGreen.paint(success_text))?;
+        } else {
+            writeln!(f, "  {}", LightRed.paint(success_text))?;
+        }
+
+        Ok(())
+    }
+}
