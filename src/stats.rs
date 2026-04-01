@@ -17,6 +17,7 @@
 
 use bytes::Bytes;
 use bytesize::ByteSize;
+use chrono::{Local, TimeZone};
 use heck::ToTrainCase;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -32,6 +33,13 @@ use unicode_truncate::UnicodeTruncateStr;
 pub static ALPN_HTTP2: &str = "h2";
 pub static ALPN_HTTP1: &str = "http/1.1";
 pub static ALPN_HTTP3: &str = "h3";
+
+// Format timestamp to human-readable string
+pub(crate) fn format_time(timestamp_seconds: i64) -> String {
+    Local
+        .timestamp_nanos(timestamp_seconds * 1_000_000_000)
+        .to_string()
+}
 
 fn format_duration(duration: Duration) -> String {
     if duration > Duration::from_secs(1) {
@@ -144,7 +152,7 @@ impl fmt::Display for HttpStat {
             );
             if self.silent {
                 if let Some(status) = &self.status {
-                    let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
+                    let alpn = self.alpn.as_deref().unwrap_or(ALPN_HTTP1);
                     let status_code = status.as_u16();
                     let status = if status_code < 400 {
                         LightGreen.paint(status.to_string())
@@ -182,7 +190,7 @@ impl fmt::Display for HttpStat {
         }
 
         if let Some(status) = &self.status {
-            let alpn = self.alpn.clone().unwrap_or_else(|| ALPN_HTTP1.to_string());
+            let alpn = self.alpn.as_deref().unwrap_or(ALPN_HTTP1);
             let status_code = status.as_u16();
             let status = if status_code < 400 {
                 LightGreen.paint(status.to_string())
@@ -204,33 +212,33 @@ impl fmt::Display for HttpStat {
             writeln!(
                 f,
                 "Cipher: {}",
-                LightCyan.paint(self.cert_cipher.clone().unwrap_or_default())
+                LightCyan.paint(self.cert_cipher.as_deref().unwrap_or_default())
             )?;
             writeln!(
                 f,
                 "Not Before: {}",
-                LightCyan.paint(self.cert_not_before.clone().unwrap_or_default())
+                LightCyan.paint(self.cert_not_before.as_deref().unwrap_or_default())
             )?;
             writeln!(
                 f,
                 "Not After: {}",
-                LightCyan.paint(self.cert_not_after.clone().unwrap_or_default())
+                LightCyan.paint(self.cert_not_after.as_deref().unwrap_or_default())
             )?;
             if self.verbose {
                 writeln!(
                     f,
                     "Subject: {}",
-                    LightCyan.paint(self.subject.clone().unwrap_or_default())
+                    LightCyan.paint(self.subject.as_deref().unwrap_or_default())
                 )?;
                 writeln!(
                     f,
                     "Issuer: {}",
-                    LightCyan.paint(self.issuer.clone().unwrap_or_default())
+                    LightCyan.paint(self.issuer.as_deref().unwrap_or_default())
                 )?;
                 writeln!(
                     f,
                     "Certificate Domains: {}",
-                    LightCyan.paint(self.cert_domains.clone().unwrap_or_default().join(", "))
+                    LightCyan.paint(self.cert_domains.as_deref().unwrap_or_default().join(", "))
                 )?;
             }
             writeln!(f)?;
@@ -242,18 +250,18 @@ impl fmt::Display for HttpStat {
                         writeln!(
                             f,
                             " {index} Subject: {}",
-                            LightCyan.paint(cert.subject.clone())
+                            LightCyan.paint(cert.subject.as_str())
                         )?;
-                        writeln!(f, "   Issuer: {}", LightCyan.paint(cert.issuer.clone()))?;
+                        writeln!(f, "   Issuer: {}", LightCyan.paint(cert.issuer.as_str()))?;
                         writeln!(
                             f,
                             "   Not Before: {}",
-                            LightCyan.paint(cert.not_before.clone())
+                            LightCyan.paint(cert.not_before.as_str())
                         )?;
                         writeln!(
                             f,
                             "   Not After: {}",
-                            LightCyan.paint(cert.not_after.clone())
+                            LightCyan.paint(cert.not_after.as_str())
                         )?;
                         writeln!(f)?;
                     }
@@ -266,7 +274,7 @@ impl fmt::Display for HttpStat {
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
                 let value = value.to_str().unwrap_or_default();
-                if key.to_string().to_lowercase() == "content-type" {
+                if key == http::header::CONTENT_TYPE {
                     if value.contains("text/") || value.contains("application/json") {
                         is_text = true;
                     }

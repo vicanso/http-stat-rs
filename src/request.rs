@@ -20,11 +20,10 @@ use super::decompress::decompress;
 use super::error::{Error, Result};
 use super::finish_with_error;
 use super::grpc::grpc_request;
-use super::net::{dns_resolve, quic_connect, tcp_connect, tls_handshake};
-use super::stats::{Certificate, HttpStat, ALPN_HTTP3};
+use super::net::{dns_resolve, parse_certificates, quic_connect, tcp_connect, tls_handshake};
+use super::stats::{HttpStat, ALPN_HTTP3};
 use super::HttpRequest;
 use bytes::{Buf, Bytes, BytesMut};
-use chrono::{Local, TimeZone};
 use futures::future;
 
 use http::Request;
@@ -42,13 +41,6 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
-// Format timestamp to human-readable string
-fn format_time(timestamp_seconds: i64) -> String {
-    Local
-        .timestamp_nanos(timestamp_seconds * 1_000_000_000)
-        .to_string()
-}
-
 // Initialize crypto provider once
 static INIT: Once = Once::new();
 
@@ -58,49 +50,20 @@ fn ensure_crypto_provider() {
     });
 }
 
-// Send HTTP/1.1 request
-async fn send_http_request(
+// Send HTTP/1.1 request over any stream (plain TCP or TLS)
+async fn send_http1_request<S>(
     req: Request<Full<Bytes>>,
-    tcp_stream: TcpStream,
+    stream: S,
     request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
-) -> Result<Response<Incoming>> {
+) -> Result<Response<Incoming>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(Duration::from_secs(30)),
-        hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)),
-    )
-    .await
-    .map_err(|e| Error::Timeout { source: e })?
-    .map_err(|e| Error::Hyper { source: e })?;
-
-    // Spawn connection task
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            let _ = tx.send(e.to_string());
-        }
-    });
-
-    let server_processing_start = Instant::now();
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
-    stat.server_processing = Some(server_processing_start.elapsed());
-    Ok(resp)
-}
-
-// Send HTTPS request
-async fn send_https_request(
-    req: Request<Full<Bytes>>,
-    tls_stream: TlsStream<TcpStream>,
-    request_timeout: Option<Duration>,
-    tx: oneshot::Sender<String>,
-    stat: &mut HttpStat,
-) -> Result<Response<Incoming>> {
-    let (mut sender, conn) = timeout(
-        request_timeout.unwrap_or(Duration::from_secs(30)),
-        hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)),
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)),
     )
     .await
     .map_err(|e| Error::Timeout { source: e })?
@@ -126,11 +89,12 @@ async fn send_https_request(
 async fn send_https2_request(
     req: Request<Full<Bytes>>,
     tls_stream: TlsStream<TcpStream>,
+    request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
-        Duration::from_secs(30),
+        request_timeout.unwrap_or(Duration::from_secs(30)),
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
     )
     .await
@@ -196,11 +160,11 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     stat.alpn = Some(ALPN_HTTP3.to_string()); // We always use HTTP/3 for QUIC
 
     // Extract certificate information
-    let mut certificates = vec![];
     if let Some(peer_identity) = conn.peer_identity() {
         if let Ok(certs) = peer_identity.downcast::<Vec<rustls::pki_types::CertificateDer>>() {
-            for (index, cert) in certs.iter().enumerate() {
-                if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+            // Set cipher from first cert's signature algorithm (HTTP/3 specific)
+            if let Some(first_cert) = certs.first() {
+                if let Ok((_, cert)) = x509_parser::parse_x509_certificate(first_cert.as_ref()) {
                     let oid_str = match cert.signature_algorithm.algorithm.to_string().as_str() {
                         "1.2.840.113549.1.1.11" => "AES_256_GCM_SHA384".to_string(),
                         "1.2.840.113549.1.1.12" => "AES_128_GCM_SHA256".to_string(),
@@ -212,39 +176,11 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
                         "1.3.101.113" => "AES_128_GCM_SHA256".to_string(),
                         _ => format!("{:?}", cert.signature_algorithm.algorithm),
                     };
-                    let subject = cert.subject().to_string();
-                    let issuer = cert.issuer().to_string();
-                    let not_before = format_time(cert.validity().not_before.timestamp());
-                    let not_after = format_time(cert.validity().not_after.timestamp());
-                    if index == 0 {
-                        stat.cert_cipher = Some(oid_str);
-                        stat.cert_not_before = Some(not_before);
-                        stat.cert_not_after = Some(not_after);
-                        stat.subject = Some(subject);
-                        stat.issuer = Some(issuer);
-                        if let Ok(Some(sans)) = cert.subject_alternative_name() {
-                            let mut domains = vec![];
-                            for san in sans.value.general_names.iter() {
-                                if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
-                                    domains.push(domain.to_string());
-                                }
-                            }
-                            stat.cert_domains = Some(domains);
-                        };
-                        continue;
-                    }
-                    certificates.push(Certificate {
-                        subject,
-                        issuer,
-                        not_before,
-                        not_after,
-                    });
+                    stat.cert_cipher = Some(oid_str);
                 }
             }
+            parse_certificates(&certs, &mut stat);
         }
-    }
-    if !certificates.is_empty() {
-        stat.certificates = Some(certificates);
     }
 
     // Create HTTP/3 connection
@@ -394,7 +330,9 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_https2_request(req, tls_stream, tx, &mut stat).await {
+            match send_https2_request(req, tls_stream, http_req.request_timeout, tx, &mut stat)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     return finish_with_error(stat, e, start);
@@ -408,7 +346,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_https_request(req, tls_stream, http_req.request_timeout, tx, &mut stat).await
+            match send_http1_request(req, tls_stream, http_req.request_timeout, tx, &mut stat).await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -425,7 +363,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
         };
         stat.request_headers = req.headers().clone();
         // Send HTTP request
-        match send_http_request(req, tcp_stream, http_req.request_timeout, tx, &mut stat).await {
+        match send_http1_request(req, tcp_stream, http_req.request_timeout, tx, &mut stat).await {
             Ok(resp) => resp,
             Err(e) => {
                 return finish_with_error(stat, e, start);

@@ -16,10 +16,9 @@
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
 use super::error::{Error, Result};
-use super::stats::{Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
+use super::stats::{format_time, Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
 use super::HttpRequest;
 use super::SkipVerifier;
-use chrono::{Local, TimeZone};
 use hickory_resolver::config::{
     LookupIpStrategy, NameServerConfigGroup, ResolverConfig, CLOUDFLARE_IPS, GOOGLE_IPS, QUAD9_IPS,
 };
@@ -36,13 +35,6 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
-// Format timestamp to human-readable string
-fn format_time(timestamp_seconds: i64) -> String {
-    Local
-        .timestamp_nanos(timestamp_seconds * 1_000_000_000)
-        .to_string()
-}
-
 // Format TLS protocol version for display
 fn format_tls_protocol(protocol: &str) -> String {
     match protocol {
@@ -50,6 +42,44 @@ fn format_tls_protocol(protocol: &str) -> String {
         "TLSv1_2" => "tls v1.2".to_string(),
         "TLSv1_1" => "tls v1.1".to_string(),
         _ => protocol.to_string(),
+    }
+}
+
+// Parse X.509 certificates and populate stat fields
+pub(crate) fn parse_certificates(certs: &[impl AsRef<[u8]>], stat: &mut HttpStat) {
+    let mut certificates = vec![];
+    for (index, cert_data) in certs.iter().enumerate() {
+        if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_data.as_ref()) {
+            let subject = cert.subject().to_string();
+            let issuer = cert.issuer().to_string();
+            let not_before = format_time(cert.validity().not_before.timestamp());
+            let not_after = format_time(cert.validity().not_after.timestamp());
+            if index == 0 {
+                stat.subject = Some(subject);
+                stat.cert_not_before = Some(not_before);
+                stat.cert_not_after = Some(not_after);
+                stat.issuer = Some(issuer);
+                if let Ok(Some(sans)) = cert.subject_alternative_name() {
+                    let mut domains = vec![];
+                    for san in sans.value.general_names.iter() {
+                        if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
+                            domains.push(domain.to_string());
+                        }
+                    }
+                    stat.cert_domains = Some(domains);
+                };
+                continue;
+            }
+            certificates.push(Certificate {
+                subject,
+                issuer,
+                not_before,
+                not_after,
+            });
+        }
+    }
+    if !certificates.is_empty() {
+        stat.certificates = Some(certificates);
     }
 }
 
@@ -228,42 +258,8 @@ pub(crate) async fn tls_handshake(
         .map(|v| format_tls_protocol(v.as_str().unwrap_or_default()));
 
     // Extract certificate information
-    let mut certificates = vec![];
     if let Some(certs) = session.peer_certificates() {
-        for (index, cert) in certs.iter().enumerate() {
-            if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
-                let subject = cert.subject().to_string();
-                let issuer = cert.issuer().to_string();
-                let not_before = format_time(cert.validity().not_before.timestamp());
-                let not_after = format_time(cert.validity().not_after.timestamp());
-                if index == 0 {
-                    stat.subject = Some(subject);
-                    stat.cert_not_before = Some(not_before);
-                    stat.cert_not_after = Some(not_after);
-                    stat.issuer = Some(issuer);
-                    if let Ok(Some(sans)) = cert.subject_alternative_name() {
-                        let mut domains = vec![];
-                        for san in sans.value.general_names.iter() {
-                            if let x509_parser::extensions::GeneralName::DNSName(domain) = san {
-                                domains.push(domain.to_string());
-                            }
-                        }
-                        stat.cert_domains = Some(domains);
-                    };
-                    continue;
-                }
-
-                certificates.push(Certificate {
-                    subject,
-                    issuer,
-                    not_before,
-                    not_after,
-                });
-            }
-        }
-    }
-    if !certificates.is_empty() {
-        stat.certificates = Some(certificates);
+        parse_certificates(certs, stat);
     }
 
     // Get cipher suite information

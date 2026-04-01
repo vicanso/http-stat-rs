@@ -113,8 +113,11 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
         }
     };
 
-    stat.lock().await.server_processing = Some(server_processing_start.elapsed());
-    let mut stat = stat.lock().await.clone();
+    let mut stat = {
+        let mut guard = stat.lock().await;
+        guard.server_processing = Some(server_processing_start.elapsed());
+        guard.clone()
+    };
     if resp.get_ref().status() != ServingStatus::Serving.into() {
         return finish_with_error(stat, "service not serving", start);
     }

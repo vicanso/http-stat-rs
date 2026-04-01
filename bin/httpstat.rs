@@ -179,7 +179,13 @@ async fn main() {
         std::process::exit(1);
     };
 
-    let mut req: HttpRequest = url.as_str().try_into().unwrap();
+    let mut req: HttpRequest = match url.as_str().try_into() {
+        Ok(req) => req,
+        Err(e) => {
+            eprintln!("httpstat: invalid URL: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Set IP version if specified
     if args.ipv4 {
@@ -194,8 +200,14 @@ async fn main() {
         req.dns_servers = Some(dns_servers.split(',').map(|s| s.to_string()).collect());
     }
 
-    if let Some(timeout) = args.timeout {
-        let timeout = timeout.parse::<humantime::Duration>().unwrap().into();
+    if let Some(timeout_str) = args.timeout {
+        let timeout: std::time::Duration = match timeout_str.parse::<humantime::Duration>() {
+            Ok(d) => d.into(),
+            Err(e) => {
+                eprintln!("httpstat: invalid timeout '{timeout_str}': {e}");
+                std::process::exit(1);
+            }
+        };
         req.dns_timeout = Some(timeout);
         req.tcp_timeout = Some(timeout);
         req.tls_timeout = Some(timeout);
@@ -233,7 +245,17 @@ async fn main() {
     req.method = args.method;
 
     if let Some(data) = args.data {
-        req.body = Some(Bytes::from(data));
+        if let Some(file_path) = data.strip_prefix('@') {
+            match fs::read(file_path).await {
+                Ok(content) => req.body = Some(Bytes::from(content)),
+                Err(e) => {
+                    eprintln!("httpstat: failed to read file '{}': {e}", file_path);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            req.body = Some(Bytes::from(data));
+        }
     }
 
     if args.http1 {
@@ -250,16 +272,16 @@ async fn main() {
 
     if let Some(resolve) = args.resolve {
         let ips = resolve.split(',').collect::<Vec<&str>>();
-        let mut stats_list = vec![];
+        let mut futs = vec![];
         for ip in ips {
             let mut req = req.clone();
             let Ok(ip) = ip.parse::<IpAddr>() else {
                 continue;
             };
             req.resolve = Some(ip);
-            let stat = do_request(req, args.follow_redirect).await;
-            stats_list.push(stat);
+            futs.push(do_request(req, args.follow_redirect));
         }
+        let mut stats_list = futures::future::join_all(futs).await;
         // error request last
         stats_list.sort_by(|item1, item2| {
             let value1 = item1.error.is_some();
