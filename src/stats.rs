@@ -23,6 +23,7 @@ use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
 use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed};
+use serde_json::{json, Map, Value};
 use std::fmt;
 use std::io::Write;
 use std::time::Duration;
@@ -41,7 +42,7 @@ pub(crate) fn format_time(timestamp_seconds: i64) -> String {
         .to_string()
 }
 
-fn format_duration(duration: Duration) -> String {
+pub fn format_duration(duration: Duration) -> String {
     if duration > Duration::from_secs(1) {
         return format!("{:.2}s", duration.as_secs_f64());
     }
@@ -111,6 +112,8 @@ pub struct HttpStat {
     pub silent: bool,
     pub verbose: bool,
     pub pretty: bool,
+    pub include_headers: Option<Vec<String>>,
+    pub exclude_headers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +125,56 @@ pub struct Certificate {
 }
 
 impl HttpStat {
+    /// Returns a semantic exit code based on the error type:
+    /// - 0: Success
+    /// - 1: General/unknown error
+    /// - 2: DNS resolution failure
+    /// - 3: TCP connection failure
+    /// - 4: TLS/SSL error
+    /// - 5: Timeout
+    /// - 6: HTTP 4xx client error
+    /// - 7: HTTP 5xx server error
+    pub fn exit_code(&self) -> i32 {
+        if self.is_success() {
+            return 0;
+        }
+        // HTTP status errors (no connection error, but bad status)
+        if self.error.is_none() {
+            if let Some(status) = &self.status {
+                let code = status.as_u16();
+                if code >= 500 {
+                    return 7;
+                }
+                if code >= 400 {
+                    return 6;
+                }
+            }
+            return 1;
+        }
+        let err = self.error.as_deref().unwrap_or_default().to_lowercase();
+        // Timeout (check before phase-based detection since timeout can happen in any phase)
+        if err.contains("timeout") || err.contains("elapsed") {
+            return 5;
+        }
+        // DNS failure: dns_lookup phase never completed
+        if self.dns_lookup.is_none() {
+            return 2;
+        }
+        // TCP failure: tcp/quic connection phase never completed
+        if self.tcp_connect.is_none() && self.quic_connect.is_none() {
+            return 3;
+        }
+        // TLS failure
+        if err.contains("rustls")
+            || err.contains("tls")
+            || err.contains("certificate")
+            || err.contains("invalid dns name")
+        {
+            return 4;
+        }
+        1
+    }
+
     pub fn is_success(&self) -> bool {
         if self.error.is_some() {
             return false;
@@ -139,6 +192,107 @@ impl HttpStat {
             return false;
         }
         true
+    }
+
+    pub fn to_json(&self) -> Value {
+        let dur_us = |d: Option<Duration>| -> Value {
+            d.map_or(Value::Null, |d| json!(d.as_micros() as u64))
+        };
+
+        let mut obj = Map::new();
+
+        // Timing (microseconds)
+        let mut timing = Map::new();
+        timing.insert("dns_lookup_us".into(), dur_us(self.dns_lookup));
+        timing.insert("tcp_connect_us".into(), dur_us(self.tcp_connect));
+        timing.insert("tls_handshake_us".into(), dur_us(self.tls_handshake));
+        timing.insert("quic_connect_us".into(), dur_us(self.quic_connect));
+        timing.insert(
+            "server_processing_us".into(),
+            dur_us(self.server_processing),
+        );
+        timing.insert("content_transfer_us".into(), dur_us(self.content_transfer));
+        timing.insert("total_us".into(), dur_us(self.total));
+        obj.insert("timing".into(), Value::Object(timing));
+
+        // Connection
+        obj.insert(
+            "addr".into(),
+            self.addr.as_deref().map_or(Value::Null, |s| json!(s)),
+        );
+        obj.insert(
+            "status".into(),
+            self.status.map_or(Value::Null, |s| json!(s.as_u16())),
+        );
+        obj.insert(
+            "alpn".into(),
+            self.alpn.as_deref().map_or(Value::Null, |s| json!(s)),
+        );
+
+        // TLS
+        if self.tls.is_some() {
+            let mut tls = Map::new();
+            tls.insert(
+                "version".into(),
+                self.tls.as_deref().map_or(Value::Null, |s| json!(s)),
+            );
+            tls.insert(
+                "cipher".into(),
+                self.cert_cipher
+                    .as_deref()
+                    .map_or(Value::Null, |s| json!(s)),
+            );
+            tls.insert(
+                "subject".into(),
+                self.subject.as_deref().map_or(Value::Null, |s| json!(s)),
+            );
+            tls.insert(
+                "issuer".into(),
+                self.issuer.as_deref().map_or(Value::Null, |s| json!(s)),
+            );
+            tls.insert(
+                "not_before".into(),
+                self.cert_not_before
+                    .as_deref()
+                    .map_or(Value::Null, |s| json!(s)),
+            );
+            tls.insert(
+                "not_after".into(),
+                self.cert_not_after
+                    .as_deref()
+                    .map_or(Value::Null, |s| json!(s)),
+            );
+            tls.insert(
+                "domains".into(),
+                self.cert_domains.as_ref().map_or(Value::Null, |d| json!(d)),
+            );
+            obj.insert("tls".into(), Value::Object(tls));
+        }
+
+        // Headers
+        if let Some(headers) = &self.headers {
+            let mut hdr_map = Map::new();
+            for (key, value) in headers.iter() {
+                let v = value.to_str().unwrap_or_default().to_string();
+                hdr_map.insert(key.to_string(), json!(v));
+            }
+            obj.insert("headers".into(), Value::Object(hdr_map));
+        }
+
+        // Body
+        obj.insert(
+            "body_size".into(),
+            self.body_size.map_or(Value::Null, |s| json!(s)),
+        );
+
+        // Error
+        obj.insert(
+            "error".into(),
+            self.error.as_deref().map_or(Value::Null, |e| json!(e)),
+        );
+        obj.insert("exit_code".into(), json!(self.exit_code()));
+
+        Value::Object(obj)
     }
 }
 
@@ -282,12 +436,22 @@ impl fmt::Display for HttpStat {
                         is_json = true;
                     }
                 }
-                writeln!(
-                    f,
-                    "{}: {}",
-                    key.to_string().to_train_case(),
-                    LightCyan.paint(value)
-                )?;
+                let key_lower = key.as_str();
+                let show = if let Some(includes) = &self.include_headers {
+                    includes.iter().any(|h| h == key_lower)
+                } else if let Some(excludes) = &self.exclude_headers {
+                    !excludes.iter().any(|h| h == key_lower)
+                } else {
+                    true
+                };
+                if show {
+                    writeln!(
+                        f,
+                        "{}: {}",
+                        key.to_string().to_train_case(),
+                        LightCyan.paint(value)
+                    )?;
+                }
             }
             writeln!(f)?;
         }

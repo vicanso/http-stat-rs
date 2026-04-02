@@ -21,6 +21,7 @@ use super::error::{Error, Result};
 use super::finish_with_error;
 use super::grpc::grpc_request;
 use super::net::{dns_resolve, parse_certificates, quic_connect, tcp_connect, tls_handshake};
+use super::proxy::{http_connect, socks5_connect, ProxyConfig, ProxyKind};
 use super::stats::{HttpStat, ALPN_HTTP3};
 use super::HttpRequest;
 use bytes::{Buf, Bytes, BytesMut};
@@ -142,7 +143,14 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     // Establish QUIC connection
     let (client_endpoint, conn) = match timeout(
         http_req.quic_timeout.unwrap_or(Duration::from_secs(30)),
-        quic_connect(host, addr, http_req.skip_verify, &mut stat),
+        quic_connect(
+            host,
+            addr,
+            http_req.skip_verify,
+            http_req.client_cert.as_deref(),
+            http_req.client_key.as_deref(),
+            &mut stat,
+        ),
     )
     .await
     {
@@ -275,29 +283,71 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     stat
 }
 
-async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
+/// Connect to the effective TCP endpoint (direct or via proxy).
+/// Returns `(stream, target_host, is_http_forward_proxy)`.
+/// - Direct: uses dns_resolve + tcp_connect, sets stat.dns_lookup / stat.addr / stat.tcp_connect.
+/// - Proxy:  connects to proxy (system DNS), sets stat.addr / stat.tcp_connect.
+async fn tcp_via_proxy(
+    http_req: &HttpRequest,
+    stat: &mut HttpStat,
+) -> Result<(TcpStream, String, bool)> {
+    let uri = &http_req.uri;
+    let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
+    let target_host = uri.host().unwrap_or_default().to_string();
+    let target_port = http_req.get_port();
+
+    if let Some(proxy) = http_req.proxy.as_deref().and_then(ProxyConfig::parse) {
+        let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
+        let tcp_start = Instant::now();
+        let proxy_stream = timeout(
+            http_req.tcp_timeout.unwrap_or(Duration::from_secs(5)),
+            TcpStream::connect(&proxy_addr),
+        )
+        .await
+        .map_err(|e| Error::Timeout { source: e })?
+        .map_err(|e| Error::Io { source: e })?;
+
+        if let Ok(peer) = proxy_stream.peer_addr() {
+            stat.addr = Some(peer.to_string());
+        }
+
+        // HTTP proxy + plain HTTP target: forward mode, no tunnel
+        let is_http_forward = !is_https && matches!(proxy.kind, ProxyKind::Http);
+        let stream = if is_http_forward {
+            proxy_stream
+        } else {
+            match proxy.kind {
+                ProxyKind::Socks5 => {
+                    socks5_connect(proxy_stream, &target_host, target_port).await?
+                }
+                ProxyKind::Http => http_connect(proxy_stream, &target_host, target_port).await?,
+            }
+        };
+        stat.tcp_connect = Some(tcp_start.elapsed());
+        Ok((stream, target_host, is_http_forward))
+    } else {
+        let (addr, host) = dns_resolve(http_req, stat).await?;
+        let stream = tcp_connect(addr, http_req.tcp_timeout, stat).await?;
+        Ok((stream, host, false))
+    }
+}
+
+async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     let start = Instant::now();
     let mut stat = HttpStat::default();
 
-    // DNS resolution
-    let dns_result = dns_resolve(&http_req, &mut stat).await;
-    let (addr, host) = match dns_result {
-        Ok(result) => result,
-        Err(e) => {
-            return finish_with_error(stat, e, start);
-        }
+    let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
+
+    // Establish TCP (direct or via proxy)
+    let (tcp_stream, host, is_http_forward) = match tcp_via_proxy(&http_req, &mut stat).await {
+        Ok(r) => r,
+        Err(e) => return finish_with_error(stat, e, start),
     };
 
-    let uri = &http_req.uri;
-    let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
-
-    // TCP connection
-    let tcp_stream = match tcp_connect(addr, http_req.tcp_timeout, &mut stat).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            return finish_with_error(stat, e, start);
-        }
-    };
+    // HTTP forward proxy: request must use the full absolute URI
+    if is_http_forward {
+        http_req.use_absolute_uri = true;
+    }
 
     // Create channel for connection errors
     let (tx, mut rx) = oneshot::channel();
@@ -305,15 +355,7 @@ async fn http1_2_request(http_req: HttpRequest) -> HttpStat {
     // Send request based on protocol
     let resp = if is_https {
         // TLS handshake
-        let tls_result = tls_handshake(
-            host.clone(),
-            tcp_stream,
-            http_req.tls_timeout,
-            http_req.alpn_protocols.clone(),
-            http_req.skip_verify,
-            &mut stat,
-        )
-        .await;
+        let tls_result = tls_handshake(host.clone(), tcp_stream, &http_req, &mut stat).await;
         let (tls_stream, is_http2) = match tls_result {
             Ok(result) => result,
             Err(e) => {
@@ -473,4 +515,217 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
     }
 
     stat
+}
+
+// --- Connection reuse API ---
+
+enum ConnectionSender {
+    Http1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
+    Http2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
+}
+
+/// A reusable HTTP connection handle for benchmarking.
+pub struct HttpConnection {
+    sender: ConnectionSender,
+    is_http2: bool,
+}
+
+async fn establish_http1<S>(
+    stream: S,
+    handshake_timeout: Duration,
+    mut stat: HttpStat,
+    start: Instant,
+) -> (HttpStat, Option<HttpConnection>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match timeout(
+        handshake_timeout,
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)),
+    )
+    .await
+    {
+        Ok(Ok((sender, conn))) => {
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            stat.total = Some(start.elapsed());
+            (
+                stat,
+                Some(HttpConnection {
+                    sender: ConnectionSender::Http1(sender),
+                    is_http2: false,
+                }),
+            )
+        }
+        Ok(Err(e)) => (
+            finish_with_error(stat, Error::Hyper { source: e }, start),
+            None,
+        ),
+        Err(e) => (
+            finish_with_error(stat, Error::Timeout { source: e }, start),
+            None,
+        ),
+    }
+}
+
+async fn establish_http2<S>(
+    stream: S,
+    handshake_timeout: Duration,
+    mut stat: HttpStat,
+    start: Instant,
+) -> (HttpStat, Option<HttpConnection>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match timeout(
+        handshake_timeout,
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+    )
+    .await
+    {
+        Ok(Ok((sender, conn))) => {
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            stat.total = Some(start.elapsed());
+            (
+                stat,
+                Some(HttpConnection {
+                    sender: ConnectionSender::Http2(sender),
+                    is_http2: true,
+                }),
+            )
+        }
+        Ok(Err(e)) => (
+            finish_with_error(stat, Error::Hyper { source: e }, start),
+            None,
+        ),
+        Err(e) => (
+            finish_with_error(stat, Error::Timeout { source: e }, start),
+            None,
+        ),
+    }
+}
+
+/// Establish an HTTP/1.1 or HTTP/2 connection and return a reusable handle.
+///
+/// Returns `(connect_stat, Some(conn))` on success, or `(error_stat, None)` on failure.
+/// Only supports HTTP/1.1 and HTTP/2. For HTTP/3 or gRPC, use `request()` directly.
+pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection>) {
+    ensure_crypto_provider();
+    let start = Instant::now();
+    let mut stat = HttpStat::default();
+
+    let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
+
+    let (tcp_stream, host, _is_http_forward) = match tcp_via_proxy(http_req, &mut stat).await {
+        Ok(r) => r,
+        Err(e) => return (finish_with_error(stat, e, start), None),
+    };
+
+    let handshake_timeout = http_req.request_timeout.unwrap_or(Duration::from_secs(30));
+
+    if is_https {
+        let (tls_stream, is_h2) = match tls_handshake(host, tcp_stream, http_req, &mut stat).await {
+            Ok(r) => r,
+            Err(e) => return (finish_with_error(stat, e, start), None),
+        };
+
+        if is_h2 {
+            establish_http2(tls_stream, handshake_timeout, stat, start).await
+        } else {
+            establish_http1(tls_stream, handshake_timeout, stat, start).await
+        }
+    } else {
+        establish_http1(tcp_stream, handshake_timeout, stat, start).await
+    }
+}
+
+impl HttpConnection {
+    /// Send a request on the existing connection, returning only request-phase timing.
+    pub async fn send(&mut self, http_req: &HttpRequest) -> HttpStat {
+        let start = Instant::now();
+        let mut stat = HttpStat::default();
+
+        let is_http1 = !self.is_http2;
+        let req = match build_http_request(http_req, is_http1) {
+            Ok(req) => req,
+            Err(e) => return finish_with_error(stat, e, start),
+        };
+        stat.request_headers = req.headers().clone();
+
+        // Ensure the connection is ready (especially important for HTTP/1.1 keep-alive)
+        match &mut self.sender {
+            ConnectionSender::Http1(sender) => {
+                if let Err(e) = sender.ready().await {
+                    return finish_with_error(stat, Error::Hyper { source: e }, start);
+                }
+            }
+            ConnectionSender::Http2(sender) => {
+                if let Err(e) = sender.ready().await {
+                    return finish_with_error(stat, Error::Hyper { source: e }, start);
+                }
+            }
+        }
+
+        let server_processing_start = Instant::now();
+        let resp = match &mut self.sender {
+            ConnectionSender::Http1(sender) => sender.send_request(req).await,
+            ConnectionSender::Http2(sender) => {
+                let mut req = req;
+                *req.version_mut() = Version::HTTP_2;
+                req.headers_mut().remove("Host");
+                sender.send_request(req).await
+            }
+        };
+
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => return finish_with_error(stat, Error::Hyper { source: e }, start),
+        };
+        stat.server_processing = Some(server_processing_start.elapsed());
+        stat.status = Some(resp.status());
+        stat.headers = Some(resp.headers().clone());
+
+        // Read response body
+        let content_transfer_start = Instant::now();
+        match resp.collect().await {
+            Ok(body) => {
+                let body_bytes = body.to_bytes();
+                stat.body = Some(body_bytes);
+                stat.content_transfer = Some(content_transfer_start.elapsed());
+            }
+            Err(e) => {
+                return finish_with_error(
+                    stat,
+                    format!("Failed to read response body: {e}"),
+                    start,
+                );
+            }
+        }
+
+        stat.total = Some(start.elapsed());
+
+        // Handle decompression
+        if let Some(body) = &stat.body {
+            stat.body_size = Some(body.len());
+        }
+        let encoding = stat
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("content-encoding"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !encoding.is_empty() {
+            if let Some(body) = &stat.body {
+                match decompress(encoding, body) {
+                    Ok(data) => stat.body = Some(data),
+                    Err(e) => stat.error = Some(e.to_string()),
+                }
+            }
+        }
+
+        stat
+    }
 }

@@ -16,6 +16,7 @@
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
 use super::error::{Error, Result};
+use super::http_request::ConnectTo;
 use super::stats::{format_time, Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
 use super::HttpRequest;
 use super::SkipVerifier;
@@ -24,6 +25,8 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -98,7 +101,25 @@ pub(crate) async fn dns_resolve(
         .to_string();
     let port = req.get_port();
 
-    if let Ok(addr) = host.parse::<IpAddr>() {
+    // Apply --connect-to override: redirect target host:port to another host:port.
+    // TLS SNI and the HTTP Host header keep using the original `host`.
+    let (lookup_host, port) = req
+        .connect_to
+        .iter()
+        .filter_map(|s| ConnectTo::parse(s))
+        .find(|ct| ct.matches(&host, port))
+        .map(|ct| {
+            let h = if ct.dst_host.is_empty() {
+                host.clone()
+            } else {
+                ct.dst_host.clone()
+            };
+            let p = ct.dst_port.unwrap_or(port);
+            (h, p)
+        })
+        .unwrap_or_else(|| (host.clone(), port));
+
+    if let Ok(addr) = lookup_host.parse::<IpAddr>() {
         let addr = SocketAddr::new(addr, port);
         stat.addr = Some(addr.to_string());
         return Ok((addr, host));
@@ -113,34 +134,115 @@ pub(crate) async fn dns_resolve(
 
     // Configure DNS resolver
     let provider = TokioConnectionProvider::default();
-    let mut servers = vec![];
+    let mut server_group: Option<NameServerConfigGroup> = None;
     if let Some(dns_servers) = &req.dns_servers {
+        let mut plain_ips: Vec<IpAddr> = vec![];
         for server in dns_servers {
             match server.as_str() {
+                // Plain UDP presets
                 "google" => {
-                    servers = GOOGLE_IPS.to_vec();
+                    server_group =
+                        Some(NameServerConfigGroup::from_ips_clear(GOOGLE_IPS, 53, true));
+                    plain_ips.clear();
                     break;
                 }
                 "cloudflare" => {
-                    servers = CLOUDFLARE_IPS.to_vec();
+                    server_group = Some(NameServerConfigGroup::from_ips_clear(
+                        CLOUDFLARE_IPS,
+                        53,
+                        true,
+                    ));
+                    plain_ips.clear();
                     break;
                 }
                 "quad9" => {
-                    servers = QUAD9_IPS.to_vec();
+                    server_group = Some(NameServerConfigGroup::from_ips_clear(QUAD9_IPS, 53, true));
+                    plain_ips.clear();
+                    break;
+                }
+                // DNS-over-HTTPS presets
+                "google-doh" => {
+                    server_group = Some(NameServerConfigGroup::from_ips_https(
+                        &[IpAddr::from([8, 8, 8, 8]), IpAddr::from([8, 8, 4, 4])],
+                        443,
+                        "dns.google".to_string(),
+                        true,
+                    ));
+                    plain_ips.clear();
+                    break;
+                }
+                "cloudflare-doh" => {
+                    server_group = Some(NameServerConfigGroup::from_ips_https(
+                        &[IpAddr::from([1, 1, 1, 1]), IpAddr::from([1, 0, 0, 1])],
+                        443,
+                        "cloudflare-dns.com".to_string(),
+                        true,
+                    ));
+                    plain_ips.clear();
+                    break;
+                }
+                "quad9-doh" => {
+                    server_group = Some(NameServerConfigGroup::from_ips_https(
+                        &[
+                            IpAddr::from([9, 9, 9, 9]),
+                            IpAddr::from([149, 112, 112, 112]),
+                        ],
+                        443,
+                        "dns.quad9.net".to_string(),
+                        true,
+                    ));
+                    plain_ips.clear();
+                    break;
+                }
+                // DNS-over-TLS presets
+                "google-dot" => {
+                    server_group = Some(NameServerConfigGroup::from_ips_tls(
+                        &[IpAddr::from([8, 8, 8, 8]), IpAddr::from([8, 8, 4, 4])],
+                        853,
+                        "dns.google".to_string(),
+                        true,
+                    ));
+                    plain_ips.clear();
+                    break;
+                }
+                "cloudflare-dot" => {
+                    server_group = Some(NameServerConfigGroup::from_ips_tls(
+                        &[IpAddr::from([1, 1, 1, 1]), IpAddr::from([1, 0, 0, 1])],
+                        853,
+                        "cloudflare-dns.com".to_string(),
+                        true,
+                    ));
+                    plain_ips.clear();
+                    break;
+                }
+                "quad9-dot" => {
+                    server_group = Some(NameServerConfigGroup::from_ips_tls(
+                        &[
+                            IpAddr::from([9, 9, 9, 9]),
+                            IpAddr::from([149, 112, 112, 112]),
+                        ],
+                        853,
+                        "dns.quad9.net".to_string(),
+                        true,
+                    ));
+                    plain_ips.clear();
                     break;
                 }
                 _ => {
                     if let Ok(addr) = server.parse::<IpAddr>() {
-                        servers.push(addr);
+                        plain_ips.push(addr);
                     }
                 }
             }
         }
+        if !plain_ips.is_empty() {
+            server_group = Some(NameServerConfigGroup::from_ips_clear(&plain_ips, 53, true));
+        }
     }
 
-    let mut builder = if !servers.is_empty() {
+    let mut builder = if let Some(group) = server_group {
         let mut config = ResolverConfig::new();
-        for server in NameServerConfigGroup::from_ips_clear(&servers, 53, true).into_inner() {
+        for server in group.into_inner() {
             config.add_name_server(server);
         }
         TokioResolver::builder_with_config(config, provider)
@@ -161,7 +263,7 @@ pub(crate) async fn dns_resolve(
     let dns_start = Instant::now();
     let addr = timeout(
         req.dns_timeout.unwrap_or(Duration::from_secs(5)),
-        resolver.lookup_ip(&host),
+        resolver.lookup_ip(&lookup_host),
     )
     .await
     .map_err(|e| Error::Timeout { source: e })?
@@ -199,9 +301,7 @@ pub(crate) async fn tcp_connect(
 pub(crate) async fn tls_handshake(
     host: String,
     tcp_stream: TcpStream,
-    tls_timeout: Option<Duration>,
-    alpn_protocols: Vec<String>,
-    skip_verify: bool,
+    http_req: &HttpRequest,
     stat: &mut HttpStat,
 ) -> Result<(TlsStream<TcpStream>, bool)> {
     let tls_start = Instant::now();
@@ -215,20 +315,40 @@ pub(crate) async fn tls_handshake(
             .map_err(|e| Error::Rustls { source: e })?;
     }
 
-    // Configure TLS client
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let builder = ClientConfig::builder().with_root_certificates(root_store);
+
+    // Configure TLS client (with or without client auth)
+    let mut config = if let (Some(cert_pem), Some(key_pem)) = (
+        http_req.client_cert.as_deref(),
+        http_req.client_key.as_deref(),
+    ) {
+        let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Common {
+                category: "cert".to_string(),
+                message: e.to_string(),
+            })?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| Error::Common {
+            category: "key".to_string(),
+            message: e.to_string(),
+        })?;
+        builder
+            .with_client_auth_cert(cert_chain, key)
+            .map_err(|e| Error::Rustls { source: e })?
+    } else {
+        builder.with_no_client_auth()
+    };
 
     // Skip certificate verification if requested
-    if skip_verify {
+    if http_req.skip_verify {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(SkipVerifier));
     }
 
     // Set ALPN protocols
-    config.alpn_protocols = alpn_protocols
+    config.alpn_protocols = http_req
+        .alpn_protocols
         .iter()
         .map(|s| s.as_bytes().to_vec())
         .collect();
@@ -237,7 +357,7 @@ pub(crate) async fn tls_handshake(
 
     // Perform TLS handshake
     let tls_stream = timeout(
-        tls_timeout.unwrap_or(Duration::from_secs(5)),
+        http_req.tls_timeout.unwrap_or(Duration::from_secs(5)),
         connector.connect(
             host.clone()
                 .try_into()
@@ -287,6 +407,8 @@ pub(crate) async fn quic_connect(
     host: String,
     addr: SocketAddr,
     skip_verify: bool,
+    client_cert: Option<&[u8]>,
+    client_key: Option<&[u8]>,
     stat: &mut HttpStat,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let quic_start = Instant::now();
@@ -300,10 +422,26 @@ pub(crate) async fn quic_connect(
             .map_err(|e| Error::Rustls { source: e })?;
     }
 
-    // Configure QUIC client
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let builder = ClientConfig::builder().with_root_certificates(root_store);
+
+    // Configure QUIC client (with or without client auth)
+    let mut config = if let (Some(cert_pem), Some(key_pem)) = (client_cert, client_key) {
+        let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Common {
+                category: "cert".to_string(),
+                message: e.to_string(),
+            })?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| Error::Common {
+            category: "key".to_string(),
+            message: e.to_string(),
+        })?;
+        builder
+            .with_client_auth_cert(cert_chain, key)
+            .map_err(|e| Error::Rustls { source: e })?
+    } else {
+        builder.with_no_client_auth()
+    };
     config.enable_early_data = true;
     config.alpn_protocols = vec![ALPN_HTTP3.as_bytes().to_vec()];
 

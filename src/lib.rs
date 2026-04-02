@@ -3,6 +3,7 @@ mod error;
 mod grpc;
 mod http_request;
 mod net;
+mod proxy;
 mod request;
 mod skip_verifier;
 mod stats;

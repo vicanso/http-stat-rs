@@ -43,6 +43,76 @@ pub(crate) fn finish_with_error(
     stat
 }
 
+/// A single `--connect-to HOST1:PORT1:HOST2:PORT2` entry.
+///
+/// When the request target matches `(src_host, src_port)`, the TCP connection is
+/// established to `(dst_host, dst_port)`. TLS SNI and the HTTP `Host` header still
+/// use the original hostname — only the actual TCP destination changes.
+///
+/// Empty `src_host` / `src_port` act as wildcards. Empty `dst_host` / absent `dst_port`
+/// keep the original value.
+#[derive(Debug, Clone)]
+pub struct ConnectTo {
+    src_host: String,
+    src_port: Option<u16>,
+    pub dst_host: String,
+    pub dst_port: Option<u16>,
+}
+
+fn parse_host_segment(s: &str) -> (String, &str) {
+    if let Some(rest) = s.strip_prefix('[') {
+        // IPv6 bracketed: [addr]...
+        if let Some(end) = rest.find(']') {
+            return (rest[..end].to_string(), &rest[end + 1..]);
+        }
+    }
+    // Plain host: take up to first ':'
+    let colon = s.find(':').unwrap_or(s.len());
+    (s[..colon].to_string(), &s[colon..])
+}
+
+impl ConnectTo {
+    /// Parse `HOST1:PORT1:HOST2:PORT2`. Any field may be empty; IPv6 uses `[addr]`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (src_host, rest) = parse_host_segment(s);
+        let rest = rest.strip_prefix(':')?; // require separator after HOST1
+
+        // PORT1 up to next ':'
+        let colon = rest.find(':')?;
+        let src_port = if rest[..colon].is_empty() {
+            None
+        } else {
+            Some(rest[..colon].parse().ok()?)
+        };
+        let rest = &rest[colon + 1..];
+
+        // HOST2
+        let (dst_host, rest) = parse_host_segment(rest);
+
+        // Optional ':PORT2'
+        let port2_str = rest.strip_prefix(':').unwrap_or(rest);
+        let dst_port = if port2_str.is_empty() {
+            None
+        } else {
+            Some(port2_str.parse().ok()?)
+        };
+
+        Some(ConnectTo {
+            src_host,
+            src_port,
+            dst_host,
+            dst_port,
+        })
+    }
+
+    /// Returns `true` if this entry applies to the given `(host, port)`.
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        let host_ok = self.src_host.is_empty() || self.src_host.eq_ignore_ascii_case(host);
+        let port_ok = self.src_port.is_none() || self.src_port == Some(port);
+        host_ok && port_ok
+    }
+}
+
 // HttpRequest struct to hold request configuration
 #[derive(Default, Debug, Clone)]
 pub struct HttpRequest {
@@ -60,6 +130,11 @@ pub struct HttpRequest {
     pub tls_timeout: Option<Duration>,           // TLS handshake timeout
     pub request_timeout: Option<Duration>,       // HTTP request timeout
     pub quic_timeout: Option<Duration>,          // QUIC connection timeout
+    pub client_cert: Option<Vec<u8>>,            // PEM-encoded client certificate (mTLS)
+    pub client_key: Option<Vec<u8>>,             // PEM-encoded client private key (mTLS)
+    pub proxy: Option<String>,                   // Proxy URL (http://, https://, socks5://)
+    pub use_absolute_uri: bool,                  // Send absolute URI (HTTP forward proxy)
+    pub connect_to: Vec<String>,                 // --connect-to HOST1:PORT1:HOST2:PORT2 overrides
 }
 
 impl HttpRequest {
@@ -85,7 +160,7 @@ impl HttpRequest {
         } else {
             Method::GET
         };
-        let mut builder = if is_http1 {
+        let mut builder = if is_http1 && !self.use_absolute_uri {
             if let Some(value) = uri.path_and_query() {
                 Request::builder().uri(value.to_string())
             } else {
