@@ -7,6 +7,7 @@ on:
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.94.1
 
 jobs:
   macos:
@@ -15,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.86.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: |
           rustup update
@@ -45,7 +46,7 @@ jobs:
       - name: release
         uses: addnab/docker-run-action@v3
         with:
-          image: clux/muslrust:1.89.0-stable
+          image: clux/muslrust:${{ env.RUST_TOOLCHAIN }}-stable
           options: -v ${{ github.workspace }}:/volume
           run: |
             make release
@@ -66,7 +67,7 @@ jobs:
       - name: release
         uses: addnab/docker-run-action@v3
         with:
-          image: clux/muslrust:1.89.0-stable
+          image: clux/muslrust:${{ env.RUST_TOOLCHAIN }}-stable
           options: -v ${{ github.workspace }}:/volume
           run: |
             make release

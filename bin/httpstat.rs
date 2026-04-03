@@ -26,6 +26,10 @@ use http_stat::{
 use std::net::IpAddr;
 use tokio::fs;
 
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// HTTP statistics tool
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -122,6 +126,10 @@ struct Args {
     /// Pretty mode
     #[arg(long = "pretty", help = "pretty mode")]
     pretty: bool,
+
+    /// Waterfall mode — show timing as a horizontal bar chart instead of columns
+    #[arg(long = "waterfall", help = "show timing as a waterfall bar chart")]
+    waterfall: bool,
 
     /// Timeout
     #[arg(long = "timeout", help = "timeout")]
@@ -675,6 +683,7 @@ async fn main() {
                 stat.verbose = args.verbose;
                 stat.silent = args.silent;
                 stat.pretty = args.pretty;
+                stat.waterfall = args.waterfall;
                 stat.include_headers.clone_from(&include_headers);
                 stat.exclude_headers.clone_from(&exclude_headers);
                 let body = stat.body.clone();
@@ -782,6 +791,7 @@ async fn main() {
             stat.verbose = args.verbose;
             stat.silent = args.silent;
             stat.pretty = args.pretty;
+            stat.waterfall = args.waterfall;
             stat.include_headers = include_headers;
             stat.exclude_headers = exclude_headers;
             let body = stat.body.clone();

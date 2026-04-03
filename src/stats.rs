@@ -114,6 +114,7 @@ pub struct HttpStat {
     pub pretty: bool,
     pub include_headers: Option<Vec<String>>,
     pub exclude_headers: Option<Vec<String>>,
+    pub waterfall: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +193,73 @@ impl HttpStat {
             return false;
         }
         true
+    }
+
+    /// Render a waterfall bar chart to `f`.
+    /// Each phase is one row; bars are horizontally positioned by cumulative offset.
+    fn fmt_waterfall(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total = match self.total {
+            Some(t) if t.as_nanos() > 0 => t,
+            _ => return Ok(()),
+        };
+
+        const BAR_WIDTH: usize = 50;
+        const LABEL_W: usize = 15;
+
+        let phases: &[(&str, Option<Duration>)] = &[
+            ("DNS Lookup", self.dns_lookup),
+            ("TCP Connect", self.tcp_connect),
+            ("TLS Handshake", self.tls_handshake),
+            ("QUIC Connect", self.quic_connect),
+            ("Server Process", self.server_processing),
+            ("Content Xfer", self.content_transfer),
+        ];
+
+        let total_ns = total.as_nanos() as f64;
+        let mut elapsed = Duration::ZERO;
+        let mut col_cursor: usize = 0;
+
+        for (name, dur_opt) in phases {
+            let Some(dur) = dur_opt else { continue };
+
+            let start_col = col_cursor;
+            elapsed += *dur;
+            let ideal_end = ((elapsed.as_nanos() as f64 / total_ns * BAR_WIDTH as f64).round()
+                as usize)
+                .min(BAR_WIDTH);
+            let end_col = ideal_end.min(BAR_WIDTH);
+            if end_col > start_col {
+                col_cursor = end_col;
+            }
+
+            let bar: String = (0..BAR_WIDTH)
+                .map(|i| {
+                    if i >= start_col && i < end_col {
+                        '█'
+                    } else {
+                        '░'
+                    }
+                })
+                .collect();
+
+            writeln!(
+                f,
+                " {:<LABEL_W$} [{}]  {}",
+                name,
+                LightCyan.paint(bar),
+                LightCyan.paint(format_duration(*dur))
+            )?;
+        }
+
+        writeln!(f)?;
+        writeln!(
+            f,
+            " {:LABEL_W$}  {:BAR_WIDTH$}  Total: {}",
+            "",
+            "",
+            LightCyan.paint(format_duration(total))
+        )?;
+        writeln!(f)
     }
 
     pub fn to_json(&self) -> Value {
@@ -456,97 +524,94 @@ impl fmt::Display for HttpStat {
             writeln!(f)?;
         }
 
-        let width = 20;
+        if self.waterfall {
+            self.fmt_waterfall(f)?;
+        } else {
+            let width = 20;
 
-        let mut timelines = vec![];
-        if let Some(value) = self.dns_lookup {
-            timelines.push(Timeline {
-                name: "DNS Lookup".to_string(),
-                duration: value,
-            });
-        }
+            let mut timelines = vec![];
+            if let Some(value) = self.dns_lookup {
+                timelines.push(Timeline {
+                    name: "DNS Lookup".to_string(),
+                    duration: value,
+                });
+            }
+            if let Some(value) = self.tcp_connect {
+                timelines.push(Timeline {
+                    name: "TCP Connect".to_string(),
+                    duration: value,
+                });
+            }
+            if let Some(value) = self.tls_handshake {
+                timelines.push(Timeline {
+                    name: "TLS Handshake".to_string(),
+                    duration: value,
+                });
+            }
+            if let Some(value) = self.quic_connect {
+                timelines.push(Timeline {
+                    name: "QUIC Connect".to_string(),
+                    duration: value,
+                });
+            }
+            if let Some(value) = self.server_processing {
+                timelines.push(Timeline {
+                    name: "Server Processing".to_string(),
+                    duration: value,
+                });
+            }
+            if let Some(value) = self.content_transfer {
+                timelines.push(Timeline {
+                    name: "Content Transfer".to_string(),
+                    duration: value,
+                });
+            }
 
-        if let Some(value) = self.tcp_connect {
-            timelines.push(Timeline {
-                name: "TCP Connect".to_string(),
-                duration: value,
-            });
-        }
-
-        if let Some(value) = self.tls_handshake {
-            timelines.push(Timeline {
-                name: "TLS Handshake".to_string(),
-                duration: value,
-            });
-        }
-        if let Some(value) = self.quic_connect {
-            timelines.push(Timeline {
-                name: "QUIC Connect".to_string(),
-                duration: value,
-            });
-        }
-
-        if let Some(value) = self.server_processing {
-            timelines.push(Timeline {
-                name: "Server Processing".to_string(),
-                duration: value,
-            });
-        }
-
-        if let Some(value) = self.content_transfer {
-            timelines.push(Timeline {
-                name: "Content Transfer".to_string(),
-                duration: value,
-            });
-        }
-
-        if !timelines.is_empty() {
-            // print name
-            write!(f, " ")?;
-            for (i, timeline) in timelines.iter().enumerate() {
-                write!(
-                    f,
-                    "{}",
-                    timeline.name.unicode_pad(width, Alignment::Center, true)
-                )?;
-                if i < timelines.len() - 1 {
-                    write!(f, " ")?;
+            if !timelines.is_empty() {
+                write!(f, " ")?;
+                for (i, timeline) in timelines.iter().enumerate() {
+                    write!(
+                        f,
+                        "{}",
+                        timeline.name.unicode_pad(width, Alignment::Center, true)
+                    )?;
+                    if i < timelines.len() - 1 {
+                        write!(f, " ")?;
+                    }
                 }
+                writeln!(f)?;
+
+                write!(f, "[")?;
+                for (i, timeline) in timelines.iter().enumerate() {
+                    write!(
+                        f,
+                        "{}",
+                        LightCyan.paint(
+                            format_duration(timeline.duration)
+                                .unicode_pad(width, Alignment::Center, true)
+                                .to_string(),
+                        )
+                    )?;
+                    if i < timelines.len() - 1 {
+                        write!(f, "|")?;
+                    }
+                }
+                writeln!(f, "]")?;
+            }
+
+            write!(f, " ")?;
+            for _ in 0..timelines.len() {
+                write!(f, "{}", " ".repeat(width))?;
+                write!(f, "|")?;
             }
             writeln!(f)?;
-
-            // print duration
-            write!(f, "[")?;
-            for (i, timeline) in timelines.iter().enumerate() {
-                write!(
-                    f,
-                    "{}",
-                    LightCyan.paint(
-                        format_duration(timeline.duration)
-                            .unicode_pad(width, Alignment::Center, true)
-                            .to_string(),
-                    )
-                )?;
-                if i < timelines.len() - 1 {
-                    write!(f, "|")?;
-                }
-            }
-            writeln!(f, "]")?;
+            write!(f, "{}", " ".repeat(width * timelines.len()))?;
+            write!(
+                f,
+                "Total:{}\n\n",
+                LightCyan.paint(format_duration(self.total.unwrap_or_default()))
+            )?;
         }
-
-        // print | line
-        write!(f, " ")?;
-        for _ in 0..timelines.len() {
-            write!(f, "{}", " ".repeat(width))?;
-            write!(f, "|")?;
-        }
-        writeln!(f)?;
-        write!(f, "{}", " ".repeat(width * timelines.len()))?;
-        write!(
-            f,
-            "Total:{}\n\n",
-            LightCyan.paint(format_duration(self.total.unwrap_or_default()))
-        )?;
 
         if let Some(body) = &self.body {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();

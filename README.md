@@ -20,6 +20,7 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **TLS inspection** — verbose mode shows full certificate chain, cipher suite, SAN domains, and validity
 - **Cookie support** — `-b 'k=v'` or `-b @file`, auto-carried across `-L` redirects with `Set-Cookie` merging
 - **curl-like UX** — familiar flags (`-H`, `-X`, `-d`, `-L`, `-k`, `-o`, `-4`/`-6`) for a smooth transition
+- **Waterfall chart** — `--waterfall` renders each phase as a horizontal bar, making bottlenecks instantly visible (like Chrome DevTools Network panel)
 - **`--connect-to`** — redirect `HOST1:PORT1` to `HOST2:PORT2` at the TCP level; TLS SNI and `Host` header stay unchanged, like curl's `--connect-to`
 - **Proxy support** — `--proxy` for HTTP/HTTPS/SOCKS5 proxies; also reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` environment variables
 - **mTLS (mutual TLS)** — `--cert`/`--key` sends a client certificate for zero-trust and service mesh authentication
@@ -112,6 +113,9 @@ httpstat --timeout 5s https://example.com
 # mTLS — send client certificate
 httpstat --cert client.crt --key client.key https://mtls.example.com
 
+# Waterfall bar chart — spot bottlenecks at a glance
+httpstat --waterfall https://example.com
+
 # Connect-to: test a specific backend without changing DNS or Host header
 httpstat --connect-to example.com:443:staging.internal:443 https://example.com
 
@@ -164,6 +168,7 @@ Options:
       --json                       output results as JSON for scripting and CI/CD
       --include-header <HEADER>    only show these response headers (repeatable, case-insensitive)
       --exclude-header <HEADER>    hide these response headers (repeatable, case-insensitive)
+      --waterfall                  show timing as a waterfall bar chart
       --connect-to <CONNECT_TO>    redirect HOST1:PORT1 to HOST2:PORT2 (repeatable, IPv6 uses [addr])
       --proxy <PROXY>              proxy URL: http://host:port, https://host:port, socks5://host:port
       --cert <CERT>                client certificate for mTLS (PEM file)

@@ -18,6 +18,7 @@
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
 - **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 重定向自动合并 `Set-Cookie`
 - **curl 风格操作** — 熟悉的参数（`-H`、`-X`、`-d`、`-L`、`-k`、`-o`、`-4`/`-6`），无缝上手
+- **Waterfall 图表** — `--waterfall` 将每个阶段渲染为横向进度条，瓶颈一目了然（类似 Chrome DevTools Network 面板）
 - **`--connect-to`** — 在 TCP 层将 `HOST1:PORT1` 重定向到 `HOST2:PORT2`，TLS SNI 和 `Host` 头保持不变，与 curl 的 `--connect-to` 一致
 - **代理支持** — `--proxy` 支持 HTTP/HTTPS/SOCKS5 代理；同时读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 环境变量
 - **mTLS（双向 TLS）** — `--cert`/`--key` 发送客户端证书，适用于零信任网络和服务网格
@@ -109,6 +110,9 @@ httpstat --timeout 5s https://example.com
 
 # mTLS — 发送客户端证书
 httpstat --cert client.crt --key client.key https://mtls.example.com
+
+# Waterfall 图表 — 一眼看出瓶颈所在
+httpstat --waterfall https://example.com
 
 # connect-to：测试指定后端，不影响 DNS 或 Host 头
 httpstat --connect-to example.com:443:staging.internal:443 https://example.com
