@@ -115,6 +115,7 @@ pub struct HttpStat {
     pub include_headers: Option<Vec<String>>,
     pub exclude_headers: Option<Vec<String>>,
     pub waterfall: bool,
+    pub jq_filter: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +124,118 @@ pub struct Certificate {
     pub issuer: String,
     pub not_before: String,
     pub not_after: String,
+}
+
+/// Apply a simple jq-style field selector to a JSON string.
+/// Supported syntax:
+///   .                    identity (pretty-print)
+///   .field               object key access
+///   .field.sub           nested key access
+///   .[0]                 array index
+///   .[]                  iterate all array/object values
+///   combinations: .items[].name, .a.b[2].c, etc.
+fn apply_jq_filter(body: &str, filter: &str) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_str(body).ok()?;
+    let filter = filter.trim();
+    // Allow omitting the leading '.' for convenience (e.g. "os" → ".os")
+    let owned;
+    let filter = if !filter.starts_with('.') {
+        owned = format!(".{filter}");
+        owned.as_str()
+    } else {
+        filter
+    };
+
+    // Tokenise the filter string into a list of access steps.
+    #[derive(Debug)]
+    enum Step {
+        Key(String),
+        Index(usize),
+        Iter,
+    }
+
+    fn tokenize(s: &str) -> Option<Vec<Step>> {
+        let s = s.strip_prefix('.')?;
+        if s.is_empty() {
+            return Some(vec![]);
+        }
+        let mut steps = Vec::new();
+        // Split on '.' but keep bracket expressions attached to the preceding key.
+        // We walk char-by-char to handle `key[0].next` etc.
+        let mut remaining = s;
+        while !remaining.is_empty() {
+            if remaining.starts_with('[') {
+                // bracket at the start: .[0] or .[]
+                let end = remaining.find(']')?;
+                let inner = &remaining[1..end];
+                if inner.is_empty() {
+                    steps.push(Step::Iter);
+                } else {
+                    let idx: usize = inner.parse().ok()?;
+                    steps.push(Step::Index(idx));
+                }
+                remaining = &remaining[end + 1..];
+                if remaining.starts_with('.') {
+                    remaining = &remaining[1..];
+                }
+            } else {
+                // read up to next '.' or '['
+                let end = remaining.find(['.', '[']).unwrap_or(remaining.len());
+                let key = &remaining[..end];
+                if !key.is_empty() {
+                    steps.push(Step::Key(key.to_string()));
+                }
+                remaining = &remaining[end..];
+                if remaining.starts_with('.') {
+                    remaining = &remaining[1..];
+                }
+            }
+        }
+        Some(steps)
+    }
+
+    fn apply_steps(values: Vec<serde_json::Value>, steps: &[Step]) -> Vec<serde_json::Value> {
+        if steps.is_empty() {
+            return values;
+        }
+        let mut current = values;
+        for step in steps {
+            current = match step {
+                Step::Key(k) => current
+                    .into_iter()
+                    .filter_map(|v| v.get(k).cloned())
+                    .collect(),
+                Step::Index(i) => current
+                    .into_iter()
+                    .filter_map(|v| v.get(i).cloned())
+                    .collect(),
+                Step::Iter => current
+                    .into_iter()
+                    .flat_map(|v| match v {
+                        serde_json::Value::Array(arr) => arr,
+                        serde_json::Value::Object(map) => map.into_values().collect(),
+                        other => vec![other],
+                    })
+                    .collect(),
+            };
+        }
+        current
+    }
+
+    let steps = tokenize(filter)?;
+    let results = apply_steps(vec![root], &steps);
+
+    if results.len() == 1 {
+        serde_json::to_string_pretty(&results[0]).ok()
+    } else {
+        Some(
+            results
+                .iter()
+                .filter_map(|v| serde_json::to_string_pretty(v).ok())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
 }
 
 impl HttpStat {
@@ -618,7 +731,11 @@ impl fmt::Display for HttpStat {
             let mut body = std::str::from_utf8(body.as_ref())
                 .unwrap_or_default()
                 .to_string();
-            if self.pretty && is_json {
+            if let Some(filter) = &self.jq_filter {
+                if let Some(filtered) = apply_jq_filter(&body, filter) {
+                    body = filtered;
+                }
+            } else if self.pretty && is_json {
                 if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&body) {
                     if let Ok(value) = serde_json::to_string_pretty(&json_body) {
                         body = value;

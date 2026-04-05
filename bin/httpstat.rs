@@ -185,6 +185,13 @@ struct Args {
     #[arg(long = "key", help = "client private key for mTLS (PEM file)")]
     key: Option<String>,
 
+    /// jq-style filter for JSON response body (e.g. ".items[].name")
+    #[arg(
+        long = "jq",
+        help = "filter JSON response body with a jq-style selector (e.g. \".items[].name\")"
+    )]
+    jq: Option<String>,
+
     /// Include only specific response headers
     #[arg(
         long = "include-header",
@@ -684,6 +691,7 @@ async fn main() {
                 stat.silent = args.silent;
                 stat.pretty = args.pretty;
                 stat.waterfall = args.waterfall;
+                stat.jq_filter.clone_from(&args.jq);
                 stat.include_headers.clone_from(&include_headers);
                 stat.exclude_headers.clone_from(&exclude_headers);
                 let body = stat.body.clone();
@@ -792,6 +800,7 @@ async fn main() {
             stat.silent = args.silent;
             stat.pretty = args.pretty;
             stat.waterfall = args.waterfall;
+            stat.jq_filter = args.jq;
             stat.include_headers = include_headers;
             stat.exclude_headers = exclude_headers;
             let body = stat.body.clone();
