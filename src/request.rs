@@ -149,6 +149,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
             http_req.skip_verify,
             http_req.client_cert.as_deref(),
             http_req.client_key.as_deref(),
+            http_req.bind_addr,
             &mut stat,
         ),
     )
@@ -327,7 +328,7 @@ async fn tcp_via_proxy(
         Ok((stream, target_host, is_http_forward))
     } else {
         let (addr, host) = dns_resolve(http_req, stat).await?;
-        let stream = tcp_connect(addr, http_req.tcp_timeout, stat).await?;
+        let stream = tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, stat).await?;
         Ok((stream, host, false))
     }
 }

@@ -17,14 +17,20 @@
 - **JSON 输出** — `--json` 方便脚本集成、CI/CD 流水线和监控系统对接
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
 - **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 重定向自动合并 `Set-Cookie`
+- **ALPN 协议协商展示** — 每次响应明确显示客户端与服务端最终协商出的协议版本（`HTTP/1.1`、`H2`、`H3`），清楚知道实际使用了哪个版本
+- **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段，无需额外管道 `jq`
+- **JSON 格式化输出** — `--pretty` 原地美化响应体；配合 `--jq` 使用，输出更聚焦、更易读
+- **响应头过滤** — `--include-header` 只显示关注的响应头；`--exclude-header` 隐藏噪音字段
 - **curl 风格操作** — 熟悉的参数（`-H`、`-X`、`-d`、`-L`、`-k`、`-o`、`-4`/`-6`），无缝上手
 - **Waterfall 图表** — `--waterfall` 将每个阶段渲染为横向进度条，瓶颈一目了然（类似 Chrome DevTools Network 面板）
 - **`--connect-to`** — 在 TCP 层将 `HOST1:PORT1` 重定向到 `HOST2:PORT2`，TLS SNI 和 `Host` 头保持不变，与 curl 的 `--connect-to` 一致
 - **代理支持** — `--proxy` 支持 HTTP/HTTPS/SOCKS5 代理；同时读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 环境变量
+- **源 IP 绑定** — `--bind <IP>` 将出站连接绑定到指定本地地址，多网卡环境、策略路由或验证特定网卡可达性时不可或缺
 - **mTLS（双向 TLS）** — `--cert`/`--key` 发送客户端证书，适用于零信任网络和服务网格
 - **配置文件** — `~/.httpstatrc` 设置持久化默认值（DNS、超时、请求头等），CLI 参数始终优先
 - **语义化退出码** — DNS、TCP、TLS、超时、4xx、5xx 各有独立退出码，脚本判断更便捷
 - **极小体积** — release 构建采用 LTO + `opt-level=z` + strip，通常 < 5 MB
+- **真正的零系统依赖** — 静态链接，不依赖 libcurl、OpenSSL 或 libc（musl 构建），可直接放入 `scratch` 或 `alpine` Docker 镜像用于生产环境排查
 
 ## 安装
 
@@ -47,6 +53,31 @@ sudo mv httpstat /usr/local/bin/
 ```bash
 cargo install http-stat
 ```
+
+## 请求生命周期
+
+每个 HTTP 请求最多经历五个串行阶段，httpstat 对每个阶段单独计时：
+
+```
+  DNS 解析     TCP 连接     TLS 握手      服务端处理       内容传输
+[────────────][────────────][──────────────][──────────────────][───────────────]
+      │              │              │                │                  │
+  域名解析       三次握手        TLS/SSL         等待首字节           下载响应
+  → IP 地址    SYN 交换       协商加密         （纯服务延迟）          正文
+                             （仅 HTTPS）
+                                                                         ▲
+                                                              Total = 所有阶段之和
+```
+
+| 阶段 | 含义 |
+|---|---|
+| DNS 解析 | 将域名解析为 IP 地址所花费的时间 |
+| TCP 连接 | 完成三次握手建立 TCP 连接的时间 |
+| TLS 握手 | 协商 TLS 会话的时间（仅 HTTPS/HTTP2/HTTP3） |
+| 服务端处理 | 从发出最后一个请求字节到收到第一个响应字节的时间——纯服务器延迟 |
+| 内容传输 | 下载完整响应正文的时间 |
+
+> HTTP/3 中，**QUIC 连接**阶段取代了 TCP 连接和 TLS 握手（QUIC 将传输层与加密握手合并为一步完成）。
 
 ## 使用示例
 
@@ -128,6 +159,9 @@ httpstat --proxy socks5://127.0.0.1:1080 https://example.com
 
 # 从环境变量读取代理
 HTTPS_PROXY=http://proxy.corp:8080 httpstat https://example.com
+
+# 绑定指定本地 IP（多网卡 / 策略路由）
+httpstat --bind 192.168.1.100 https://example.com
 ```
 
 ## 选项

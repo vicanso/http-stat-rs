@@ -135,6 +135,7 @@ pub struct HttpRequest {
     pub proxy: Option<String>,                   // Proxy URL (http://, https://, socks5://)
     pub use_absolute_uri: bool,                  // Send absolute URI (HTTP forward proxy)
     pub connect_to: Vec<String>,                 // --connect-to HOST1:PORT1:HOST2:PORT2 overrides
+    pub bind_addr: Option<IpAddr>,               // Local source IP to bind before connecting
 }
 
 impl HttpRequest {

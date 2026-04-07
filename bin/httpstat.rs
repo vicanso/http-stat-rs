@@ -185,6 +185,13 @@ struct Args {
     #[arg(long = "key", help = "client private key for mTLS (PEM file)")]
     key: Option<String>,
 
+    /// Bind to a specific local IP address before connecting
+    #[arg(
+        long = "bind",
+        help = "bind to a specific local IP address (e.g. 192.168.1.100 or ::1)"
+    )]
+    bind: Option<String>,
+
     /// jq-style filter for JSON response body (e.g. ".items[].name")
     #[arg(
         long = "jq",
@@ -470,6 +477,16 @@ async fn main() {
         req.ip_version = Some(6);
     }
     req.skip_verify = args.skip_verify;
+
+    if let Some(bind_str) = args.bind {
+        match bind_str.parse::<std::net::IpAddr>() {
+            Ok(ip) => req.bind_addr = Some(ip),
+            Err(_) => {
+                eprintln!("httpstat: invalid --bind address '{bind_str}'");
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Some(dns_servers) = args.dns_servers {
         req.dns_servers = Some(dns_servers.split(',').map(|s| s.to_string()).collect());

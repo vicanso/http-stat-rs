@@ -32,6 +32,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::net::TcpSocket;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
@@ -283,16 +284,33 @@ pub(crate) async fn dns_resolve(
 pub(crate) async fn tcp_connect(
     addr: SocketAddr,
     tcp_timeout: Option<Duration>,
+    bind_addr: Option<IpAddr>,
     stat: &mut HttpStat,
 ) -> Result<TcpStream> {
     let tcp_start = Instant::now();
-    let tcp_stream = timeout(
-        tcp_timeout.unwrap_or(Duration::from_secs(5)),
-        TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|e| Error::Timeout { source: e })?
-    .map_err(|e| Error::Io { source: e })?;
+    let connect_fut = async {
+        if let Some(src_ip) = bind_addr {
+            let socket = if src_ip.is_ipv6() {
+                TcpSocket::new_v6()
+            } else {
+                TcpSocket::new_v4()
+            }
+            .map_err(|e| Error::Io { source: e })?;
+            let bind: SocketAddr = (src_ip, 0).into();
+            socket.bind(bind).map_err(|e| Error::Io { source: e })?;
+            socket
+                .connect(addr)
+                .await
+                .map_err(|e| Error::Io { source: e })
+        } else {
+            TcpStream::connect(addr)
+                .await
+                .map_err(|e| Error::Io { source: e })
+        }
+    };
+    let tcp_stream = timeout(tcp_timeout.unwrap_or(Duration::from_secs(5)), connect_fut)
+        .await
+        .map_err(|e| Error::Timeout { source: e })??;
     stat.tcp_connect = Some(tcp_start.elapsed());
     Ok(tcp_stream)
 }
@@ -409,6 +427,7 @@ pub(crate) async fn quic_connect(
     skip_verify: bool,
     client_cert: Option<&[u8]>,
     client_key: Option<&[u8]>,
+    bind_addr: Option<IpAddr>,
     stat: &mut HttpStat,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let quic_start = Instant::now();
@@ -452,13 +471,19 @@ pub(crate) async fn quic_connect(
             .set_certificate_verifier(Arc::new(SkipVerifier));
     }
 
-    // Create QUIC endpoint
+    // Create QUIC endpoint, binding to the requested source IP (or wildcard)
+    let quic_bind: SocketAddr = match bind_addr {
+        Some(ip) => (ip, 0).into(),
+        None => {
+            if addr.is_ipv6() {
+                "[::]:0".parse().unwrap()
+            } else {
+                "0.0.0.0:0".parse().unwrap()
+            }
+        }
+    };
     let mut client_endpoint =
-        h3_quinn::quinn::Endpoint::client("[::]:0".parse().map_err(|_| Error::Common {
-            category: "parse".to_string(),
-            message: "failed to parse address".to_string(),
-        })?)
-        .map_err(|e| Error::Io { source: e })?;
+        h3_quinn::quinn::Endpoint::client(quic_bind).map_err(|e| Error::Io { source: e })?;
 
     let h3_config =
         quinn::crypto::rustls::QuicClientConfig::try_from(config).map_err(|e| Error::Common {

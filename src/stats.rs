@@ -742,7 +742,7 @@ impl fmt::Display for HttpStat {
                     }
                 }
             }
-            if self.verbose || (is_text && body.len() < 1024) {
+            if self.verbose || self.jq_filter.is_some() || (is_text && body.len() < 4096) {
                 let text = format!(
                     "Body size: {}",
                     ByteSize(self.body_size.unwrap_or(0) as u64)

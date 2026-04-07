@@ -52,7 +52,8 @@ impl Service<Uri> for CustomHttpConnector {
         let fut = async move {
             let mut stat = stat.lock().await;
             let (addr, _host) = dns_resolve(&http_req, &mut stat).await?;
-            let tcp_stream = tcp_connect(addr, http_req.tcp_timeout, &mut stat).await?;
+            let tcp_stream =
+                tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, &mut stat).await?;
             Ok(TokioIo::new(tcp_stream))
         };
         ConnectorConnecting {

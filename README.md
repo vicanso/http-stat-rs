@@ -19,14 +19,20 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **JSON output** — `--json` for scripting, CI/CD pipelines, and monitoring integration
 - **TLS inspection** — verbose mode shows full certificate chain, cipher suite, SAN domains, and validity
 - **Cookie support** — `-b 'k=v'` or `-b @file`, auto-carried across `-L` redirects with `Set-Cookie` merging
+- **ALPN negotiation display** — every response line shows the final protocol agreed between client and server (`HTTP/1.1`, `H2`, `H3`), so you always know which version was actually used
+- **JSON field selector** — `--jq '.items[].name'` extracts fields directly from the response body; no need to pipe through `jq`
+- **Pretty JSON** — `--pretty` formats the response body in-place; combine with `--jq` for focused, readable output
+- **Response header filtering** — `--include-header` shows only the headers you care about; `--exclude-header` hides the noisy ones
 - **curl-like UX** — familiar flags (`-H`, `-X`, `-d`, `-L`, `-k`, `-o`, `-4`/`-6`) for a smooth transition
 - **Waterfall chart** — `--waterfall` renders each phase as a horizontal bar, making bottlenecks instantly visible (like Chrome DevTools Network panel)
 - **`--connect-to`** — redirect `HOST1:PORT1` to `HOST2:PORT2` at the TCP level; TLS SNI and `Host` header stay unchanged, like curl's `--connect-to`
 - **Proxy support** — `--proxy` for HTTP/HTTPS/SOCKS5 proxies; also reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` environment variables
+- **Source IP binding** — `--bind <IP>` pins outbound connections to a specific local address; essential for multi-NIC hosts, policy routing, or validating which interface reaches a target
 - **mTLS (mutual TLS)** — `--cert`/`--key` sends a client certificate for zero-trust and service mesh authentication
 - **Config file** — `~/.httpstatrc` sets persistent defaults (DNS, timeout, headers, etc.); CLI flags always win
 - **Semantic exit codes** — distinct codes for DNS, TCP, TLS, timeout, 4xx, 5xx failures for easy scripting
 - **Tiny binary** — release build uses LTO + `opt-level=z` + strip, typically < 5 MB
+- **Truly zero system dependencies** — statically linked, no libcurl, no OpenSSL, no libc on musl builds; drop the binary directly into a `scratch` or `alpine` Docker image for production diagnostics
 
 ## Installation
 
@@ -49,6 +55,31 @@ sudo mv httpstat /usr/local/bin/
 ```bash
 cargo install http-stat
 ```
+
+## Request Lifecycle
+
+Every HTTP request goes through up to five sequential phases. httpstat measures each one independently:
+
+```
+  DNS Lookup   TCP Connect  TLS Handshake  Server Processing  Content Transfer
+[────────────][────────────][──────────────][──────────────────][───────────────]
+      │              │              │                │                  │
+  hostname       3-way SYN      TLS/SSL          waiting for       downloading
+   → IP          handshake    negotiation        first byte         response
+                                 (HTTPS)
+                                                                         ▲
+                                                              Total = all phases
+```
+
+| Phase | What it measures |
+|---|---|
+| DNS Lookup | Time to resolve the hostname to an IP address |
+| TCP Connect | Time for the 3-way TCP handshake |
+| TLS Handshake | Time to negotiate the TLS session (HTTPS/HTTP2/HTTP3 only) |
+| Server Processing | Time from the last request byte sent to the first response byte received — pure server latency |
+| Content Transfer | Time to download the complete response body |
+
+> For HTTP/3, **QUIC Connect** replaces both TCP Connect and TLS Handshake (QUIC combines transport and crypto in a single handshake).
 
 ## Usage
 
@@ -130,6 +161,9 @@ httpstat --proxy socks5://127.0.0.1:1080 https://example.com
 
 # Proxy from environment variable
 HTTPS_PROXY=http://proxy.corp:8080 httpstat https://example.com
+
+# Bind to a specific local IP (multi-NIC / policy routing)
+httpstat --bind 192.168.1.100 https://example.com
 ```
 
 ## Options
