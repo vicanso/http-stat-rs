@@ -34,6 +34,12 @@
 
 ## 安装
 
+### 一键安装（Linux & macOS）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vicanso/http-stat-rs/main/install.sh | sh
+```
+
 ### 预编译二进制
 
 为 Windows、macOS 和 Linux 提供[预编译二进制文件](https://github.com/vicanso/http-stat-rs/releases)。

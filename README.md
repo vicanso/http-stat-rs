@@ -36,6 +36,12 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 
 ## Installation
 
+### One-line install (Linux & macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vicanso/http-stat-rs/main/install.sh | sh
+```
+
 ### Pre-built binaries
 
 [Pre-built binaries](https://github.com/vicanso/http-stat-rs/releases) for Windows, macOS and Linux.
