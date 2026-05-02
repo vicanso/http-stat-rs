@@ -22,7 +22,7 @@ use heck::ToTrainCase;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
-use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed};
+use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::io::Write;
@@ -480,11 +480,12 @@ impl HttpStat {
 impl fmt::Display for HttpStat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(addr) = &self.addr {
-            let mut text = format!(
-                "{} {}",
-                LightGreen.paint("Connected to"),
-                LightCyan.paint(addr)
-            );
+            let label = if self.tcp_connect.is_some() || self.quic_connect.is_some() {
+                LightGreen.paint("Connected to")
+            } else {
+                LightYellow.paint("Resolved to")
+            };
+            let mut text = format!("{} {}", label, LightCyan.paint(addr));
             if self.silent {
                 if let Some(status) = &self.status {
                     let alpn = self.alpn.as_deref().unwrap_or(ALPN_HTTP1);
