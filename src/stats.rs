@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::i18n::Lang;
 use crate::tcp_info::{TcpInfo, TcpInfoDelta};
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -172,6 +173,10 @@ pub struct HttpStat {
     /// When true, render the Kernel TCP block even without `--verbose`.
     /// Driven by the CLI `--tcp-info` flag.
     pub show_tcp_info: bool,
+    /// Display language for the terminal renderer. JSON output is always
+    /// in English (machine contract). Driven by `--lang` or auto-detected
+    /// from LC_ALL/LC_MESSAGES/LANG.
+    pub lang: Lang,
 }
 
 #[derive(Debug, Clone)]
@@ -507,24 +512,25 @@ impl HttpStat {
         const BAR_WIDTH: usize = 50;
         const LABEL_W: usize = 15;
 
+        let s = self.lang.strings();
         // When a DoH/DoT probe ran, split the DNS column into Connect + Query.
         let (dns_a, dns_b) = if self.dns_connect.is_some() {
             (
-                ("DNS Connect", self.dns_connect),
-                ("DNS Query", self.dns_query()),
+                (s.dns_connect, self.dns_connect),
+                (s.dns_query, self.dns_query()),
             )
         } else {
-            (("DNS Lookup", self.dns_lookup), ("", None))
+            ((s.dns_lookup, self.dns_lookup), ("", None))
         };
         let phases_vec: Vec<(&str, Option<Duration>)> = vec![
             dns_a,
             dns_b,
-            ("TCP Connect", self.tcp_connect),
-            ("TLS Handshake", self.tls_handshake),
-            ("QUIC Connect", self.quic_connect),
-            ("Request Send", self.request_send),
-            ("Server Process", self.server_processing),
-            ("Content Xfer", self.content_transfer),
+            (s.tcp_connect, self.tcp_connect),
+            (s.tls_handshake, self.tls_handshake),
+            (s.quic_connect, self.quic_connect),
+            (s.request_send, self.request_send),
+            (s.server_processing_short, self.server_processing),
+            (s.content_transfer_short, self.content_transfer),
         ];
         let phases: &[(&str, Option<Duration>)] = &phases_vec;
 
@@ -567,9 +573,10 @@ impl HttpStat {
         writeln!(f)?;
         writeln!(
             f,
-            " {:LABEL_W$}  {:BAR_WIDTH$}  Total: {}",
+            " {:LABEL_W$}  {:BAR_WIDTH$}  {}: {}",
             "",
             "",
+            s.total,
             LightCyan.paint(format_duration(total))
         )?;
         writeln!(f)
@@ -783,11 +790,12 @@ impl HttpStat {
 
 impl fmt::Display for HttpStat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.lang.strings();
         if let Some(addr) = &self.addr {
             let label = if self.tcp_connect.is_some() || self.quic_connect.is_some() {
-                LightGreen.paint("Connected to")
+                LightGreen.paint(s.connected_to)
             } else {
-                LightYellow.paint("Resolved to")
+                LightYellow.paint(s.resolved_to)
             };
             let mut text = format!("{} {}", label, LightCyan.paint(addr));
             if self.silent {
@@ -805,16 +813,17 @@ impl fmt::Display for HttpStat {
                         status
                     );
                 } else {
-                    text = format!("{text} --> {}", LightRed.paint("FAIL"));
+                    text = format!("{text} --> {}", LightRed.paint(s.fail));
                 }
                 text = format!("{text} {}", format_duration(self.total.unwrap_or_default()));
                 // Surface TLS resumption / 0-RTT inline — most useful in
                 // benchmark (-n) output where iterations 2+ may resume.
+                // "0-RTT" stays as a technical token across locales.
                 if let Some(true) = self.tls_resumed {
                     let tag = if matches!(self.tls_early_data_accepted, Some(true)) {
                         "0-RTT"
                     } else {
-                        "Resumed"
+                        s.handshake_resumed
                     };
                     text = format!("{text} [{}]", LightYellow.paint(tag));
                 }
@@ -822,7 +831,7 @@ impl fmt::Display for HttpStat {
             writeln!(f, "{text}")?;
         }
         if let Some(error) = &self.error {
-            writeln!(f, "Error: {}", LightRed.paint(error))?;
+            writeln!(f, "{}: {}", s.error_label, LightRed.paint(error))?;
         }
         if self.silent {
             return Ok(());
@@ -851,59 +860,73 @@ impl fmt::Display for HttpStat {
         }
         if self.is_grpc {
             if self.is_success() {
-                writeln!(f, "{}", LightGreen.paint("GRPC OK"))?;
+                writeln!(f, "{}", LightGreen.paint(s.grpc_ok))?;
             }
             writeln!(f)?;
         }
 
         if let Some(tls) = &self.tls {
             writeln!(f)?;
-            writeln!(f, "Tls: {}", LightCyan.paint(tls))?;
+            writeln!(f, "{}: {}", s.tls_label, LightCyan.paint(tls))?;
             writeln!(
                 f,
-                "Cipher: {}",
+                "{}: {}",
+                s.cipher,
                 LightCyan.paint(self.cert_cipher.as_deref().unwrap_or_default())
             )?;
             if let Some(resumed) = self.tls_resumed {
-                let label = if resumed { "Resumed" } else { "Full" };
-                writeln!(f, "Handshake: {}", LightCyan.paint(label))?;
+                let label = if resumed {
+                    s.handshake_resumed
+                } else {
+                    s.handshake_full
+                };
+                writeln!(f, "{}: {}", s.handshake, LightCyan.paint(label))?;
             }
             if let Some(accepted) = self.tls_early_data_accepted {
                 let label = if accepted {
-                    "accepted (0-RTT)"
+                    s.early_data_accepted
                 } else {
-                    "not accepted"
+                    s.early_data_not_accepted
                 };
-                writeln!(f, "Early Data: {}", LightCyan.paint(label))?;
+                writeln!(f, "{}: {}", s.early_data, LightCyan.paint(label))?;
             }
             if let Some(stapled) = self.tls_ocsp_stapled {
-                let label = if stapled { "stapled" } else { "not stapled" };
-                writeln!(f, "OCSP: {}", LightCyan.paint(label))?;
+                let label = if stapled {
+                    s.ocsp_stapled
+                } else {
+                    s.ocsp_not_stapled
+                };
+                writeln!(f, "{}: {}", s.ocsp, LightCyan.paint(label))?;
             }
             writeln!(
                 f,
-                "Not Before: {}",
+                "{}: {}",
+                s.not_before,
                 LightCyan.paint(self.cert_not_before.as_deref().unwrap_or_default())
             )?;
             writeln!(
                 f,
-                "Not After: {}",
+                "{}: {}",
+                s.not_after,
                 LightCyan.paint(self.cert_not_after.as_deref().unwrap_or_default())
             )?;
             if self.verbose {
                 writeln!(
                     f,
-                    "Subject: {}",
+                    "{}: {}",
+                    s.subject,
                     LightCyan.paint(self.subject.as_deref().unwrap_or_default())
                 )?;
                 writeln!(
                     f,
-                    "Issuer: {}",
+                    "{}: {}",
+                    s.issuer,
                     LightCyan.paint(self.issuer.as_deref().unwrap_or_default())
                 )?;
                 writeln!(
                     f,
-                    "Certificate Domains: {}",
+                    "{}: {}",
+                    s.cert_domains,
                     LightCyan.paint(self.cert_domains.as_deref().unwrap_or_default().join(", "))
                 )?;
             }
@@ -911,22 +934,30 @@ impl fmt::Display for HttpStat {
 
             if self.verbose {
                 if let Some(certificates) = &self.certificates {
-                    writeln!(f, "Certificate Chain")?;
+                    writeln!(f, "{}", s.cert_chain)?;
                     for (index, cert) in certificates.iter().enumerate() {
                         writeln!(
                             f,
-                            " {index} Subject: {}",
+                            " {index} {}: {}",
+                            s.subject,
                             LightCyan.paint(cert.subject.as_str())
                         )?;
-                        writeln!(f, "   Issuer: {}", LightCyan.paint(cert.issuer.as_str()))?;
                         writeln!(
                             f,
-                            "   Not Before: {}",
+                            "   {}: {}",
+                            s.issuer,
+                            LightCyan.paint(cert.issuer.as_str())
+                        )?;
+                        writeln!(
+                            f,
+                            "   {}: {}",
+                            s.not_before,
                             LightCyan.paint(cert.not_before.as_str())
                         )?;
                         writeln!(
                             f,
-                            "   Not After: {}",
+                            "   {}: {}",
+                            s.not_after,
                             LightCyan.paint(cert.not_after.as_str())
                         )?;
                         writeln!(f)?;
@@ -942,7 +973,9 @@ impl fmt::Display for HttpStat {
         if (self.verbose || self.show_tcp_info)
             && (self.tcp_info_post_connect.is_some() || self.tcp_info_final.is_some())
         {
-            writeln!(f, "{}", LightGreen.paint("Kernel TCP:"))?;
+            writeln!(f, "{}", LightGreen.paint(s.kernel_tcp_heading))?;
+            // Technical field names (rtt/retrans/cwnd/mss) stay English —
+            // they're the standard `getsockopt(TCP_INFO)` field names.
             let render = |label: &str, info: &TcpInfo| -> String {
                 let rtt = info.rtt.map(format_duration).unwrap_or_else(|| "-".into());
                 let rttvar = info
@@ -967,17 +1000,21 @@ impl fmt::Display for HttpStat {
                 )
             };
             if let Some(info) = &self.tcp_info_post_connect {
-                writeln!(f, "{}", LightCyan.paint(render("post-connect:", info)))?;
+                writeln!(
+                    f,
+                    "{}",
+                    LightCyan.paint(render(s.tcp_post_connect_row, info))
+                )?;
             }
             if let Some(info) = &self.tcp_info_final {
-                writeln!(f, "{}", LightCyan.paint(render("final:", info)))?;
+                writeln!(f, "{}", LightCyan.paint(render(s.tcp_final_row, info)))?;
             }
             if let Some(delta) = TcpInfoDelta::compute(
                 self.tcp_info_post_connect.as_ref(),
                 self.tcp_info_final.as_ref(),
             ) {
                 if let Some(n) = delta.retransmits_during {
-                    let label = format!("  during request: {n} retransmit(s)");
+                    let label = format!("  {} {n} {}", s.tcp_during, s.tcp_retransmit_word);
                     let painted = if n == 0 {
                         LightCyan.paint(label)
                     } else {
@@ -1047,22 +1084,27 @@ impl fmt::Display for HttpStat {
 
                 let summary = match self.server_processing {
                     Some(sp) if sp > sum => format!(
-                        "(\u{03A3} {} of {} Server Processing \u{00B7} {} unaccounted)",
+                        "(\u{03A3} {} {} {} {} \u{00B7} {} {})",
                         format_duration(sum),
+                        s.st_sum_of,
                         format_duration(sp),
+                        s.server_processing,
                         format_duration(sp - sum),
+                        s.st_unaccounted,
                     ),
                     Some(sp) => format!(
-                        "(\u{03A3} {} of {} Server Processing)",
+                        "(\u{03A3} {} {} {} {})",
                         format_duration(sum),
+                        s.st_sum_of,
                         format_duration(sp),
+                        s.server_processing,
                     ),
                     None => format!("(\u{03A3} {})", format_duration(sum)),
                 };
                 writeln!(
                     f,
                     "{} {}",
-                    LightGreen.paint("Server-Timing:"),
+                    LightGreen.paint(s.server_timing_heading),
                     LightCyan.paint(&summary),
                 )?;
 
@@ -1161,54 +1203,54 @@ impl fmt::Display for HttpStat {
             // can see whether the cost was the TLS handshake or the query.
             if let Some(connect) = self.dns_connect {
                 timelines.push(Timeline {
-                    name: "DNS Connect".to_string(),
+                    name: s.dns_connect.to_string(),
                     duration: connect,
                 });
                 if let Some(query) = self.dns_query() {
                     timelines.push(Timeline {
-                        name: "DNS Query".to_string(),
+                        name: s.dns_query.to_string(),
                         duration: query,
                     });
                 }
             } else if let Some(value) = self.dns_lookup {
                 timelines.push(Timeline {
-                    name: "DNS Lookup".to_string(),
+                    name: s.dns_lookup.to_string(),
                     duration: value,
                 });
             }
             if let Some(value) = self.tcp_connect {
                 timelines.push(Timeline {
-                    name: "TCP Connect".to_string(),
+                    name: s.tcp_connect.to_string(),
                     duration: value,
                 });
             }
             if let Some(value) = self.tls_handshake {
                 timelines.push(Timeline {
-                    name: "TLS Handshake".to_string(),
+                    name: s.tls_handshake.to_string(),
                     duration: value,
                 });
             }
             if let Some(value) = self.quic_connect {
                 timelines.push(Timeline {
-                    name: "QUIC Connect".to_string(),
+                    name: s.quic_connect.to_string(),
                     duration: value,
                 });
             }
             if let Some(value) = self.request_send {
                 timelines.push(Timeline {
-                    name: "Request Send".to_string(),
+                    name: s.request_send.to_string(),
                     duration: value,
                 });
             }
             if let Some(value) = self.server_processing {
                 timelines.push(Timeline {
-                    name: "Server Processing".to_string(),
+                    name: s.server_processing.to_string(),
                     duration: value,
                 });
             }
             if let Some(value) = self.content_transfer {
                 timelines.push(Timeline {
-                    name: "Content Transfer".to_string(),
+                    name: s.content_transfer.to_string(),
                     duration: value,
                 });
             }
@@ -1254,7 +1296,8 @@ impl fmt::Display for HttpStat {
             write!(f, "{}", " ".repeat(width * timelines.len()))?;
             write!(
                 f,
-                "Total:{}\n\n",
+                "{}:{}\n\n",
+                s.total,
                 LightCyan.paint(format_duration(self.total.unwrap_or_default()))
             )?;
         }
@@ -1277,7 +1320,8 @@ impl fmt::Display for HttpStat {
             }
             if self.verbose || self.jq_filter.is_some() || (is_text && body.len() < 4096) {
                 let text = format!(
-                    "Body size: {}",
+                    "{}: {}",
+                    s.body_size,
                     ByteSize(self.body_size.unwrap_or(0) as u64)
                 );
                 writeln!(f, "{}", LightCyan.paint(text))?;
@@ -1292,12 +1336,13 @@ impl fmt::Display for HttpStat {
                 let mut save_tips = "".to_string();
                 if let Ok(mut file) = NamedTempFile::new() {
                     if let Ok(()) = file.write_all(body.as_bytes()) {
-                        save_tips = format!("saved to: {}", file.path().display());
+                        save_tips = format!("{}: {}", s.saved_to, file.path().display());
                         let _ = file.keep();
                     }
                 }
                 let text = format!(
-                    "Body discarded {}",
+                    "{} {}",
+                    s.body_discarded,
                     ByteSize(self.body_size.unwrap_or(0) as u64)
                 );
                 writeln!(f, "{} {}", LightCyan.paint(text), save_tips)?;
@@ -1324,10 +1369,11 @@ impl HttpStat {
         let Some(total) = self.throughput_bps() else {
             return Ok(());
         };
+        let s = self.lang.strings();
         writeln!(
             f,
             "{} {}",
-            LightCyan.paint("Throughput:"),
+            LightCyan.paint(s.throughput),
             LightCyan.paint(format_throughput(total)),
         )?;
         if self.verbose {
@@ -1338,10 +1384,10 @@ impl HttpStat {
                 writeln!(
                     f,
                     "  {} {}  {}  {} {}",
-                    LightCyan.paint("first 100KB:"),
+                    LightCyan.paint(s.throughput_first_100k),
                     LightCyan.paint(format_throughput(first)),
                     LightCyan.paint("·"),
-                    LightCyan.paint("then:"),
+                    LightCyan.paint(s.throughput_then),
                     LightCyan.paint(format_throughput(tail)),
                 )?;
             }
@@ -1352,6 +1398,7 @@ impl HttpStat {
 
 pub struct BenchmarkSummary {
     pub stats: Vec<HttpStat>,
+    pub lang: Lang,
 }
 
 impl BenchmarkSummary {
@@ -1377,30 +1424,34 @@ impl fmt::Display for BenchmarkSummary {
             return Ok(());
         }
 
+        let strs = self.lang.strings();
         // When any run used DoH/DoT, render DNS as two columns; otherwise keep
         // the single DNS Lookup column for the existing plain-UDP path.
         let has_dns_connect = self.stats.iter().any(|s| s.dns_connect.is_some());
         let dns_cols: Vec<(&str, Vec<Duration>)> = if has_dns_connect {
             vec![
-                ("DNS Connect", self.collect_sorted(|s| s.dns_connect)),
-                ("DNS Query", self.collect_sorted(|s| s.dns_query())),
+                (strs.dns_connect, self.collect_sorted(|s| s.dns_connect)),
+                (strs.dns_query, self.collect_sorted(|s| s.dns_query())),
             ]
         } else {
-            vec![("DNS Lookup", self.collect_sorted(|s| s.dns_lookup))]
+            vec![(strs.dns_lookup, self.collect_sorted(|s| s.dns_lookup))]
         };
         let phases: Vec<(&str, Vec<Duration>)> = dns_cols
             .into_iter()
             .chain([
-                ("TCP Connect", self.collect_sorted(|s| s.tcp_connect)),
-                ("TLS Handshake", self.collect_sorted(|s| s.tls_handshake)),
-                ("QUIC Connect", self.collect_sorted(|s| s.quic_connect)),
-                ("Request Send", self.collect_sorted(|s| s.request_send)),
+                (strs.tcp_connect, self.collect_sorted(|s| s.tcp_connect)),
+                (strs.tls_handshake, self.collect_sorted(|s| s.tls_handshake)),
+                (strs.quic_connect, self.collect_sorted(|s| s.quic_connect)),
+                (strs.request_send, self.collect_sorted(|s| s.request_send)),
                 (
-                    "Server Process",
+                    strs.server_processing_short,
                     self.collect_sorted(|s| s.server_processing),
                 ),
-                ("Content Xfer", self.collect_sorted(|s| s.content_transfer)),
-                ("Total", self.collect_sorted(|s| s.total)),
+                (
+                    strs.content_transfer_short,
+                    self.collect_sorted(|s| s.content_transfer),
+                ),
+                (strs.total, self.collect_sorted(|s| s.total)),
             ])
             .filter(|(_, v)| !v.is_empty())
             .collect();
@@ -1413,7 +1464,10 @@ impl fmt::Display for BenchmarkSummary {
         writeln!(
             f,
             "{}",
-            LightGreen.paint(format!("--- Benchmark Results ({total} requests) ---"))
+            LightGreen.paint(format!(
+                "{} ({total} {}) ---",
+                strs.benchmark_results_prefix, strs.benchmark_results_requests,
+            ))
         )?;
         writeln!(f)?;
 
@@ -1427,11 +1481,12 @@ impl fmt::Display for BenchmarkSummary {
         }
         writeln!(f)?;
 
-        // Stats rows
+        // Stats rows — p50/p95/p99 are standard percentile notation, kept
+        // as-is across locales. Only min/max/avg get translated.
         let rows: [(&str, f64); 6] = [
-            ("min", 0.0),
-            ("max", f64::INFINITY),
-            ("avg", f64::NAN),
+            (strs.min, 0.0),
+            (strs.max, f64::INFINITY),
+            (strs.avg, f64::NAN),
             ("p50", 0.5),
             ("p95", 0.95),
             ("p99", 0.99),
@@ -1471,7 +1526,7 @@ impl fmt::Display for BenchmarkSummary {
         writeln!(f)?;
         let success = self.stats.iter().filter(|s| s.is_success()).count();
         let pct = (success as f64 / total as f64) * 100.0;
-        let success_text = format!("Success: {success}/{total} ({pct:.1}%)");
+        let success_text = format!("{}: {success}/{total} ({pct:.1}%)", strs.success);
         if success == total {
             writeln!(f, "  {}", LightGreen.paint(success_text))?;
         } else {

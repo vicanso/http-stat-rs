@@ -20,7 +20,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::StatusCode;
 use http::Uri;
 use http_stat::{
-    connect, format_duration, request, BenchmarkSummary, ConnectTo, HttpRequest, HttpStat,
+    connect, format_duration, request, BenchmarkSummary, ConnectTo, HttpRequest, HttpStat, Lang,
     ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3,
 };
 use std::net::IpAddr;
@@ -139,6 +139,12 @@ struct Args {
         help = "show kernel TCP_INFO stats (RTT, cwnd, retransmits); Linux + macOS"
     )]
     tcp_info: bool,
+
+    /// Display language. Accepts `en` / `zh` (case-insensitive). When
+    /// omitted, falls back to LC_ALL / LC_MESSAGES / LANG, then English.
+    /// JSON output always uses English keys.
+    #[arg(long = "lang", help = "display language: en | zh (default: system)")]
+    lang: Option<String>,
 
     /// Timeout
     #[arg(long = "timeout", help = "timeout")]
@@ -465,6 +471,13 @@ async fn main() {
     let config = load_config();
     apply_config(&mut args, &config);
 
+    // Resolve the effective display language once. Explicit --lang wins;
+    // otherwise we sniff LC_ALL / LC_MESSAGES / LANG and fall back to English.
+    let lang = match args.lang.as_deref() {
+        Some(v) => Lang::parse_arg(v),
+        None => Lang::detect(),
+    };
+
     let Some(url) = args.url.or(args.url_arg) else {
         println!("httpstat: try 'httpstat -h' or 'httpstat --help' for more information");
         std::process::exit(1);
@@ -718,6 +731,7 @@ async fn main() {
                 stat.pretty = args.pretty;
                 stat.waterfall = args.waterfall;
                 stat.show_tcp_info = args.tcp_info;
+                stat.lang = lang;
                 stat.jq_filter.clone_from(&args.jq);
                 stat.include_headers.clone_from(&include_headers);
                 stat.exclude_headers.clone_from(&exclude_headers);
@@ -743,6 +757,7 @@ async fn main() {
                 stat.addr.clone_from(&connect_stat.addr);
                 stat.alpn.clone_from(&connect_stat.alpn);
                 stat.silent = true;
+                stat.lang = lang;
                 if !json_output {
                     print!("[{:>width$}/{count}] {stat}", i + 1);
                 }
@@ -759,7 +774,7 @@ async fn main() {
                     serde_json::to_string_pretty(&json_val).unwrap_or_default()
                 );
             } else {
-                let summary = BenchmarkSummary { stats };
+                let summary = BenchmarkSummary { stats, lang };
                 println!("{summary}");
                 // Show cold connect cost
                 let mut parts = vec![];
@@ -773,7 +788,8 @@ async fn main() {
                     parts.push(format!("TLS {}", format_duration(d)));
                 }
                 println!(
-                    "  Cold connect: {} ({})",
+                    "  {}: {} ({})",
+                    lang.strings().cold_connect,
                     format_duration(connect_stat.total.unwrap_or_default()),
                     parts.join(" + ")
                 );
@@ -802,6 +818,7 @@ async fn main() {
             req.tls_session_store = Some(Arc::clone(&session_store));
             let mut stat = do_request(req, args.follow_redirect).await;
             stat.silent = true;
+            stat.lang = lang;
             if !json_output {
                 print!("[{:>width$}/{count}] {stat}", i + 1);
             }
@@ -818,7 +835,7 @@ async fn main() {
                 serde_json::to_string_pretty(&json_val).unwrap_or_default()
             );
         } else {
-            let summary = BenchmarkSummary { stats };
+            let summary = BenchmarkSummary { stats, lang };
             println!("{summary}");
         }
     } else {
@@ -834,6 +851,7 @@ async fn main() {
             stat.pretty = args.pretty;
             stat.waterfall = args.waterfall;
             stat.show_tcp_info = args.tcp_info;
+            stat.lang = lang;
             stat.jq_filter = args.jq;
             stat.include_headers = include_headers;
             stat.exclude_headers = exclude_headers;
