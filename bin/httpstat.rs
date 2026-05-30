@@ -132,6 +132,14 @@ struct Args {
     #[arg(long = "waterfall", help = "show timing as a waterfall bar chart")]
     waterfall: bool,
 
+    /// Show kernel TCP statistics (RTT, MSS, cwnd, retransmits-during-request)
+    /// without needing the full --verbose dump. Linux + macOS only.
+    #[arg(
+        long = "tcp-info",
+        help = "show kernel TCP_INFO stats (RTT, cwnd, retransmits); Linux + macOS"
+    )]
+    tcp_info: bool,
+
     /// Timeout
     #[arg(long = "timeout", help = "timeout")]
     timeout: Option<String>,
@@ -709,6 +717,7 @@ async fn main() {
                 stat.silent = args.silent;
                 stat.pretty = args.pretty;
                 stat.waterfall = args.waterfall;
+                stat.show_tcp_info = args.tcp_info;
                 stat.jq_filter.clone_from(&args.jq);
                 stat.include_headers.clone_from(&include_headers);
                 stat.exclude_headers.clone_from(&exclude_headers);
@@ -824,6 +833,7 @@ async fn main() {
             stat.silent = args.silent;
             stat.pretty = args.pretty;
             stat.waterfall = args.waterfall;
+            stat.show_tcp_info = args.tcp_info;
             stat.jq_filter = args.jq;
             stat.include_headers = include_headers;
             stat.exclude_headers = exclude_headers;

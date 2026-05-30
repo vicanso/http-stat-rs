@@ -19,6 +19,7 @@ use super::error::{Error, Result};
 use super::http_request::ConnectTo;
 use super::skip_verifier::CapturingVerifier;
 use super::stats::{format_time, Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
+use super::tcp_info::TcpInfoProbe;
 use super::HttpRequest;
 use super::SkipVerifier;
 use hickory_resolver::config::{
@@ -378,12 +379,18 @@ pub(crate) async fn dns_resolve(
 }
 
 // Establish TCP connection
+//
+// Returns the live `TcpStream` plus an optional [`TcpInfoProbe`] holding a
+// `dup(2)`'d FD pointing at the same kernel socket. The probe lets a later
+// caller (after the response body has been read) take a second TCP_INFO
+// sample, so we can compute retransmits-during-transfer even after hyper
+// has taken ownership of the original stream.
 pub(crate) async fn tcp_connect(
     addr: SocketAddr,
     tcp_timeout: Option<Duration>,
     bind_addr: Option<IpAddr>,
     stat: &mut HttpStat,
-) -> Result<TcpStream> {
+) -> Result<(TcpStream, Option<TcpInfoProbe>)> {
     let tcp_start = Instant::now();
     let connect_fut = async {
         if let Some(src_ip) = bind_addr {
@@ -409,7 +416,10 @@ pub(crate) async fn tcp_connect(
         .await
         .map_err(|e| Error::Timeout { source: e })??;
     stat.tcp_connect = Some(tcp_start.elapsed());
-    Ok(tcp_stream)
+    // Baseline kernel TCP stats + a dup'd FD for the post-transfer sample.
+    let (baseline, probe) = TcpInfoProbe::capture(&tcp_stream);
+    stat.tcp_info_post_connect = baseline;
+    Ok((tcp_stream, probe))
 }
 
 // Perform TLS handshake

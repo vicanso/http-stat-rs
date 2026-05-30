@@ -52,7 +52,10 @@ impl Service<Uri> for CustomHttpConnector {
         let fut = async move {
             let mut stat = stat.lock().await;
             let (addr, _host) = dns_resolve(&http_req, &mut stat).await?;
-            let tcp_stream =
+            // gRPC uses tonic's high-level client; we can't reliably sample
+            // post-transfer TCP_INFO, so drop the probe. The post-connect
+            // baseline is already populated by tcp_connect.
+            let (tcp_stream, _tcp_probe) =
                 tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, &mut stat).await?;
             Ok(TokioIo::new(tcp_stream))
         };

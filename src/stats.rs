@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::tcp_info::{TcpInfo, TcpInfoDelta};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::{Local, TimeZone};
@@ -96,6 +97,15 @@ pub struct HttpStat {
     pub dns_connect: Option<Duration>,
     pub quic_connect: Option<Duration>,
     pub tcp_connect: Option<Duration>,
+    /// Kernel TCP statistics sampled right after `connect(2)`. Provides the
+    /// baseline RTT, MSS and initial cwnd before any application data flows.
+    /// Linux + macOS only — None on other platforms.
+    pub tcp_info_post_connect: Option<TcpInfo>,
+    /// Kernel TCP statistics sampled after the response body has been fully
+    /// received. The diff against `tcp_info_post_connect` reveals retransmits
+    /// during the request — the diagnostic answer to "was Content Transfer
+    /// slow because of packet loss or just slow start?".
+    pub tcp_info_final: Option<TcpInfo>,
     pub tls_handshake: Option<Duration>,
     pub request_send: Option<Duration>,
     pub server_processing: Option<Duration>,
@@ -128,6 +138,9 @@ pub struct HttpStat {
     pub exclude_headers: Option<Vec<String>>,
     pub waterfall: bool,
     pub jq_filter: Option<String>,
+    /// When true, render the Kernel TCP block even without `--verbose`.
+    /// Driven by the CLI `--tcp-info` flag.
+    pub show_tcp_info: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +528,50 @@ impl HttpStat {
         timing.insert("total_us".into(), dur_us(self.total));
         obj.insert("timing".into(), Value::Object(timing));
 
+        // Kernel TCP statistics (Linux + macOS): both samples plus a derived
+        // delta highlighting what changed during the request.
+        let tcp_info_json = |info: Option<&TcpInfo>| -> Value {
+            let Some(info) = info else { return Value::Null };
+            let mut m = Map::new();
+            m.insert("rtt_us".into(), dur_us(info.rtt));
+            m.insert("rttvar_us".into(), dur_us(info.rttvar));
+            m.insert(
+                "retransmits".into(),
+                info.retransmits.map_or(Value::Null, |v| json!(v)),
+            );
+            m.insert("cwnd".into(), info.cwnd.map_or(Value::Null, |v| json!(v)));
+            m.insert(
+                "snd_mss".into(),
+                info.snd_mss.map_or(Value::Null, |v| json!(v)),
+            );
+            Value::Object(m)
+        };
+        if self.tcp_info_post_connect.is_some() || self.tcp_info_final.is_some() {
+            let mut block = Map::new();
+            block.insert(
+                "post_connect".into(),
+                tcp_info_json(self.tcp_info_post_connect.as_ref()),
+            );
+            block.insert("final".into(), tcp_info_json(self.tcp_info_final.as_ref()));
+            if let Some(delta) = TcpInfoDelta::compute(
+                self.tcp_info_post_connect.as_ref(),
+                self.tcp_info_final.as_ref(),
+            ) {
+                let mut d = Map::new();
+                d.insert(
+                    "retransmits_during".into(),
+                    delta.retransmits_during.map_or(Value::Null, |v| json!(v)),
+                );
+                d.insert("rtt_final_us".into(), dur_us(delta.rtt_final));
+                d.insert(
+                    "cwnd_final".into(),
+                    delta.cwnd_final.map_or(Value::Null, |v| json!(v)),
+                );
+                block.insert("delta".into(), Value::Object(d));
+            }
+            obj.insert("tcp_info".into(), Value::Object(block));
+        }
+
         // Server-Timing entries (RFC 8673)
         if let Some(entries) = &self.server_timing {
             let arr: Vec<Value> = entries
@@ -783,6 +840,60 @@ impl fmt::Display for HttpStat {
                     }
                 }
             }
+        }
+
+        // Kernel TCP stats — shown under `-v` or whenever `--tcp-info` is set
+        // via `self.show_tcp_info`. The "during" retransmit count is the
+        // diagnostic gold: it isolates packet loss to *this* request's window
+        // rather than the connection's lifetime.
+        if (self.verbose || self.show_tcp_info)
+            && (self.tcp_info_post_connect.is_some() || self.tcp_info_final.is_some())
+        {
+            writeln!(f, "{}", LightGreen.paint("Kernel TCP:"))?;
+            let render = |label: &str, info: &TcpInfo| -> String {
+                let rtt = info.rtt.map(format_duration).unwrap_or_else(|| "-".into());
+                let rttvar = info
+                    .rttvar
+                    .map(format_duration)
+                    .unwrap_or_else(|| "-".into());
+                let retrans = info
+                    .retransmits
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let cwnd = info
+                    .cwnd
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let mss = info
+                    .snd_mss
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into());
+                format!(
+                    "  {:<14} rtt {} \u{00B1} {}  retrans {}  cwnd {}  mss {}",
+                    label, rtt, rttvar, retrans, cwnd, mss,
+                )
+            };
+            if let Some(info) = &self.tcp_info_post_connect {
+                writeln!(f, "{}", LightCyan.paint(render("post-connect:", info)))?;
+            }
+            if let Some(info) = &self.tcp_info_final {
+                writeln!(f, "{}", LightCyan.paint(render("final:", info)))?;
+            }
+            if let Some(delta) = TcpInfoDelta::compute(
+                self.tcp_info_post_connect.as_ref(),
+                self.tcp_info_final.as_ref(),
+            ) {
+                if let Some(n) = delta.retransmits_during {
+                    let label = format!("  during request: {n} retransmit(s)");
+                    let painted = if n == 0 {
+                        LightCyan.paint(label)
+                    } else {
+                        LightYellow.paint(label)
+                    };
+                    writeln!(f, "{painted}")?;
+                }
+            }
+            writeln!(f)?;
         }
 
         let mut is_text = false;

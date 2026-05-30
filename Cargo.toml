@@ -41,6 +41,7 @@ http-body = "1.0.1"
 http-body-util = "0.1.3"
 humantime = "2.3.0"
 hyper = { version = "1.9.0", features = ["client", "http1", "http2"] }
+libc = "0.2"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 mimalloc = "0.1.48"
 nu-ansi-term = "0.50.3"

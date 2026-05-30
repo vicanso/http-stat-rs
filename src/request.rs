@@ -396,13 +396,23 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
 }
 
 /// Connect to the effective TCP endpoint (direct or via proxy).
-/// Returns `(stream, target_host, is_http_forward_proxy)`.
+/// Returns `(stream, target_host, is_http_forward_proxy, tcp_info_probe)`.
 /// - Direct: uses dns_resolve + tcp_connect, sets stat.dns_lookup / stat.addr / stat.tcp_connect.
 /// - Proxy:  connects to proxy (system DNS), sets stat.addr / stat.tcp_connect.
+///
+/// `tcp_info_probe` is a `dup(2)`'d FD pointing at the socket we'll actually
+/// use for HTTP traffic. Through a proxy the probe reflects the
+/// client-to-proxy socket, not the origin — `getsockopt(TCP_INFO)` can't see
+/// past the proxy.
 async fn tcp_via_proxy(
     http_req: &HttpRequest,
     stat: &mut HttpStat,
-) -> Result<(TcpStream, String, bool)> {
+) -> Result<(
+    TcpStream,
+    String,
+    bool,
+    Option<crate::tcp_info::TcpInfoProbe>,
+)> {
     let uri = &http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
     let target_host = uri.host().unwrap_or_default().to_string();
@@ -423,6 +433,11 @@ async fn tcp_via_proxy(
             stat.addr = Some(peer.to_string());
         }
 
+        // Sample baseline TCP_INFO on the proxy connection (what we'll
+        // actually carry traffic over) before any SOCKS5/HTTP CONNECT bytes.
+        let (baseline, probe) = crate::tcp_info::TcpInfoProbe::capture(&proxy_stream);
+        stat.tcp_info_post_connect = baseline;
+
         // HTTP proxy + plain HTTP target: forward mode, no tunnel
         let is_http_forward = !is_https && matches!(proxy.kind, ProxyKind::Http);
         let stream = if is_http_forward {
@@ -436,11 +451,12 @@ async fn tcp_via_proxy(
             }
         };
         stat.tcp_connect = Some(tcp_start.elapsed());
-        Ok((stream, target_host, is_http_forward))
+        Ok((stream, target_host, is_http_forward, probe))
     } else {
         let (addr, host) = dns_resolve(http_req, stat).await?;
-        let stream = tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, stat).await?;
-        Ok((stream, host, false))
+        let (stream, probe) =
+            tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, stat).await?;
+        Ok((stream, host, false, probe))
     }
 }
 
@@ -451,10 +467,11 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
     // Establish TCP (direct or via proxy)
-    let (tcp_stream, host, is_http_forward) = match tcp_via_proxy(&http_req, &mut stat).await {
-        Ok(r) => r,
-        Err(e) => return finish_with_error(stat, e, start),
-    };
+    let (tcp_stream, host, is_http_forward, tcp_probe) =
+        match tcp_via_proxy(&http_req, &mut stat).await {
+            Ok(r) => r,
+            Err(e) => return finish_with_error(stat, e, start),
+        };
 
     // HTTP forward proxy: request must use the full absolute URI
     if is_http_forward {
@@ -572,6 +589,13 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     stat.body = Some(body_bytes);
     stat.content_transfer = Some(content_transfer_start.elapsed());
 
+    // Second kernel TCP sample: retransmits accumulated during the body read,
+    // final RTT/cwnd. dup'd FD is dropped here (closes only the duplicate;
+    // the real socket lives on inside hyper).
+    if let Some(probe) = &tcp_probe {
+        stat.tcp_info_final = probe.sample();
+    }
+
     stat.total = Some(start.elapsed());
     stat
 }
@@ -665,12 +689,21 @@ enum ConnectionSender {
 pub struct HttpConnection {
     sender: ConnectionSender,
     is_http2: bool,
+    /// dup'd FD so we can sample TCP_INFO after each `send()` even though
+    /// the original socket has been moved into hyper. None on non-Unix or
+    /// when `dup(2)` failed.
+    tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
+    /// Most recent TCP_INFO snapshot. Used as the "post-connect" baseline
+    /// for the next `send()`'s delta calculation, so each iteration's
+    /// `retransmits_during` reflects only that iteration's window.
+    last_tcp_info: Option<crate::TcpInfo>,
 }
 
 async fn establish_http1<S>(
     stream: S,
     handshake_timeout: Duration,
     mut stat: HttpStat,
+    tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
     start: Instant,
 ) -> (HttpStat, Option<HttpConnection>)
 where
@@ -687,11 +720,14 @@ where
                 let _ = conn.await;
             });
             stat.total = Some(start.elapsed());
+            let last_tcp_info = stat.tcp_info_post_connect.clone();
             (
                 stat,
                 Some(HttpConnection {
                     sender: ConnectionSender::Http1(sender),
                     is_http2: false,
+                    tcp_probe,
+                    last_tcp_info,
                 }),
             )
         }
@@ -710,6 +746,7 @@ async fn establish_http2<S>(
     stream: S,
     handshake_timeout: Duration,
     mut stat: HttpStat,
+    tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
     start: Instant,
 ) -> (HttpStat, Option<HttpConnection>)
 where
@@ -726,11 +763,14 @@ where
                 let _ = conn.await;
             });
             stat.total = Some(start.elapsed());
+            let last_tcp_info = stat.tcp_info_post_connect.clone();
             (
                 stat,
                 Some(HttpConnection {
                     sender: ConnectionSender::Http2(sender),
                     is_http2: true,
+                    tcp_probe,
+                    last_tcp_info,
                 }),
             )
         }
@@ -756,10 +796,11 @@ pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection
 
     let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
-    let (tcp_stream, host, _is_http_forward) = match tcp_via_proxy(http_req, &mut stat).await {
-        Ok(r) => r,
-        Err(e) => return (finish_with_error(stat, e, start), None),
-    };
+    let (tcp_stream, host, _is_http_forward, tcp_probe) =
+        match tcp_via_proxy(http_req, &mut stat).await {
+            Ok(r) => r,
+            Err(e) => return (finish_with_error(stat, e, start), None),
+        };
 
     let handshake_timeout = http_req.request_timeout.unwrap_or(Duration::from_secs(30));
 
@@ -770,12 +811,12 @@ pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection
         };
 
         if is_h2 {
-            establish_http2(tls_stream, handshake_timeout, stat, start).await
+            establish_http2(tls_stream, handshake_timeout, stat, tcp_probe, start).await
         } else {
-            establish_http1(tls_stream, handshake_timeout, stat, start).await
+            establish_http1(tls_stream, handshake_timeout, stat, tcp_probe, start).await
         }
     } else {
-        establish_http1(tcp_stream, handshake_timeout, stat, start).await
+        establish_http1(tcp_stream, handshake_timeout, stat, tcp_probe, start).await
     }
 }
 
@@ -783,7 +824,14 @@ impl HttpConnection {
     /// Send a request on the existing connection, returning only request-phase timing.
     pub async fn send(&mut self, http_req: &HttpRequest) -> HttpStat {
         let start = Instant::now();
-        let mut stat = HttpStat::default();
+        // Seed the per-iteration TCP_INFO baseline from the previous send's
+        // final sample (or the connection's post-connect snapshot for the
+        // first iteration). This way each iteration's retransmits_during
+        // counts only retransmits in *this* iteration's window.
+        let mut stat = HttpStat {
+            tcp_info_post_connect: self.last_tcp_info.clone(),
+            ..HttpStat::default()
+        };
 
         let is_http1 = !self.is_http2;
         let (req, done) = match build_tracked_request(http_req, is_http1) {
@@ -841,6 +889,17 @@ impl HttpConnection {
                     format!("Failed to read response body: {e}"),
                     start,
                 );
+            }
+        }
+
+        // End-of-iteration kernel TCP snapshot. Cache it as the baseline for
+        // the next send() so successive iterations don't double-count
+        // retransmits.
+        if let Some(probe) = &self.tcp_probe {
+            let now = probe.sample();
+            stat.tcp_info_final = now.clone();
+            if now.is_some() {
+                self.last_tcp_info = now;
             }
         }
 

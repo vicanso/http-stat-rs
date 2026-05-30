@@ -794,6 +794,7 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
+ "libc",
  "mimalloc",
  "nu-ansi-term",
  "quinn",
