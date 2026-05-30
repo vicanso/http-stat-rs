@@ -7,7 +7,7 @@ on:
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: 1.94.1
+  RUST_TOOLCHAIN: 1.95.0
 
 jobs:
   macos:
@@ -28,7 +28,7 @@ jobs:
           mv target/aarch64-apple-darwin/release/httpstat ./httpstat
           tar -czvf httpstat-darwin-arm64.tar.gz httpstat
 
-        
+
           cargo build --release --target=x86_64-apple-darwin
           mv target/x86_64-apple-darwin/release/httpstat ./httpstat
           tar -czvf httpstat-darwin-x86_64.tar.gz httpstat
@@ -81,7 +81,6 @@ jobs:
 
           ./.github/workflows/upload_asset.sh ./httpstat-linux-musl-aarch64.tar.gz $GITHUB_TOKEN
 
-
   windows:
     runs-on: windows-latest
     name: ${{ matrix.target }}
@@ -128,7 +127,7 @@ jobs:
         shell: bash
         run: |
           cargo --version
-          cargo build --release 
+          cargo build --release
           mv target/release/httpstat.exe ./httpstat.exe
       - name: Zip
         shell: powershell
