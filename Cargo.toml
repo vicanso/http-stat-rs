@@ -1,6 +1,6 @@
 [package]
 name = "http-stat"
-version = "0.6.1"
+version = "0.6.2"
 authors = ["Tree Xie <tree.xie@outlook.com>"]
 edition = "2021"
 categories = ["web-programming"]
@@ -50,7 +50,7 @@ quinn = { version = "0.11.9", default-features = false, features = [
     "rustls",
     "ring",
 ] }
-rustls = "0.23.36"
+rustls = { version = "0.23.36", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1.14.0"
 serde_json = "1.0.149"
@@ -76,6 +76,9 @@ opt-level = "z"
 lto = true
 strip = true
 panic = "abort"
+debug = false
+overflow-checks = false
+incremental = false
 
 [profile.release.package.brotli-decompressor]
 opt-level = 3
