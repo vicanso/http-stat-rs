@@ -16,6 +16,7 @@
 - **多 IP 并发测试** — `--resolve` 同时测试多个 IP，结果按成功/失败排序
 - **透明解压** — `--compressed` 自动解码 `gzip`、`br`、`zstd` 响应
 - **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`；DoH/DoT 预设：`google-doh`、`cloudflare-doh`、`quad9-doh`、`google-dot`、`cloudflare-dot`、`quad9-dot`
+- **DoH/DoT 阶段拆分** — 使用 DoH 或 DoT 时，DNS 一列会拆成 `DNS Connect`（到解析服务器的 TCP+TLS 握手）与 `DNS Query`，让你看出"DoH 慢"是慢在连 DNS 服务器还是慢在查询本身
 - **JSON 输出** — `--json` 方便脚本集成、CI/CD 流水线和监控系统对接
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
 - **TLS 握手诊断** — 每次 HTTPS 请求都会报告握手类型（`Full` / `Resumed`）、服务器是否进行 OCSP stapling，以及在 `-n` 基准测试模式下后续请求是否接受了 0-RTT 早期数据

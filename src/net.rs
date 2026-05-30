@@ -41,6 +41,52 @@ use tokio_rustls::rustls::client::{Resumption, WebPkiServerVerifier};
 use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore};
 use tokio_rustls::TlsConnector;
 
+/// Transport used by a DoH/DoT preset, captured so we can run a parallel
+/// cold-connect probe and split `dns_lookup` into `dns_connect` + `dns_query`.
+#[derive(Debug, Clone, Copy)]
+enum DnsTransport {
+    Doh,
+    Dot,
+}
+
+#[derive(Debug, Clone)]
+struct DnsProbeEndpoint {
+    transport: DnsTransport,
+    ip: IpAddr,
+    port: u16,
+    sni: String,
+}
+
+/// Measure the cold TCP + TLS handshake cost to a DoH/DoT server. Returns
+/// `None` on any failure — the main resolver call is the source of truth and
+/// will surface real errors via `dns_lookup`. Designed to run in parallel
+/// with the resolver via `tokio::join!`, so it doesn't inflate wall-clock
+/// (the resolver's connect+query path dominates).
+async fn probe_dns_endpoint(ep: &DnsProbeEndpoint, max: Duration) -> Option<Duration> {
+    let work = async move {
+        let start = Instant::now();
+        let addr: SocketAddr = (ep.ip, ep.port).into();
+        let tcp = TcpStream::connect(addr).await.ok()?;
+
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = match ep.transport {
+            DnsTransport::Doh => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            DnsTransport::Dot => vec![b"dot".to_vec()],
+        };
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = ep.sni.clone().try_into().ok()?;
+        let _tls = connector.connect(server_name, tcp).await.ok()?;
+        Some(start.elapsed())
+    };
+    timeout(max, work).await.ok().flatten()
+}
+
 // Format TLS protocol version for display
 fn format_tls_protocol(protocol: &str) -> String {
     match protocol {
@@ -138,6 +184,9 @@ pub(crate) async fn dns_resolve(
     // Configure DNS resolver
     let provider = TokioConnectionProvider::default();
     let mut server_group: Option<NameServerConfigGroup> = None;
+    // When a DoH/DoT preset matches, remember its endpoint so we can probe
+    // the cold connect cost in parallel with the actual resolver call.
+    let mut probe_endpoint: Option<DnsProbeEndpoint> = None;
     if let Some(dns_servers) = &req.dns_servers {
         let mut plain_ips: Vec<IpAddr> = vec![];
         for server in dns_servers {
@@ -171,6 +220,12 @@ pub(crate) async fn dns_resolve(
                         "dns.google".to_string(),
                         true,
                     ));
+                    probe_endpoint = Some(DnsProbeEndpoint {
+                        transport: DnsTransport::Doh,
+                        ip: IpAddr::from([8, 8, 8, 8]),
+                        port: 443,
+                        sni: "dns.google".to_string(),
+                    });
                     plain_ips.clear();
                     break;
                 }
@@ -181,6 +236,12 @@ pub(crate) async fn dns_resolve(
                         "cloudflare-dns.com".to_string(),
                         true,
                     ));
+                    probe_endpoint = Some(DnsProbeEndpoint {
+                        transport: DnsTransport::Doh,
+                        ip: IpAddr::from([1, 1, 1, 1]),
+                        port: 443,
+                        sni: "cloudflare-dns.com".to_string(),
+                    });
                     plain_ips.clear();
                     break;
                 }
@@ -194,6 +255,12 @@ pub(crate) async fn dns_resolve(
                         "dns.quad9.net".to_string(),
                         true,
                     ));
+                    probe_endpoint = Some(DnsProbeEndpoint {
+                        transport: DnsTransport::Doh,
+                        ip: IpAddr::from([9, 9, 9, 9]),
+                        port: 443,
+                        sni: "dns.quad9.net".to_string(),
+                    });
                     plain_ips.clear();
                     break;
                 }
@@ -205,6 +272,12 @@ pub(crate) async fn dns_resolve(
                         "dns.google".to_string(),
                         true,
                     ));
+                    probe_endpoint = Some(DnsProbeEndpoint {
+                        transport: DnsTransport::Dot,
+                        ip: IpAddr::from([8, 8, 8, 8]),
+                        port: 853,
+                        sni: "dns.google".to_string(),
+                    });
                     plain_ips.clear();
                     break;
                 }
@@ -215,6 +288,12 @@ pub(crate) async fn dns_resolve(
                         "cloudflare-dns.com".to_string(),
                         true,
                     ));
+                    probe_endpoint = Some(DnsProbeEndpoint {
+                        transport: DnsTransport::Dot,
+                        ip: IpAddr::from([1, 1, 1, 1]),
+                        port: 853,
+                        sni: "cloudflare-dns.com".to_string(),
+                    });
                     plain_ips.clear();
                     break;
                 }
@@ -228,6 +307,12 @@ pub(crate) async fn dns_resolve(
                         "dns.quad9.net".to_string(),
                         true,
                     ));
+                    probe_endpoint = Some(DnsProbeEndpoint {
+                        transport: DnsTransport::Dot,
+                        ip: IpAddr::from([9, 9, 9, 9]),
+                        port: 853,
+                        sni: "dns.quad9.net".to_string(),
+                    });
                     plain_ips.clear();
                     break;
                 }
@@ -261,17 +346,27 @@ pub(crate) async fn dns_resolve(
         }
     }
 
-    // Perform DNS lookup
+    // Perform DNS lookup. For DoH/DoT, race a connect-only probe in parallel
+    // so we can split the reported `dns_lookup` into `dns_connect` (TCP+TLS to
+    // the DNS server) and a derived `dns_query`. The probe is fire-and-forget
+    // accurate — failures leave `dns_connect` as None and never block the
+    // real resolver result.
     let resolver = builder.build();
+    let dns_timeout = req.dns_timeout.unwrap_or(Duration::from_secs(5));
     let dns_start = Instant::now();
-    let addr = timeout(
-        req.dns_timeout.unwrap_or(Duration::from_secs(5)),
-        resolver.lookup_ip(&lookup_host),
-    )
-    .await
-    .map_err(|e| Error::Timeout { source: e })?
-    .map_err(|e| Error::Resolve { source: e })?;
+    let lookup_fut = timeout(dns_timeout, resolver.lookup_ip(&lookup_host));
+    let probe_fut = async {
+        match &probe_endpoint {
+            Some(ep) => probe_dns_endpoint(ep, dns_timeout).await,
+            None => None,
+        }
+    };
+    let (lookup_result, probe_result) = tokio::join!(lookup_fut, probe_fut);
+    let addr = lookup_result
+        .map_err(|e| Error::Timeout { source: e })?
+        .map_err(|e| Error::Resolve { source: e })?;
     stat.dns_lookup = Some(dns_start.elapsed());
+    stat.dns_connect = probe_result;
     let addr = addr.into_iter().next().ok_or(Error::Common {
         category: "http".to_string(),
         message: "dns lookup failed".to_string(),

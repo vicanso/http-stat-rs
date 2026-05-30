@@ -88,6 +88,12 @@ pub struct HttpStat {
     pub is_grpc: bool,
     pub request_headers: HeaderMap<HeaderValue>,
     pub dns_lookup: Option<Duration>,
+    /// Cold connect cost (TCP + TLS) to the DNS server. Only populated when
+    /// using DoH or DoT — for plain UDP DNS this stays None. When present,
+    /// the `dns_lookup` total can be split into `dns_connect` and a derived
+    /// `dns_query = dns_lookup - dns_connect`, making it possible to tell
+    /// whether DoH/DoT latency comes from TLS handshake or query processing.
+    pub dns_connect: Option<Duration>,
     pub quic_connect: Option<Duration>,
     pub tcp_connect: Option<Duration>,
     pub tls_handshake: Option<Duration>,
@@ -376,6 +382,17 @@ impl HttpStat {
         1
     }
 
+    /// Derived "DNS Query" phase: the portion of `dns_lookup` not spent on
+    /// `dns_connect`. Returns `None` when no DoH/DoT probe was performed.
+    /// Clamped to ≥ 0 because the parallel probe can race slightly ahead of
+    /// the real resolver in rare cases.
+    pub fn dns_query(&self) -> Option<Duration> {
+        match (self.dns_lookup, self.dns_connect) {
+            (Some(total), Some(connect)) => Some(total.saturating_sub(connect)),
+            _ => None,
+        }
+    }
+
     pub fn is_success(&self) -> bool {
         if self.error.is_some() {
             return false;
@@ -406,8 +423,18 @@ impl HttpStat {
         const BAR_WIDTH: usize = 50;
         const LABEL_W: usize = 15;
 
-        let phases: &[(&str, Option<Duration>)] = &[
-            ("DNS Lookup", self.dns_lookup),
+        // When a DoH/DoT probe ran, split the DNS column into Connect + Query.
+        let (dns_a, dns_b) = if self.dns_connect.is_some() {
+            (
+                ("DNS Connect", self.dns_connect),
+                ("DNS Query", self.dns_query()),
+            )
+        } else {
+            (("DNS Lookup", self.dns_lookup), ("", None))
+        };
+        let phases_vec: Vec<(&str, Option<Duration>)> = vec![
+            dns_a,
+            dns_b,
             ("TCP Connect", self.tcp_connect),
             ("TLS Handshake", self.tls_handshake),
             ("QUIC Connect", self.quic_connect),
@@ -415,6 +442,7 @@ impl HttpStat {
             ("Server Process", self.server_processing),
             ("Content Xfer", self.content_transfer),
         ];
+        let phases: &[(&str, Option<Duration>)] = &phases_vec;
 
         let total_ns = total.as_nanos() as f64;
         let mut elapsed = Duration::ZERO;
@@ -473,6 +501,8 @@ impl HttpStat {
         // Timing (microseconds)
         let mut timing = Map::new();
         timing.insert("dns_lookup_us".into(), dur_us(self.dns_lookup));
+        timing.insert("dns_connect_us".into(), dur_us(self.dns_connect));
+        timing.insert("dns_query_us".into(), dur_us(self.dns_query()));
         timing.insert("tcp_connect_us".into(), dur_us(self.tcp_connect));
         timing.insert("tls_handshake_us".into(), dur_us(self.tls_handshake));
         timing.insert("quic_connect_us".into(), dur_us(self.quic_connect));
@@ -494,7 +524,8 @@ impl HttpStat {
                     m.insert("name".into(), json!(e.name));
                     m.insert(
                         "duration_us".into(),
-                        e.duration.map_or(Value::Null, |d| json!(d.as_micros() as u64)),
+                        e.duration
+                            .map_or(Value::Null, |d| json!(d.as_micros() as u64)),
                     );
                     m.insert(
                         "description".into(),
@@ -806,9 +837,7 @@ impl fmt::Display for HttpStat {
                 let largest_idx: Option<usize> = entries
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, e)| {
-                        e.duration.filter(|d| !d.is_zero()).map(|d| (i, d))
-                    })
+                    .filter_map(|(i, e)| e.duration.filter(|d| !d.is_zero()).map(|d| (i, d)))
                     .max_by_key(|(_, d)| *d)
                     .map(|(i, _)| i);
 
@@ -838,16 +867,13 @@ impl fmt::Display for HttpStat {
                 let sum_ns_u = sum.as_nanos();
                 let mut cum_ns: u128 = 0;
                 for (i, entry) in entries.iter().enumerate() {
-                    let name_pad =
-                        " ".repeat(name_w.saturating_sub(entry.name.chars().count()));
+                    let name_pad = " ".repeat(name_w.saturating_sub(entry.name.chars().count()));
                     let dur_ns = entry.duration.map(|d| d.as_nanos()).unwrap_or(0);
 
-                    let start_col = ((cum_ns as f64 / total_ns) * BAR_W as f64)
-                        .round() as usize;
+                    let start_col = ((cum_ns as f64 / total_ns) * BAR_W as f64).round() as usize;
                     let start_col = start_col.min(BAR_W);
-                    let mut end_col = (((cum_ns + dur_ns) as f64 / total_ns)
-                        * BAR_W as f64)
-                        .round() as usize;
+                    let mut end_col =
+                        (((cum_ns + dur_ns) as f64 / total_ns) * BAR_W as f64).round() as usize;
                     end_col = end_col.min(BAR_W);
                     // Non-zero entries should always paint at least one cell so they
                     // don't disappear into rounding.
@@ -927,7 +953,20 @@ impl fmt::Display for HttpStat {
             let width = 20;
 
             let mut timelines = vec![];
-            if let Some(value) = self.dns_lookup {
+            // When a DoH/DoT probe ran, render DNS as two columns so the user
+            // can see whether the cost was the TLS handshake or the query.
+            if let Some(connect) = self.dns_connect {
+                timelines.push(Timeline {
+                    name: "DNS Connect".to_string(),
+                    duration: connect,
+                });
+                if let Some(query) = self.dns_query() {
+                    timelines.push(Timeline {
+                        name: "DNS Query".to_string(),
+                        duration: query,
+                    });
+                }
+            } else if let Some(value) = self.dns_lookup {
                 timelines.push(Timeline {
                     name: "DNS Lookup".to_string(),
                     duration: value,
@@ -1090,22 +1129,33 @@ impl fmt::Display for BenchmarkSummary {
             return Ok(());
         }
 
-        let phases: Vec<(&str, Vec<Duration>)> = [
-            ("DNS Lookup", self.collect_sorted(|s| s.dns_lookup)),
-            ("TCP Connect", self.collect_sorted(|s| s.tcp_connect)),
-            ("TLS Handshake", self.collect_sorted(|s| s.tls_handshake)),
-            ("QUIC Connect", self.collect_sorted(|s| s.quic_connect)),
-            ("Request Send", self.collect_sorted(|s| s.request_send)),
-            (
-                "Server Process",
-                self.collect_sorted(|s| s.server_processing),
-            ),
-            ("Content Xfer", self.collect_sorted(|s| s.content_transfer)),
-            ("Total", self.collect_sorted(|s| s.total)),
-        ]
-        .into_iter()
-        .filter(|(_, v)| !v.is_empty())
-        .collect();
+        // When any run used DoH/DoT, render DNS as two columns; otherwise keep
+        // the single DNS Lookup column for the existing plain-UDP path.
+        let has_dns_connect = self.stats.iter().any(|s| s.dns_connect.is_some());
+        let dns_cols: Vec<(&str, Vec<Duration>)> = if has_dns_connect {
+            vec![
+                ("DNS Connect", self.collect_sorted(|s| s.dns_connect)),
+                ("DNS Query", self.collect_sorted(|s| s.dns_query())),
+            ]
+        } else {
+            vec![("DNS Lookup", self.collect_sorted(|s| s.dns_lookup))]
+        };
+        let phases: Vec<(&str, Vec<Duration>)> = dns_cols
+            .into_iter()
+            .chain([
+                ("TCP Connect", self.collect_sorted(|s| s.tcp_connect)),
+                ("TLS Handshake", self.collect_sorted(|s| s.tls_handshake)),
+                ("QUIC Connect", self.collect_sorted(|s| s.quic_connect)),
+                ("Request Send", self.collect_sorted(|s| s.request_send)),
+                (
+                    "Server Process",
+                    self.collect_sorted(|s| s.server_processing),
+                ),
+                ("Content Xfer", self.collect_sorted(|s| s.content_transfer)),
+                ("Total", self.collect_sorted(|s| s.total)),
+            ])
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
 
         if phases.is_empty() {
             return Ok(());

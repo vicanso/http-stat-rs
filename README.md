@@ -18,6 +18,7 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **Multi-IP concurrent testing** — `--resolve` tests multiple IPs in parallel, results sorted by success
 - **Transparent decompression** — auto-decodes `gzip`, `br`, `zstd` responses with `--compressed`
 - **Custom DNS** — specify DNS servers by IP or use built-in presets: `google`, `cloudflare`, `quad9`; DoH/DoT presets: `google-doh`, `cloudflare-doh`, `quad9-doh`, `google-dot`, `cloudflare-dot`, `quad9-dot`
+- **DoH/DoT phase split** — when DoH or DoT is in use, the DNS column splits into `DNS Connect` (TCP+TLS to the resolver) and `DNS Query`, so you can tell whether "DoH is slow" means slow handshake to the resolver or slow query processing
 - **JSON output** — `--json` for scripting, CI/CD pipelines, and monitoring integration
 - **TLS inspection** — verbose mode shows full certificate chain, cipher suite, SAN domains, and validity
 - **TLS handshake diagnostics** — every HTTPS request reports whether the handshake was `Full` or `Resumed`, whether the server stapled an OCSP response, and (in `-n` benchmark mode, where runs 2+ can resume) whether 0-RTT early data was accepted
