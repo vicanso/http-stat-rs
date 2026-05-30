@@ -15,14 +15,13 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
-use super::build_http_request;
 use super::decompress::decompress;
 use super::error::{Error, Result};
 use super::finish_with_error;
 use super::grpc::grpc_request;
 use super::net::{dns_resolve, parse_certificates, quic_connect, tcp_connect, tls_handshake};
 use super::proxy::{http_connect, socks5_connect, ProxyConfig, ProxyKind};
-use super::stats::{HttpStat, ALPN_HTTP3};
+use super::stats::{parse_server_timing, HttpStat, ALPN_HTTP3};
 use super::HttpRequest;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
@@ -30,17 +29,122 @@ use futures::future;
 use http::Request;
 use http::Response;
 use http::Version;
-use http_body_util::{BodyExt, Full};
+use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
-use std::sync::Once;
+use std::pin::Pin;
+use std::sync::{Arc, Once, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
+
+/// Request body that records the `Instant` at which hyper finished consuming it.
+///
+/// Hyper does not expose a "request body fully sent" hook, but it does pull frames
+/// from this `Body` impl until `poll_frame` returns `Ready(None)`. We capture the
+/// timestamp at that boundary, which is the closest available signal to "last
+/// request byte handed to the transport." Used to split the new `request_send`
+/// phase from `server_processing`.
+pub(crate) struct TrackedBody {
+    data: Option<Bytes>,
+    done: Arc<OnceLock<Instant>>,
+}
+
+impl TrackedBody {
+    pub(crate) fn new(data: Bytes) -> (Self, Arc<OnceLock<Instant>>) {
+        let done = Arc::new(OnceLock::new());
+        (
+            Self {
+                data: Some(data),
+                done: done.clone(),
+            },
+            done,
+        )
+    }
+}
+
+impl Body for TrackedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(bytes) = this.data.take() {
+            Poll::Ready(Some(Ok(Frame::data(bytes))))
+        } else {
+            let _ = this.done.set(Instant::now());
+            Poll::Ready(None)
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // Always force hyper to poll us so we can record completion.
+        false
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.data {
+            Some(b) => SizeHint::with_exact(b.len() as u64),
+            None => SizeHint::with_exact(0),
+        }
+    }
+}
+
+/// Build a hyper `Request<TrackedBody>` plus the shared done-handle.
+fn build_tracked_request(
+    req: &HttpRequest,
+    is_http1: bool,
+) -> Result<(Request<TrackedBody>, Arc<OnceLock<Instant>>)> {
+    let body = req.body.clone().unwrap_or_default();
+    let (tracked, done) = TrackedBody::new(body);
+    let request = req
+        .builder(is_http1)
+        .body(tracked)
+        .map_err(|e| Error::Http { source: e })?;
+    Ok((request, done))
+}
+
+/// Split a captured `send_request` future window into request_send + server_processing
+/// using a `TrackedBody`'s completion timestamp. Falls back to lumping into
+/// server_processing if the body wasn't consumed before the response arrived
+/// (which shouldn't happen for normal request/response flows).
+fn record_send_split(
+    stat: &mut HttpStat,
+    send_start: Instant,
+    response_at: Instant,
+    done: &Arc<OnceLock<Instant>>,
+) {
+    match done.get().copied() {
+        Some(done_at) if done_at >= send_start && done_at <= response_at => {
+            stat.request_send = Some(done_at.duration_since(send_start));
+            stat.server_processing = Some(response_at.duration_since(done_at));
+        }
+        _ => {
+            stat.server_processing = Some(response_at.duration_since(send_start));
+        }
+    }
+}
+
+/// Populate `stat.server_timing` from response headers (RFC 8673).
+fn capture_server_timing(stat: &mut HttpStat, headers: &http::HeaderMap) {
+    let values: Vec<&str> = headers
+        .get_all("server-timing")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if !values.is_empty() {
+        stat.server_timing = parse_server_timing(values.iter().copied());
+    }
+}
 
 // Initialize crypto provider once
 static INIT: Once = Once::new();
@@ -53,7 +157,8 @@ fn ensure_crypto_provider() {
 
 // Send HTTP/1.1 request over any stream (plain TCP or TLS)
 async fn send_http1_request<S>(
-    req: Request<Full<Bytes>>,
+    req: Request<TrackedBody>,
+    done: Arc<OnceLock<Instant>>,
     stream: S,
     request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
@@ -77,18 +182,20 @@ where
         }
     });
 
-    let server_processing_start = Instant::now();
+    let send_start = Instant::now();
     let resp = sender
         .send_request(req)
         .await
         .map_err(|e| Error::Hyper { source: e })?;
-    stat.server_processing = Some(server_processing_start.elapsed());
+    let response_at = Instant::now();
+    record_send_split(stat, send_start, response_at, &done);
     Ok(resp)
 }
 
 // Send HTTP/2 request
 async fn send_https2_request(
-    req: Request<Full<Bytes>>,
+    req: Request<TrackedBody>,
+    done: Arc<OnceLock<Instant>>,
     tls_stream: TlsStream<TcpStream>,
     request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
@@ -114,12 +221,13 @@ async fn send_https2_request(
     // Remove Host header for HTTP/2 as it's replaced by :authority
     req.headers_mut().remove("Host");
 
-    let server_processing_start = Instant::now();
+    let send_start = Instant::now();
     let resp = sender
         .send_request(req)
         .await
         .map_err(|e| Error::Hyper { source: e })?;
-    stat.server_processing = Some(server_processing_start.elapsed());
+    let response_at = Instant::now();
+    record_send_split(stat, send_start, response_at, &done);
     Ok(resp)
 }
 
@@ -228,21 +336,22 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
 
     // Send request and handle response
     let request = async move {
-        let mut stream = send_request.send_request(req).await?;
-        stream.send_data(body).await?;
-
         let mut sub_stat = HttpStat::default();
 
-        // Finish sending
+        let request_send_start = Instant::now();
+        let mut stream = send_request.send_request(req).await?;
+        stream.send_data(body).await?;
+        // Finish sending — last request byte is now on the wire (or in QUIC's buffer).
         stream.finish().await?;
+        sub_stat.request_send = Some(request_send_start.elapsed());
 
         let server_processing_start = Instant::now();
-
         let resp = stream.recv_response().await?;
         sub_stat.server_processing = Some(server_processing_start.elapsed());
 
         sub_stat.status = Some(resp.status());
         sub_stat.headers = Some(resp.headers().clone());
+        capture_server_timing(&mut sub_stat, resp.headers());
 
         // Receive response body
         let content_transfer_start = Instant::now();
@@ -259,11 +368,13 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     let (req_res, drive_res) = tokio::join!(request, drive);
     match req_res {
         Ok(sub_stat) => {
+            stat.request_send = sub_stat.request_send;
             stat.server_processing = sub_stat.server_processing;
             stat.content_transfer = sub_stat.content_transfer;
             stat.status = sub_stat.status;
             stat.headers = sub_stat.headers;
             stat.body = sub_stat.body;
+            stat.server_timing = sub_stat.server_timing;
         }
         Err(err) => {
             if !err.is_h3_no_error() {
@@ -366,15 +477,22 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
 
         // Send HTTPS request
         if is_http2 {
-            let req = match build_http_request(&http_req, false) {
-                Ok(req) => req,
+            let (req, done) = match build_tracked_request(&http_req, false) {
+                Ok(r) => r,
                 Err(e) => {
                     return finish_with_error(stat, e, start);
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_https2_request(req, tls_stream, http_req.request_timeout, tx, &mut stat)
-                .await
+            match send_https2_request(
+                req,
+                done,
+                tls_stream,
+                http_req.request_timeout,
+                tx,
+                &mut stat,
+            )
+            .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -382,14 +500,22 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
                 }
             }
         } else {
-            let req = match build_http_request(&http_req, true) {
-                Ok(req) => req,
+            let (req, done) = match build_tracked_request(&http_req, true) {
+                Ok(r) => r,
                 Err(e) => {
                     return finish_with_error(stat, e, start);
                 }
             };
             stat.request_headers = req.headers().clone();
-            match send_http1_request(req, tls_stream, http_req.request_timeout, tx, &mut stat).await
+            match send_http1_request(
+                req,
+                done,
+                tls_stream,
+                http_req.request_timeout,
+                tx,
+                &mut stat,
+            )
+            .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -398,15 +524,24 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             }
         }
     } else {
-        let req = match build_http_request(&http_req, true) {
-            Ok(req) => req,
+        let (req, done) = match build_tracked_request(&http_req, true) {
+            Ok(r) => r,
             Err(e) => {
                 return finish_with_error(stat, e, start);
             }
         };
         stat.request_headers = req.headers().clone();
         // Send HTTP request
-        match send_http1_request(req, tcp_stream, http_req.request_timeout, tx, &mut stat).await {
+        match send_http1_request(
+            req,
+            done,
+            tcp_stream,
+            http_req.request_timeout,
+            tx,
+            &mut stat,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 return finish_with_error(stat, e, start);
@@ -417,6 +552,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     // Process response
     stat.status = Some(resp.status());
     stat.headers = Some(resp.headers().clone());
+    capture_server_timing(&mut stat, resp.headers());
 
     // Check for connection errors
     if let Ok(error) = rx.try_recv() {
@@ -521,8 +657,8 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
 // --- Connection reuse API ---
 
 enum ConnectionSender {
-    Http1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
-    Http2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
+    Http1(hyper::client::conn::http1::SendRequest<TrackedBody>),
+    Http2(hyper::client::conn::http2::SendRequest<TrackedBody>),
 }
 
 /// A reusable HTTP connection handle for benchmarking.
@@ -650,8 +786,8 @@ impl HttpConnection {
         let mut stat = HttpStat::default();
 
         let is_http1 = !self.is_http2;
-        let req = match build_http_request(http_req, is_http1) {
-            Ok(req) => req,
+        let (req, done) = match build_tracked_request(http_req, is_http1) {
+            Ok(r) => r,
             Err(e) => return finish_with_error(stat, e, start),
         };
         stat.request_headers = req.headers().clone();
@@ -670,7 +806,7 @@ impl HttpConnection {
             }
         }
 
-        let server_processing_start = Instant::now();
+        let send_start = Instant::now();
         let resp = match &mut self.sender {
             ConnectionSender::Http1(sender) => sender.send_request(req).await,
             ConnectionSender::Http2(sender) => {
@@ -685,9 +821,11 @@ impl HttpConnection {
             Ok(resp) => resp,
             Err(e) => return finish_with_error(stat, Error::Hyper { source: e }, start),
         };
-        stat.server_processing = Some(server_processing_start.elapsed());
+        let response_at = Instant::now();
+        record_send_split(&mut stat, send_start, response_at, &done);
         stat.status = Some(resp.status());
         stat.headers = Some(resp.headers().clone());
+        capture_server_timing(&mut stat, resp.headers());
 
         // Read response body
         let content_transfer_start = Instant::now();

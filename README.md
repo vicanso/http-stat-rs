@@ -12,6 +12,8 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 
 - **HTTP/1.1, HTTP/2 & HTTP/3 (QUIC)** — first-class support for all modern protocols, switch with a single flag
 - **gRPC health check** — use `grpc://` or `grpcs://` scheme to probe gRPC services
+- **Request Send phase** — request body upload is timed separately from Server Processing, so a slow POST upload no longer hides as "server is slow"
+- **Server-Timing inspection** — parses the `Server-Timing` response header (RFC 8673) and displays the server-reported breakdown *inside* TTFB (CDN edge vs origin vs worker, etc.)
 - **Benchmark mode** — `-n 10` repeats N times with min/max/avg/p50/p95/p99; add `-K` to reuse the connection and compare cold vs warm latency
 - **Multi-IP concurrent testing** — `--resolve` tests multiple IPs in parallel, results sorted by success
 - **Transparent decompression** — auto-decodes `gzip`, `br`, `zstd` responses with `--compressed`
@@ -64,17 +66,17 @@ cargo install http-stat
 
 ## Request Lifecycle
 
-Every HTTP request goes through up to five sequential phases. httpstat measures each one independently:
+Every HTTP request goes through up to six sequential phases. httpstat measures each one independently:
 
 ```
-  DNS Lookup   TCP Connect  TLS Handshake  Server Processing  Content Transfer
-[────────────][────────────][──────────────][──────────────────][───────────────]
-      │              │              │                │                  │
-  hostname       3-way SYN      TLS/SSL          waiting for       downloading
-   → IP          handshake    negotiation        first byte         response
-                                 (HTTPS)
-                                                                         ▲
-                                                              Total = all phases
+  DNS Lookup   TCP Connect  TLS Handshake  Request Send  Server Processing  Content Transfer
+[────────────][────────────][──────────────][────────────][──────────────────][───────────────]
+      │              │              │             │                │                  │
+  hostname       3-way SYN      TLS/SSL      headers +         waiting for       downloading
+   → IP          handshake    negotiation    request body       first byte         response
+                                 (HTTPS)      on the wire
+                                                                                          ▲
+                                                                              Total = all phases
 ```
 
 | Phase | What it measures |
@@ -82,10 +84,13 @@ Every HTTP request goes through up to five sequential phases. httpstat measures 
 | DNS Lookup | Time to resolve the hostname to an IP address |
 | TCP Connect | Time for the 3-way TCP handshake |
 | TLS Handshake | Time to negotiate the TLS session (HTTPS/HTTP2/HTTP3 only) |
+| Request Send | Time to write request headers and body to the transport — matters for POST/PUT uploads |
 | Server Processing | Time from the last request byte sent to the first response byte received — pure server latency |
 | Content Transfer | Time to download the complete response body |
 
 > For HTTP/3, **QUIC Connect** replaces both TCP Connect and TLS Handshake (QUIC combines transport and crypto in a single handshake).
+
+If the server emits a `Server-Timing` response header, httpstat parses it and displays the server-reported sub-phases right above the timeline — useful for splitting a slow Server Processing into CDN edge / origin / worker components without leaving the terminal.
 
 ## Usage
 

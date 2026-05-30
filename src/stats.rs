@@ -68,7 +68,8 @@ struct Timeline {
 /// * `quic_connect` - Time taken to establish QUIC connection (for HTTP/3)
 /// * `tcp_connect` - Time taken to establish TCP connection
 /// * `tls_handshake` - Time taken for TLS handshake (for HTTPS)
-/// * `server_processing` - Time taken for server to process the request
+/// * `request_send` - Time to send the request headers and body
+/// * `server_processing` - Time from request fully sent to first response byte
 /// * `content_transfer` - Time taken to transfer the response body
 /// * `total` - Total time taken for the entire request
 /// * `addr` - Resolved IP address and port
@@ -90,8 +91,10 @@ pub struct HttpStat {
     pub quic_connect: Option<Duration>,
     pub tcp_connect: Option<Duration>,
     pub tls_handshake: Option<Duration>,
+    pub request_send: Option<Duration>,
     pub server_processing: Option<Duration>,
     pub content_transfer: Option<Duration>,
+    pub server_timing: Option<Vec<ServerTiming>>,
     pub total: Option<Duration>,
     pub addr: Option<String>,
     pub grpc_status: Option<String>,
@@ -124,6 +127,87 @@ pub struct Certificate {
     pub issuer: String,
     pub not_before: String,
     pub not_after: String,
+}
+
+/// A single entry parsed from the `Server-Timing` response header (RFC 8673 / W3C).
+///
+/// Format: `name[;dur=<ms>][;desc="<text>"]`, possibly multiple comma-separated entries
+/// per header, possibly multiple `Server-Timing` headers.
+#[derive(Debug, Clone)]
+pub struct ServerTiming {
+    pub name: String,
+    pub duration: Option<Duration>,
+    pub description: Option<String>,
+}
+
+/// Parse all `Server-Timing` header values into a flat list of entries.
+/// Returns `None` if the input iterator yields no entries.
+pub fn parse_server_timing<'a, I>(values: I) -> Option<Vec<ServerTiming>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out = Vec::new();
+    for raw in values {
+        for part in split_top_level_commas(raw) {
+            let mut subparts = part.split(';').map(str::trim);
+            let name = match subparts.next() {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => continue,
+            };
+            let mut entry = ServerTiming {
+                name,
+                duration: None,
+                description: None,
+            };
+            for kv in subparts {
+                let Some(eq) = kv.find('=') else { continue };
+                let key = kv[..eq].trim().to_ascii_lowercase();
+                let mut val = kv[eq + 1..].trim();
+                if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
+                    val = &val[1..val.len() - 1];
+                }
+                match key.as_str() {
+                    "dur" => {
+                        if let Ok(ms) = val.parse::<f64>() {
+                            if ms.is_finite() && ms >= 0.0 {
+                                entry.duration = Some(Duration::from_secs_f64(ms / 1000.0));
+                            }
+                        }
+                    }
+                    "desc" => entry.description = Some(val.to_string()),
+                    _ => {}
+                }
+            }
+            out.push(entry);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Split on top-level commas, ignoring commas inside double-quoted strings.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(s[start..].trim());
+    parts
 }
 
 /// Apply a simple jq-style field selector to a JSON string.
@@ -324,6 +408,7 @@ impl HttpStat {
             ("TCP Connect", self.tcp_connect),
             ("TLS Handshake", self.tls_handshake),
             ("QUIC Connect", self.quic_connect),
+            ("Request Send", self.request_send),
             ("Server Process", self.server_processing),
             ("Content Xfer", self.content_transfer),
         ];
@@ -388,6 +473,7 @@ impl HttpStat {
         timing.insert("tcp_connect_us".into(), dur_us(self.tcp_connect));
         timing.insert("tls_handshake_us".into(), dur_us(self.tls_handshake));
         timing.insert("quic_connect_us".into(), dur_us(self.quic_connect));
+        timing.insert("request_send_us".into(), dur_us(self.request_send));
         timing.insert(
             "server_processing_us".into(),
             dur_us(self.server_processing),
@@ -395,6 +481,27 @@ impl HttpStat {
         timing.insert("content_transfer_us".into(), dur_us(self.content_transfer));
         timing.insert("total_us".into(), dur_us(self.total));
         obj.insert("timing".into(), Value::Object(timing));
+
+        // Server-Timing entries (RFC 8673)
+        if let Some(entries) = &self.server_timing {
+            let arr: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    let mut m = Map::new();
+                    m.insert("name".into(), json!(e.name));
+                    m.insert(
+                        "duration_us".into(),
+                        e.duration.map_or(Value::Null, |d| json!(d.as_micros() as u64)),
+                    );
+                    m.insert(
+                        "description".into(),
+                        e.description.as_deref().map_or(Value::Null, |s| json!(s)),
+                    );
+                    Value::Object(m)
+                })
+                .collect();
+            obj.insert("server_timing".into(), Value::Array(arr));
+        }
 
         // Connection
         obj.insert(
@@ -638,6 +745,140 @@ impl fmt::Display for HttpStat {
             writeln!(f)?;
         }
 
+        // Server-Timing breakdown (what the server says happened inside Server Processing).
+        // Each row shows: name, a sparkline-style bar sized by share of the reported total,
+        // duration, and percent. The header line reconciles the reported sum against the
+        // measured Server Processing time so the unaccounted gap (network/queueing) is visible.
+        if let Some(entries) = &self.server_timing {
+            if !entries.is_empty() {
+                const BAR_W: usize = 34;
+                let name_w = entries
+                    .iter()
+                    .map(|e| e.name.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .max(4);
+
+                let sum: Duration = entries.iter().filter_map(|e| e.duration).sum();
+                let total_ns = (sum.as_nanos() as f64).max(1.0);
+                let largest_idx: Option<usize> = entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| {
+                        e.duration.filter(|d| !d.is_zero()).map(|d| (i, d))
+                    })
+                    .max_by_key(|(_, d)| *d)
+                    .map(|(i, _)| i);
+
+                let summary = match self.server_processing {
+                    Some(sp) if sp > sum => format!(
+                        "(\u{03A3} {} of {} Server Processing \u{00B7} {} unaccounted)",
+                        format_duration(sum),
+                        format_duration(sp),
+                        format_duration(sp - sum),
+                    ),
+                    Some(sp) => format!(
+                        "(\u{03A3} {} of {} Server Processing)",
+                        format_duration(sum),
+                        format_duration(sp),
+                    ),
+                    None => format!("(\u{03A3} {})", format_duration(sum)),
+                };
+                writeln!(
+                    f,
+                    "{} {}",
+                    LightGreen.paint("Server-Timing:"),
+                    LightCyan.paint(&summary),
+                )?;
+
+                // Lay each bar out at its cumulative offset, so the sequence reads
+                // left-to-right like a waterfall inside Server Processing.
+                let sum_ns_u = sum.as_nanos();
+                let mut cum_ns: u128 = 0;
+                for (i, entry) in entries.iter().enumerate() {
+                    let name_pad =
+                        " ".repeat(name_w.saturating_sub(entry.name.chars().count()));
+                    let dur_ns = entry.duration.map(|d| d.as_nanos()).unwrap_or(0);
+
+                    let start_col = ((cum_ns as f64 / total_ns) * BAR_W as f64)
+                        .round() as usize;
+                    let start_col = start_col.min(BAR_W);
+                    let mut end_col = (((cum_ns + dur_ns) as f64 / total_ns)
+                        * BAR_W as f64)
+                        .round() as usize;
+                    end_col = end_col.min(BAR_W);
+                    // Non-zero entries should always paint at least one cell so they
+                    // don't disappear into rounding.
+                    if dur_ns > 0 && end_col <= start_col {
+                        end_col = (start_col + 1).min(BAR_W);
+                    }
+
+                    let bar: String = (0..BAR_W)
+                        .map(|col| {
+                            if dur_ns == 0 {
+                                let marker = start_col.min(BAR_W - 1);
+                                if col == marker {
+                                    '\u{00B7}'
+                                } else {
+                                    '\u{2591}'
+                                }
+                            } else if col >= start_col && col < end_col {
+                                '\u{2588}'
+                            } else {
+                                '\u{2591}'
+                            }
+                        })
+                        .collect();
+
+                    let (dur_str, pct_str) = if dur_ns > 0 {
+                        let pct = if sum_ns_u > 0 {
+                            (dur_ns as f64 / sum_ns_u as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        (
+                            format_duration(entry.duration.unwrap_or_default()),
+                            format!("{pct:>5.1}%"),
+                        )
+                    } else {
+                        ("\u{2014}".to_string(), "\u{2013}".to_string())
+                    };
+
+                    let is_largest = Some(i) == largest_idx;
+                    let bar_painted = if is_largest {
+                        LightYellow.paint(&bar).to_string()
+                    } else {
+                        LightCyan.paint(&bar).to_string()
+                    };
+                    let dur_painted = if is_largest {
+                        LightYellow.paint(format!("{dur_str:>8}")).to_string()
+                    } else {
+                        LightCyan.paint(format!("{dur_str:>8}")).to_string()
+                    };
+                    let pct_painted = LightCyan.paint(format!("{pct_str:>6}")).to_string();
+                    let desc = entry
+                        .description
+                        .as_deref()
+                        .map(|d| format!("  ({d})"))
+                        .unwrap_or_default();
+
+                    writeln!(
+                        f,
+                        "  {}{}  {}  {}  {}{}",
+                        LightCyan.paint(&entry.name),
+                        name_pad,
+                        bar_painted,
+                        dur_painted,
+                        pct_painted,
+                        desc,
+                    )?;
+
+                    cum_ns += dur_ns;
+                }
+                writeln!(f)?;
+            }
+        }
+
         if self.waterfall {
             self.fmt_waterfall(f)?;
         } else {
@@ -665,6 +906,12 @@ impl fmt::Display for HttpStat {
             if let Some(value) = self.quic_connect {
                 timelines.push(Timeline {
                     name: "QUIC Connect".to_string(),
+                    duration: value,
+                });
+            }
+            if let Some(value) = self.request_send {
+                timelines.push(Timeline {
+                    name: "Request Send".to_string(),
                     duration: value,
                 });
             }
@@ -806,6 +1053,7 @@ impl fmt::Display for BenchmarkSummary {
             ("TCP Connect", self.collect_sorted(|s| s.tcp_connect)),
             ("TLS Handshake", self.collect_sorted(|s| s.tls_handshake)),
             ("QUIC Connect", self.collect_sorted(|s| s.quic_connect)),
+            ("Request Send", self.collect_sorted(|s| s.request_send)),
             (
                 "Server Process",
                 self.collect_sorted(|s| s.server_processing),

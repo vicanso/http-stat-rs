@@ -236,12 +236,3 @@ impl TryFrom<&HttpRequest> for Request<Full<Bytes>> {
             .map_err(|e| Error::Http { source: e })
     }
 }
-
-pub(crate) fn build_http_request(
-    req: &HttpRequest,
-    is_http1: bool,
-) -> Result<Request<Full<Bytes>>> {
-    req.builder(is_http1)
-        .body(Full::new(req.body.clone().unwrap_or_default()))
-        .map_err(|e| Error::Http { source: e })
-}

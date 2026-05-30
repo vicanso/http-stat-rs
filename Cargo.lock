@@ -789,6 +789,7 @@ dependencies = [
  "heck",
  "hickory-resolver",
  "http",
+ "http-body",
  "http-body-util",
  "humantime",
  "hyper",
