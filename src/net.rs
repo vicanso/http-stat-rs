@@ -17,6 +17,7 @@
 
 use super::error::{Error, Result};
 use super::http_request::ConnectTo;
+use super::skip_verifier::CapturingVerifier;
 use super::stats::{format_time, Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
 use super::HttpRequest;
 use super::SkipVerifier;
@@ -36,7 +37,8 @@ use tokio::net::TcpSocket;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::client::{Resumption, WebPkiServerVerifier};
+use tokio_rustls::rustls::{ClientConfig, HandshakeKind, RootCertStore};
 use tokio_rustls::TlsConnector;
 
 // Format TLS protocol version for display
@@ -333,7 +335,11 @@ pub(crate) async fn tls_handshake(
             .map_err(|e| Error::Rustls { source: e })?;
     }
 
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
+    // Build a webpki-backed verifier that we can wrap to observe OCSP stapling.
+    // When `--skip-verify` is set we fall through to SkipVerifier and leave
+    // `tls_ocsp_stapled` as None (OCSP detection is meaningless without
+    // verification).
+    let builder = ClientConfig::builder().with_root_certificates(root_store.clone());
 
     // Configure TLS client (with or without client auth)
     let mut config = if let (Some(cert_pem), Some(key_pem)) = (
@@ -357,11 +363,34 @@ pub(crate) async fn tls_handshake(
         builder.with_no_client_auth()
     };
 
-    // Skip certificate verification if requested
-    if http_req.skip_verify {
+    // Install verifier: SkipVerifier when --skip-verify, otherwise wrap the
+    // default WebPkiServerVerifier so we can record whether the server stapled
+    // an OCSP response.
+    let ocsp_handle: Option<Arc<std::sync::OnceLock<bool>>> = if http_req.skip_verify {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(SkipVerifier));
+        None
+    } else {
+        let inner = WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| Error::Common {
+                category: "tls".to_string(),
+                message: e.to_string(),
+            })?;
+        let (capturing, handle) = CapturingVerifier::new(inner);
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(capturing));
+        Some(handle)
+    };
+
+    // Enable 0-RTT and wire the session store (if the caller provided one,
+    // e.g. the -n benchmark loop), so a resumed handshake can occur and we
+    // can report whether early data was actually accepted.
+    config.enable_early_data = true;
+    if let Some(store) = &http_req.tls_session_store {
+        config.resumption = Resumption::store(store.clone());
     }
 
     // Set ALPN protocols
@@ -394,6 +423,25 @@ pub(crate) async fn tls_handshake(
     stat.tls = session
         .protocol_version()
         .map(|v| format_tls_protocol(v.as_str().unwrap_or_default()));
+
+    // Resumption: rustls reports `HandshakeKind::Resumed` for a session-ticket
+    // resumption. Full / FullWithHelloRetryRequest both collapse to "Full" for
+    // the user-facing label.
+    stat.tls_resumed = session
+        .handshake_kind()
+        .map(|k| matches!(k, HandshakeKind::Resumed));
+    // Early data is meaningful only when the client actually requested it,
+    // which requires a prior session. On a cold handshake `is_early_data_accepted`
+    // returns false but the question wasn't really asked — only report when
+    // we attempted resumption.
+    if matches!(stat.tls_resumed, Some(true)) {
+        stat.tls_early_data_accepted = Some(session.is_early_data_accepted());
+    }
+    // OCSP: from the wrapping verifier. Left as None when --skip-verify or when
+    // (unlikely) the verifier was bypassed via cached cert.
+    if let Some(handle) = &ocsp_handle {
+        stat.tls_ocsp_stapled = handle.get().copied();
+    }
 
     // Extract certificate information
     if let Some(certs) = session.peer_certificates() {

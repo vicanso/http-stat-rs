@@ -24,8 +24,10 @@ use http::Request;
 use http::Uri;
 use http::{HeaderMap, Method};
 use http_body_util::Full;
+use rustls::client::{ClientSessionMemoryCache, ClientSessionStore};
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -136,6 +138,12 @@ pub struct HttpRequest {
     pub use_absolute_uri: bool,                  // Send absolute URI (HTTP forward proxy)
     pub connect_to: Vec<String>,                 // --connect-to HOST1:PORT1:HOST2:PORT2 overrides
     pub bind_addr: Option<IpAddr>,               // Local source IP to bind before connecting
+    /// Optional shared TLS session store. When set, the rustls `ClientConfig`
+    /// is wired with `Resumption::store(...)` and `enable_early_data = true`,
+    /// so subsequent requests sharing this store can perform a resumed
+    /// handshake and attempt 0-RTT. Intended for the `-n` benchmark loop:
+    /// install one cache before the loop and clone it onto every request.
+    pub tls_session_store: Option<Arc<dyn ClientSessionStore>>,
 }
 
 impl HttpRequest {
@@ -204,6 +212,14 @@ impl HttpRequest {
         }
         builder
     }
+}
+
+/// Create an in-memory TLS session store suitable for sharing across multiple
+/// requests (e.g. across a benchmark `-n` loop). Pass the returned `Arc` into
+/// `HttpRequest::tls_session_store` on every request that should be able to
+/// resume a previous TLS session.
+pub fn new_tls_session_store(capacity: usize) -> Arc<dyn ClientSessionStore> {
+    Arc::new(ClientSessionMemoryCache::new(capacity))
 }
 
 // Convert string URL to HttpRequest

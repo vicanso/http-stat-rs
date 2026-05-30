@@ -24,6 +24,7 @@ use http_stat::{
     ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3,
 };
 use std::net::IpAddr;
+use std::sync::Arc;
 use tokio::fs;
 
 #[cfg(target_env = "musl")]
@@ -780,11 +781,17 @@ async fn main() {
             exit_code = connect_stat.exit_code();
         }
     } else if count > 1 {
-        // Benchmark mode (new connection each time)
+        // Benchmark mode (new connection each time). Share a single TLS session
+        // store across iterations so runs 2..N can perform a resumed handshake
+        // (and attempt 0-RTT) — making the speedup visible in the per-request
+        // tls_handshake column and in the reported handshake kind.
         let width = count.to_string().len();
+        let session_store = http_stat::new_tls_session_store(count.max(8));
         let mut stats = Vec::with_capacity(count);
         for i in 0..count {
-            let mut stat = do_request(req.clone(), args.follow_redirect).await;
+            let mut req = req.clone();
+            req.tls_session_store = Some(Arc::clone(&session_store));
+            let mut stat = do_request(req, args.follow_redirect).await;
             stat.silent = true;
             if !json_output {
                 print!("[{:>width$}/{count}] {stat}", i + 1);

@@ -100,6 +100,9 @@ pub struct HttpStat {
     pub grpc_status: Option<String>,
     pub status: Option<StatusCode>,
     pub tls: Option<String>,
+    pub tls_resumed: Option<bool>,
+    pub tls_early_data_accepted: Option<bool>,
+    pub tls_ocsp_stapled: Option<bool>,
     pub alpn: Option<String>,
     pub subject: Option<String>,
     pub issuer: Option<String>,
@@ -531,6 +534,19 @@ impl HttpStat {
                     .map_or(Value::Null, |s| json!(s)),
             );
             tls.insert(
+                "resumed".into(),
+                self.tls_resumed.map_or(Value::Null, |b| json!(b)),
+            );
+            tls.insert(
+                "early_data_accepted".into(),
+                self.tls_early_data_accepted
+                    .map_or(Value::Null, |b| json!(b)),
+            );
+            tls.insert(
+                "ocsp_stapled".into(),
+                self.tls_ocsp_stapled.map_or(Value::Null, |b| json!(b)),
+            );
+            tls.insert(
                 "subject".into(),
                 self.subject.as_deref().map_or(Value::Null, |s| json!(s)),
             );
@@ -611,6 +627,16 @@ impl fmt::Display for HttpStat {
                     text = format!("{text} --> {}", LightRed.paint("FAIL"));
                 }
                 text = format!("{text} {}", format_duration(self.total.unwrap_or_default()));
+                // Surface TLS resumption / 0-RTT inline — most useful in
+                // benchmark (-n) output where iterations 2+ may resume.
+                if let Some(true) = self.tls_resumed {
+                    let tag = if matches!(self.tls_early_data_accepted, Some(true)) {
+                        "0-RTT"
+                    } else {
+                        "Resumed"
+                    };
+                    text = format!("{text} [{}]", LightYellow.paint(tag));
+                }
             }
             writeln!(f, "{text}")?;
         }
@@ -657,6 +683,22 @@ impl fmt::Display for HttpStat {
                 "Cipher: {}",
                 LightCyan.paint(self.cert_cipher.as_deref().unwrap_or_default())
             )?;
+            if let Some(resumed) = self.tls_resumed {
+                let label = if resumed { "Resumed" } else { "Full" };
+                writeln!(f, "Handshake: {}", LightCyan.paint(label))?;
+            }
+            if let Some(accepted) = self.tls_early_data_accepted {
+                let label = if accepted {
+                    "accepted (0-RTT)"
+                } else {
+                    "not accepted"
+                };
+                writeln!(f, "Early Data: {}", LightCyan.paint(label))?;
+            }
+            if let Some(stapled) = self.tls_ocsp_stapled {
+                let label = if stapled { "stapled" } else { "not stapled" };
+                writeln!(f, "OCSP: {}", LightCyan.paint(label))?;
+            }
             writeln!(
                 f,
                 "Not Before: {}",

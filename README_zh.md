@@ -18,6 +18,7 @@
 - **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`；DoH/DoT 预设：`google-doh`、`cloudflare-doh`、`quad9-doh`、`google-dot`、`cloudflare-dot`、`quad9-dot`
 - **JSON 输出** — `--json` 方便脚本集成、CI/CD 流水线和监控系统对接
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
+- **TLS 握手诊断** — 每次 HTTPS 请求都会报告握手类型（`Full` / `Resumed`）、服务器是否进行 OCSP stapling，以及在 `-n` 基准测试模式下后续请求是否接受了 0-RTT 早期数据
 - **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 重定向自动合并 `Set-Cookie`
 - **ALPN 协议协商展示** — 每次响应明确显示客户端与服务端最终协商出的协议版本（`HTTP/1.1`、`H2`、`H3`），清楚知道实际使用了哪个版本
 - **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段，无需额外管道 `jq`
