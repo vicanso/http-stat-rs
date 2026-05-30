@@ -53,6 +53,27 @@ pub fn format_duration(duration: Duration) -> String {
     format!("{}µs", duration.as_micros())
 }
 
+/// Format a throughput value (bytes/s) into a human-readable string using
+/// decimal units (MB/s = 10^6 B/s, the network-convention) — bandwidth is
+/// almost universally reported in decimal, even when storage uses binary.
+pub fn format_throughput(bytes_per_sec: f64) -> String {
+    if !bytes_per_sec.is_finite() || bytes_per_sec <= 0.0 {
+        return "-".to_string();
+    }
+    if bytes_per_sec >= 1_000_000.0 {
+        format!("{:.1} MB/s", bytes_per_sec / 1_000_000.0)
+    } else if bytes_per_sec >= 1_000.0 {
+        format!("{:.1} KB/s", bytes_per_sec / 1_000.0)
+    } else {
+        format!("{bytes_per_sec:.0} B/s")
+    }
+}
+
+/// Size of the "first chunk" window used for throughput splitting.
+pub const FIRST_CHUNK_BYTES: usize = 100 * 1024;
+/// Threshold above which we render the overall Throughput line.
+pub const THROUGHPUT_DISPLAY_THRESHOLD: usize = 1024 * 1024;
+
 struct Timeline {
     name: String,
     duration: Duration,
@@ -110,6 +131,16 @@ pub struct HttpStat {
     pub request_send: Option<Duration>,
     pub server_processing: Option<Duration>,
     pub content_transfer: Option<Duration>,
+    /// Bytes actually received over the wire (pre-decompression). For an
+    /// uncompressed response this matches `body_size`; for `gzip`/`br`/`zstd`
+    /// it's smaller and is the right denominator for *network* throughput.
+    pub wire_body_size: Option<usize>,
+    /// Time from the start of `content_transfer` until the first 100 KiB of
+    /// body bytes had arrived. Combined with the overall content_transfer
+    /// duration, it splits download throughput into "first 100 KB" vs
+    /// "tail" — the former is TCP slow-start dominated, the latter is the
+    /// steady-state rate the server can sustain.
+    pub time_to_first_100k: Option<Duration>,
     pub server_timing: Option<Vec<ServerTiming>>,
     pub total: Option<Duration>,
     pub addr: Option<String>,
@@ -406,6 +437,46 @@ impl HttpStat {
         }
     }
 
+    /// Overall download throughput in bytes/sec, based on wire bytes received
+    /// over the content_transfer window. Returns `None` when either input is
+    /// unavailable or content_transfer is zero (instant local response).
+    pub fn throughput_bps(&self) -> Option<f64> {
+        let bytes = self.wire_body_size? as f64;
+        let secs = self.content_transfer?.as_secs_f64();
+        if secs <= 0.0 {
+            return None;
+        }
+        Some(bytes / secs)
+    }
+
+    /// Throughput across the first 100 KiB of body bytes — dominated by TCP
+    /// slow-start on a cold connection. Compare with [`tail_throughput_bps`]
+    /// to tell "slow start" from "server streams slowly".
+    pub fn first_chunk_throughput_bps(&self) -> Option<f64> {
+        let dur = self.time_to_first_100k?.as_secs_f64();
+        if dur <= 0.0 {
+            return None;
+        }
+        Some(FIRST_CHUNK_BYTES as f64 / dur)
+    }
+
+    /// Throughput of the remaining body after the first 100 KiB — the
+    /// steady-state rate the server actually sustains.
+    pub fn tail_throughput_bps(&self) -> Option<f64> {
+        let total = self.content_transfer?;
+        let head = self.time_to_first_100k?;
+        let bytes = self.wire_body_size?;
+        if bytes <= FIRST_CHUNK_BYTES || total <= head {
+            return None;
+        }
+        let tail_bytes = (bytes - FIRST_CHUNK_BYTES) as f64;
+        let tail_secs = (total - head).as_secs_f64();
+        if tail_secs <= 0.0 {
+            return None;
+        }
+        Some(tail_bytes / tail_secs)
+    }
+
     pub fn is_success(&self) -> bool {
         if self.error.is_some() {
             return false;
@@ -525,8 +596,30 @@ impl HttpStat {
             dur_us(self.server_processing),
         );
         timing.insert("content_transfer_us".into(), dur_us(self.content_transfer));
+        timing.insert(
+            "time_to_first_100k_us".into(),
+            dur_us(self.time_to_first_100k),
+        );
         timing.insert("total_us".into(), dur_us(self.total));
         obj.insert("timing".into(), Value::Object(timing));
+
+        // Throughput block — populated whenever a body was received with a
+        // measurable content_transfer. Numerator is wire bytes (pre-decompress).
+        if self.wire_body_size.is_some() && self.content_transfer.is_some() {
+            let mut t = Map::new();
+            t.insert(
+                "wire_body_size".into(),
+                self.wire_body_size.map_or(Value::Null, |v| json!(v)),
+            );
+            let opt_f = |v: Option<f64>| -> Value { v.map_or(Value::Null, |x| json!(x)) };
+            t.insert("bps_total".into(), opt_f(self.throughput_bps()));
+            t.insert(
+                "bps_first_100k".into(),
+                opt_f(self.first_chunk_throughput_bps()),
+            );
+            t.insert("bps_tail".into(), opt_f(self.tail_throughput_bps()));
+            obj.insert("throughput".into(), Value::Object(t));
+        }
 
         // Kernel TCP statistics (Linux + macOS): both samples plus a derived
         // delta highlighting what changed during the request.
@@ -1187,7 +1280,9 @@ impl fmt::Display for HttpStat {
                     "Body size: {}",
                     ByteSize(self.body_size.unwrap_or(0) as u64)
                 );
-                writeln!(f, "{}\n", LightCyan.paint(text))?;
+                writeln!(f, "{}", LightCyan.paint(text))?;
+                self.fmt_throughput(f)?;
+                writeln!(f)?;
                 if status >= 400 {
                     writeln!(f, "{}", LightRed.paint(body))?;
                 } else {
@@ -1206,9 +1301,51 @@ impl fmt::Display for HttpStat {
                     ByteSize(self.body_size.unwrap_or(0) as u64)
                 );
                 writeln!(f, "{} {}", LightCyan.paint(text), save_tips)?;
+                self.fmt_throughput(f)?;
             }
         }
 
+        Ok(())
+    }
+}
+
+impl HttpStat {
+    /// Render the throughput line(s) under the body summary. Always shown
+    /// when the body exceeds `THROUGHPUT_DISPLAY_THRESHOLD` (1 MiB);
+    /// verbose mode additionally splits "first 100 KB" vs "tail" so the
+    /// user can tell TCP slow-start from steady-state server-side slowness.
+    fn fmt_throughput(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(wire) = self.wire_body_size else {
+            return Ok(());
+        };
+        if wire < THROUGHPUT_DISPLAY_THRESHOLD {
+            return Ok(());
+        }
+        let Some(total) = self.throughput_bps() else {
+            return Ok(());
+        };
+        writeln!(
+            f,
+            "{} {}",
+            LightCyan.paint("Throughput:"),
+            LightCyan.paint(format_throughput(total)),
+        )?;
+        if self.verbose {
+            if let (Some(first), Some(tail)) = (
+                self.first_chunk_throughput_bps(),
+                self.tail_throughput_bps(),
+            ) {
+                writeln!(
+                    f,
+                    "  {} {}  {}  {} {}",
+                    LightCyan.paint("first 100KB:"),
+                    LightCyan.paint(format_throughput(first)),
+                    LightCyan.paint("·"),
+                    LightCyan.paint("then:"),
+                    LightCyan.paint(format_throughput(tail)),
+                )?;
+            }
+        }
         Ok(())
     }
 }

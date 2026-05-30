@@ -21,7 +21,7 @@ use super::finish_with_error;
 use super::grpc::grpc_request;
 use super::net::{dns_resolve, parse_certificates, quic_connect, tcp_connect, tls_handshake};
 use super::proxy::{http_connect, socks5_connect, ProxyConfig, ProxyKind};
-use super::stats::{parse_server_timing, HttpStat, ALPN_HTTP3};
+use super::stats::{parse_server_timing, HttpStat, ALPN_HTTP3, FIRST_CHUNK_BYTES};
 use super::HttpRequest;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
@@ -144,6 +144,29 @@ fn capture_server_timing(stat: &mut HttpStat, headers: &http::HeaderMap) {
     if !values.is_empty() {
         stat.server_timing = parse_server_timing(values.iter().copied());
     }
+}
+
+/// Drain a streaming response body frame-by-frame, recording the moment the
+/// accumulator first crosses [`FIRST_CHUNK_BYTES`]. The returned tuple is
+/// `(body_bytes, time_to_first_100k)`. `time_to_first_100k` is `None` when
+/// the body is smaller than the threshold — there's no split to report.
+async fn drain_body_with_split(
+    body: Incoming,
+    start: Instant,
+) -> std::result::Result<(Bytes, Option<Duration>), String> {
+    let mut body = body;
+    let mut buf = BytesMut::new();
+    let mut first_chunk_at: Option<Duration> = None;
+    while let Some(frame_res) = body.frame().await {
+        let frame = frame_res.map_err(|e| format!("Failed to read response body: {e}"))?;
+        if let Ok(data) = frame.into_data() {
+            buf.extend_from_slice(&data);
+            if first_chunk_at.is_none() && buf.len() >= FIRST_CHUNK_BYTES {
+                first_chunk_at = Some(start.elapsed());
+            }
+        }
+    }
+    Ok((buf.freeze(), first_chunk_at))
 }
 
 // Initialize crypto provider once
@@ -353,13 +376,20 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         sub_stat.headers = Some(resp.headers().clone());
         capture_server_timing(&mut sub_stat, resp.headers());
 
-        // Receive response body
+        // Receive response body. Capture the first-100KB instant so we can
+        // split throughput into "slow start" vs "steady state" later.
         let content_transfer_start = Instant::now();
         let mut buf = BytesMut::new();
+        let mut first_chunk_at: Option<Duration> = None;
         while let Some(chunk) = stream.recv_data().await? {
             buf.extend(chunk.chunk());
+            if first_chunk_at.is_none() && buf.len() >= FIRST_CHUNK_BYTES {
+                first_chunk_at = Some(content_transfer_start.elapsed());
+            }
         }
         sub_stat.content_transfer = Some(content_transfer_start.elapsed());
+        sub_stat.wire_body_size = Some(buf.len());
+        sub_stat.time_to_first_100k = first_chunk_at;
         sub_stat.body = Some(Bytes::from(buf));
         Ok::<HttpStat, h3::error::StreamError>(sub_stat)
     };
@@ -374,6 +404,8 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
             stat.status = sub_stat.status;
             stat.headers = sub_stat.headers;
             stat.body = sub_stat.body;
+            stat.wire_body_size = sub_stat.wire_body_size;
+            stat.time_to_first_100k = sub_stat.time_to_first_100k;
             stat.server_timing = sub_stat.server_timing;
         }
         Err(err) => {
@@ -575,17 +607,18 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     if let Ok(error) = rx.try_recv() {
         stat.error = Some(error);
     }
-    // Read response body
+    // Read response body — stream frame-by-frame so we can timestamp the
+    // moment 100 KiB has arrived. Combined with content_transfer, this lets
+    // us split throughput into "first 100 KB" (TCP slow-start dominated)
+    // and "tail" (steady-state server send rate).
     let content_transfer_start = Instant::now();
-    let body_result = resp.collect().await;
-    let body = match body_result {
-        Ok(body) => body,
-        Err(e) => {
-            return finish_with_error(stat, format!("Failed to read response body: {e}"), start);
-        }
+    let drain_result = drain_body_with_split(resp.into_body(), content_transfer_start).await;
+    let (body_bytes, time_to_first_100k) = match drain_result {
+        Ok(p) => p,
+        Err(e) => return finish_with_error(stat, e, start),
     };
-
-    let body_bytes = body.to_bytes();
+    stat.wire_body_size = Some(body_bytes.len());
+    stat.time_to_first_100k = time_to_first_100k;
     stat.body = Some(body_bytes);
     stat.content_transfer = Some(content_transfer_start.elapsed());
 
@@ -875,20 +908,19 @@ impl HttpConnection {
         stat.headers = Some(resp.headers().clone());
         capture_server_timing(&mut stat, resp.headers());
 
-        // Read response body
+        // Read response body — frame-by-frame so we capture the
+        // time-to-first-100K marker for throughput-split diagnosis (matches
+        // the http1_2_request path).
         let content_transfer_start = Instant::now();
-        match resp.collect().await {
-            Ok(body) => {
-                let body_bytes = body.to_bytes();
+        match drain_body_with_split(resp.into_body(), content_transfer_start).await {
+            Ok((body_bytes, first_100k)) => {
+                stat.wire_body_size = Some(body_bytes.len());
+                stat.time_to_first_100k = first_100k;
                 stat.body = Some(body_bytes);
                 stat.content_transfer = Some(content_transfer_start.elapsed());
             }
             Err(e) => {
-                return finish_with_error(
-                    stat,
-                    format!("Failed to read response body: {e}"),
-                    start,
-                );
+                return finish_with_error(stat, e, start);
             }
         }
 
