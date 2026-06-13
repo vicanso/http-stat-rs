@@ -20,7 +20,7 @@ pub enum Error {
     Uri { source: http::uri::InvalidUri },
     #[snafu(display("resolve error {source}"))]
     Resolve {
-        source: hickory_resolver::ResolveError,
+        source: hickory_resolver::net::NetError,
     },
     #[snafu(display("{category}, {message}"))]
     Common { category: String, message: String },

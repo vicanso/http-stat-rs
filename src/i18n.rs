@@ -124,6 +124,11 @@ pub struct Strings {
     pub st_sum_of: &'static str,
     pub st_unaccounted: &'static str,
 
+    // Protocol advertisements (Alt-Svc / HSTS)
+    pub protocol_adv_heading: &'static str,
+    pub alt_svc_label: &'static str,
+    pub hsts_label: &'static str,
+
     // Kernel TCP block
     pub kernel_tcp_heading: &'static str,
     pub tcp_post_connect_row: &'static str,
@@ -191,6 +196,10 @@ pub const EN: Strings = Strings {
     st_sum_of: "of",
     st_unaccounted: "unaccounted",
 
+    protocol_adv_heading: "Server Advertisements:",
+    alt_svc_label: "Alt-Svc:",
+    hsts_label: "HSTS:   ",
+
     kernel_tcp_heading: "Kernel TCP:",
     tcp_post_connect_row: "post-connect:",
     tcp_final_row: "final:",
@@ -254,6 +263,10 @@ pub const ZH: Strings = Strings {
     server_timing_heading: "Server-Timing：",
     st_sum_of: "占",
     st_unaccounted: "未统计",
+
+    protocol_adv_heading: "服务器声明：",
+    alt_svc_label: "Alt-Svc：",
+    hsts_label: "HSTS：   ",
 
     kernel_tcp_heading: "内核 TCP：",
     tcp_post_connect_row: "连接后：",

@@ -23,9 +23,9 @@ use super::tcp_info::TcpInfoProbe;
 use super::HttpRequest;
 use super::SkipVerifier;
 use hickory_resolver::config::{
-    LookupIpStrategy, NameServerConfigGroup, ResolverConfig, CLOUDFLARE_IPS, GOOGLE_IPS, QUAD9_IPS,
+    LookupIpStrategy, NameServerConfig, ResolverConfig, CLOUDFLARE, GOOGLE, QUAD9,
 };
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -183,8 +183,8 @@ pub(crate) async fn dns_resolve(
     }
 
     // Configure DNS resolver
-    let provider = TokioConnectionProvider::default();
-    let mut server_group: Option<NameServerConfigGroup> = None;
+    let provider = TokioRuntimeProvider::default();
+    let mut server_config: Option<ResolverConfig> = None;
     // When a DoH/DoT preset matches, remember its endpoint so we can probe
     // the cold connect cost in parallel with the actual resolver call.
     let mut probe_endpoint: Option<DnsProbeEndpoint> = None;
@@ -192,35 +192,25 @@ pub(crate) async fn dns_resolve(
         let mut plain_ips: Vec<IpAddr> = vec![];
         for server in dns_servers {
             match server.as_str() {
-                // Plain UDP presets
+                // Plain UDP/TCP presets
                 "google" => {
-                    server_group =
-                        Some(NameServerConfigGroup::from_ips_clear(GOOGLE_IPS, 53, true));
+                    server_config = Some(ResolverConfig::udp_and_tcp(&GOOGLE));
                     plain_ips.clear();
                     break;
                 }
                 "cloudflare" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_clear(
-                        CLOUDFLARE_IPS,
-                        53,
-                        true,
-                    ));
+                    server_config = Some(ResolverConfig::udp_and_tcp(&CLOUDFLARE));
                     plain_ips.clear();
                     break;
                 }
                 "quad9" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_clear(QUAD9_IPS, 53, true));
+                    server_config = Some(ResolverConfig::udp_and_tcp(&QUAD9));
                     plain_ips.clear();
                     break;
                 }
                 // DNS-over-HTTPS presets
                 "google-doh" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_https(
-                        &[IpAddr::from([8, 8, 8, 8]), IpAddr::from([8, 8, 4, 4])],
-                        443,
-                        "dns.google".to_string(),
-                        true,
-                    ));
+                    server_config = Some(ResolverConfig::https(&GOOGLE));
                     probe_endpoint = Some(DnsProbeEndpoint {
                         transport: DnsTransport::Doh,
                         ip: IpAddr::from([8, 8, 8, 8]),
@@ -231,12 +221,7 @@ pub(crate) async fn dns_resolve(
                     break;
                 }
                 "cloudflare-doh" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_https(
-                        &[IpAddr::from([1, 1, 1, 1]), IpAddr::from([1, 0, 0, 1])],
-                        443,
-                        "cloudflare-dns.com".to_string(),
-                        true,
-                    ));
+                    server_config = Some(ResolverConfig::https(&CLOUDFLARE));
                     probe_endpoint = Some(DnsProbeEndpoint {
                         transport: DnsTransport::Doh,
                         ip: IpAddr::from([1, 1, 1, 1]),
@@ -247,15 +232,7 @@ pub(crate) async fn dns_resolve(
                     break;
                 }
                 "quad9-doh" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_https(
-                        &[
-                            IpAddr::from([9, 9, 9, 9]),
-                            IpAddr::from([149, 112, 112, 112]),
-                        ],
-                        443,
-                        "dns.quad9.net".to_string(),
-                        true,
-                    ));
+                    server_config = Some(ResolverConfig::https(&QUAD9));
                     probe_endpoint = Some(DnsProbeEndpoint {
                         transport: DnsTransport::Doh,
                         ip: IpAddr::from([9, 9, 9, 9]),
@@ -267,12 +244,7 @@ pub(crate) async fn dns_resolve(
                 }
                 // DNS-over-TLS presets
                 "google-dot" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_tls(
-                        &[IpAddr::from([8, 8, 8, 8]), IpAddr::from([8, 8, 4, 4])],
-                        853,
-                        "dns.google".to_string(),
-                        true,
-                    ));
+                    server_config = Some(ResolverConfig::tls(&GOOGLE));
                     probe_endpoint = Some(DnsProbeEndpoint {
                         transport: DnsTransport::Dot,
                         ip: IpAddr::from([8, 8, 8, 8]),
@@ -283,12 +255,7 @@ pub(crate) async fn dns_resolve(
                     break;
                 }
                 "cloudflare-dot" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_tls(
-                        &[IpAddr::from([1, 1, 1, 1]), IpAddr::from([1, 0, 0, 1])],
-                        853,
-                        "cloudflare-dns.com".to_string(),
-                        true,
-                    ));
+                    server_config = Some(ResolverConfig::tls(&CLOUDFLARE));
                     probe_endpoint = Some(DnsProbeEndpoint {
                         transport: DnsTransport::Dot,
                         ip: IpAddr::from([1, 1, 1, 1]),
@@ -299,15 +266,7 @@ pub(crate) async fn dns_resolve(
                     break;
                 }
                 "quad9-dot" => {
-                    server_group = Some(NameServerConfigGroup::from_ips_tls(
-                        &[
-                            IpAddr::from([9, 9, 9, 9]),
-                            IpAddr::from([149, 112, 112, 112]),
-                        ],
-                        853,
-                        "dns.quad9.net".to_string(),
-                        true,
-                    ));
+                    server_config = Some(ResolverConfig::tls(&QUAD9));
                     probe_endpoint = Some(DnsProbeEndpoint {
                         transport: DnsTransport::Dot,
                         ip: IpAddr::from([9, 9, 9, 9]),
@@ -325,15 +284,15 @@ pub(crate) async fn dns_resolve(
             }
         }
         if !plain_ips.is_empty() {
-            server_group = Some(NameServerConfigGroup::from_ips_clear(&plain_ips, 53, true));
+            let servers: Vec<NameServerConfig> = plain_ips
+                .into_iter()
+                .map(NameServerConfig::udp_and_tcp)
+                .collect();
+            server_config = Some(ResolverConfig::from_parts(None, vec![], servers));
         }
     }
 
-    let mut builder = if let Some(group) = server_group {
-        let mut config = ResolverConfig::new();
-        for server in group.into_inner() {
-            config.add_name_server(server);
-        }
+    let mut builder = if let Some(config) = server_config {
         TokioResolver::builder_with_config(config, provider)
     } else {
         TokioResolver::builder(provider).map_err(|e| Error::Resolve { source: e })?
@@ -352,7 +311,7 @@ pub(crate) async fn dns_resolve(
     // the DNS server) and a derived `dns_query`. The probe is fire-and-forget
     // accurate — failures leave `dns_connect` as None and never block the
     // real resolver result.
-    let resolver = builder.build();
+    let resolver = builder.build().map_err(|e| Error::Resolve { source: e })?;
     let dns_timeout = req.dns_timeout.unwrap_or(Duration::from_secs(5));
     let dns_start = Instant::now();
     let lookup_fut = timeout(dns_timeout, resolver.lookup_ip(&lookup_host));
@@ -368,7 +327,7 @@ pub(crate) async fn dns_resolve(
         .map_err(|e| Error::Resolve { source: e })?;
     stat.dns_lookup = Some(dns_start.elapsed());
     stat.dns_connect = probe_result;
-    let addr = addr.into_iter().next().ok_or(Error::Common {
+    let addr = addr.iter().next().ok_or(Error::Common {
         category: "http".to_string(),
         message: "dns lookup failed".to_string(),
     })?;

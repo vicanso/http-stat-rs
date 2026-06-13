@@ -21,7 +21,9 @@ use super::finish_with_error;
 use super::grpc::grpc_request;
 use super::net::{dns_resolve, parse_certificates, quic_connect, tcp_connect, tls_handshake};
 use super::proxy::{http_connect, socks5_connect, ProxyConfig, ProxyKind};
-use super::stats::{parse_server_timing, HttpStat, ALPN_HTTP3, FIRST_CHUNK_BYTES};
+use super::stats::{
+    parse_alt_svc, parse_hsts, parse_server_timing, HttpStat, ALPN_HTTP3, FIRST_CHUNK_BYTES,
+};
 use super::HttpRequest;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
@@ -143,6 +145,25 @@ fn capture_server_timing(stat: &mut HttpStat, headers: &http::HeaderMap) {
         .collect();
     if !values.is_empty() {
         stat.server_timing = parse_server_timing(values.iter().copied());
+    }
+}
+
+/// Populate `stat.alt_svc` and `stat.hsts` from response headers.
+/// Pure header parse — no extra network cost.
+fn capture_protocol_advertisements(stat: &mut HttpStat, headers: &http::HeaderMap) {
+    let alt_svc_values: Vec<&str> = headers
+        .get_all("alt-svc")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if !alt_svc_values.is_empty() {
+        stat.alt_svc = parse_alt_svc(alt_svc_values.iter().copied());
+    }
+    if let Some(v) = headers
+        .get("strict-transport-security")
+        .and_then(|v| v.to_str().ok())
+    {
+        stat.hsts = parse_hsts(v);
     }
 }
 
@@ -375,6 +396,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         sub_stat.status = Some(resp.status());
         sub_stat.headers = Some(resp.headers().clone());
         capture_server_timing(&mut sub_stat, resp.headers());
+        capture_protocol_advertisements(&mut sub_stat, resp.headers());
 
         // Receive response body. Capture the first-100KB instant so we can
         // split throughput into "slow start" vs "steady state" later.
@@ -602,6 +624,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     stat.status = Some(resp.status());
     stat.headers = Some(resp.headers().clone());
     capture_server_timing(&mut stat, resp.headers());
+    capture_protocol_advertisements(&mut stat, resp.headers());
 
     // Check for connection errors
     if let Ok(error) = rx.try_recv() {
@@ -907,6 +930,7 @@ impl HttpConnection {
         stat.status = Some(resp.status());
         stat.headers = Some(resp.headers().clone());
         capture_server_timing(&mut stat, resp.headers());
+        capture_protocol_advertisements(&mut stat, resp.headers());
 
         // Read response body — frame-by-frame so we capture the
         // time-to-first-100K marker for throughput-split diagnosis (matches

@@ -143,6 +143,11 @@ pub struct HttpStat {
     /// steady-state rate the server can sustain.
     pub time_to_first_100k: Option<Duration>,
     pub server_timing: Option<Vec<ServerTiming>>,
+    /// Parsed `Alt-Svc` advertisements (RFC 7838). Tells the user "this
+    /// server announced h3 on port X" without requiring a second probe.
+    pub alt_svc: Option<Vec<AltSvc>>,
+    /// Parsed `Strict-Transport-Security` policy (RFC 6797).
+    pub hsts: Option<Hsts>,
     pub total: Option<Duration>,
     pub addr: Option<String>,
     pub grpc_status: Option<String>,
@@ -244,6 +249,114 @@ where
     } else {
         Some(out)
     }
+}
+
+/// A single entry from the `Alt-Svc` response header (RFC 7838).
+///
+/// Format: `protocol-id=authority; ma=<seconds>; persist=<0|1>`. Multiple
+/// entries are comma-separated; the special value `clear` (handled by the
+/// parser) clears the current advertisement set.
+#[derive(Debug, Clone)]
+pub struct AltSvc {
+    pub protocol: String,
+    pub authority: String,
+    pub max_age: Option<u64>,
+}
+
+/// Parsed `Strict-Transport-Security` directive (RFC 6797).
+#[derive(Debug, Clone)]
+pub struct Hsts {
+    pub max_age: u64,
+    pub include_subdomains: bool,
+    pub preload: bool,
+}
+
+/// Parse one or more `Alt-Svc` header values into a flat list.
+///
+/// Returns `None` if no entries were found. `clear` resets accumulation.
+pub fn parse_alt_svc<'a, I>(values: I) -> Option<Vec<AltSvc>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out: Vec<AltSvc> = Vec::new();
+    for raw in values {
+        for part in split_top_level_commas(raw) {
+            if part.eq_ignore_ascii_case("clear") {
+                out.clear();
+                continue;
+            }
+            let mut subparts = part.split(';').map(str::trim);
+            let head = match subparts.next() {
+                Some(h) if !h.is_empty() => h,
+                _ => continue,
+            };
+            let Some(eq) = head.find('=') else { continue };
+            let protocol = head[..eq].trim().to_string();
+            let mut authority = head[eq + 1..].trim().to_string();
+            if authority.starts_with('"') && authority.ends_with('"') && authority.len() >= 2 {
+                authority = authority[1..authority.len() - 1].to_string();
+            }
+            let mut entry = AltSvc {
+                protocol,
+                authority,
+                max_age: None,
+            };
+            for kv in subparts {
+                let Some(eq) = kv.find('=') else { continue };
+                let key = kv[..eq].trim().to_ascii_lowercase();
+                let val = kv[eq + 1..].trim().trim_matches('"');
+                if key == "ma" {
+                    if let Ok(n) = val.parse::<u64>() {
+                        entry.max_age = Some(n);
+                    }
+                }
+            }
+            out.push(entry);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Parse a single `Strict-Transport-Security` header value. Returns `None`
+/// if `max-age` is missing or unparseable (a directive without `max-age` is
+/// not a valid HSTS policy per RFC 6797 §6.1).
+pub fn parse_hsts(value: &str) -> Option<Hsts> {
+    let mut max_age: Option<u64> = None;
+    let mut include_subdomains = false;
+    let mut preload = false;
+    for part in value.split(';').map(str::trim) {
+        if part.is_empty() {
+            continue;
+        }
+        let (key, val) = match part.find('=') {
+            Some(eq) => (
+                part[..eq].trim().to_ascii_lowercase(),
+                Some(part[eq + 1..].trim().trim_matches('"')),
+            ),
+            None => (part.to_ascii_lowercase(), None),
+        };
+        match key.as_str() {
+            "max-age" => {
+                if let Some(v) = val {
+                    if let Ok(n) = v.parse::<u64>() {
+                        max_age = Some(n);
+                    }
+                }
+            }
+            "includesubdomains" => include_subdomains = true,
+            "preload" => preload = true,
+            _ => {}
+        }
+    }
+    max_age.map(|m| Hsts {
+        max_age: m,
+        include_subdomains,
+        preload,
+    })
 }
 
 /// Split on top-level commas, ignoring commas inside double-quoted strings.
@@ -692,6 +805,33 @@ impl HttpStat {
                 })
                 .collect();
             obj.insert("server_timing".into(), Value::Array(arr));
+        }
+
+        // Alt-Svc advertisements (RFC 7838)
+        if let Some(entries) = &self.alt_svc {
+            let arr: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    let mut m = Map::new();
+                    m.insert("protocol".into(), json!(e.protocol));
+                    m.insert("authority".into(), json!(e.authority));
+                    m.insert(
+                        "max_age_seconds".into(),
+                        e.max_age.map_or(Value::Null, |v| json!(v)),
+                    );
+                    Value::Object(m)
+                })
+                .collect();
+            obj.insert("alt_svc".into(), Value::Array(arr));
+        }
+
+        // HSTS policy (RFC 6797)
+        if let Some(h) = &self.hsts {
+            let mut m = Map::new();
+            m.insert("max_age_seconds".into(), json!(h.max_age));
+            m.insert("include_subdomains".into(), json!(h.include_subdomains));
+            m.insert("preload".into(), json!(h.preload));
+            obj.insert("hsts".into(), Value::Object(m));
         }
 
         // Connection
@@ -1191,6 +1331,46 @@ impl fmt::Display for HttpStat {
                 }
                 writeln!(f)?;
             }
+        }
+
+        // Protocol advertisements (Alt-Svc / HSTS).
+        // These are facts the server told us about itself — no extra
+        // network calls, just headers we already parsed.
+        if self.alt_svc.is_some() || self.hsts.is_some() {
+            writeln!(f, "{}", LightGreen.paint(s.protocol_adv_heading))?;
+            if let Some(entries) = &self.alt_svc {
+                for entry in entries {
+                    let ma = match entry.max_age {
+                        Some(ma) => format!("  ma={ma}s"),
+                        None => String::new(),
+                    };
+                    writeln!(
+                        f,
+                        "  {}  {}={}{}",
+                        s.alt_svc_label,
+                        LightCyan.paint(&entry.protocol),
+                        LightCyan.paint(&entry.authority),
+                        LightCyan.paint(ma),
+                    )?;
+                }
+            }
+            if let Some(h) = &self.hsts {
+                let mut flags = String::new();
+                if h.include_subdomains {
+                    flags.push_str("; includeSubDomains");
+                }
+                if h.preload {
+                    flags.push_str("; preload");
+                }
+                writeln!(
+                    f,
+                    "  {}  {}{}",
+                    s.hsts_label,
+                    LightCyan.paint(format!("max-age={}s", h.max_age)),
+                    LightCyan.paint(flags),
+                )?;
+            }
+            writeln!(f)?;
         }
 
         if self.waterfall {
