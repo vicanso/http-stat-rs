@@ -19,7 +19,7 @@ use crate::i18n::Lang;
 use crate::tcp_info::{TcpInfo, TcpInfoDelta};
 use bytes::Bytes;
 use bytesize::ByteSize;
-use chrono::{Local, TimeZone};
+use time::{OffsetDateTime, UtcOffset};
 use heck::ToTrainCase;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -37,11 +37,27 @@ pub static ALPN_HTTP2: &str = "h2";
 pub static ALPN_HTTP1: &str = "http/1.1";
 pub static ALPN_HTTP3: &str = "h3";
 
-// Format timestamp to human-readable string
+// Format a Unix timestamp (seconds) as "YYYY-MM-DD HH:MM:SS ±HH:MM" in the
+// local timezone. Falls back to UTC if the local offset can't be determined.
 pub(crate) fn format_time(timestamp_seconds: i64) -> String {
-    Local
-        .timestamp_nanos(timestamp_seconds * 1_000_000_000)
-        .to_string()
+    let Ok(utc) = OffsetDateTime::from_unix_timestamp(timestamp_seconds) else {
+        return timestamp_seconds.to_string();
+    };
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let dt = utc.to_offset(offset);
+    let (h, m, _) = offset.as_hms();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}{:02}:{:02}",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        if h < 0 || m < 0 { '-' } else { '+' },
+        h.unsigned_abs(),
+        m.unsigned_abs(),
+    )
 }
 
 pub fn format_duration(duration: Duration) -> String {

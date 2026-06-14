@@ -23,7 +23,6 @@ path = "bin/httpstat.rs"
 brotli-decompressor = "5.0.1"
 bytes = "1.11.1"
 bytesize = "2.3.1"
-chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib"] }
 futures = "0.3.32"
@@ -56,6 +55,11 @@ rustls-pki-types = "1.14.1"
 serde_json = "1.0.150"
 snafu = "0.9.1"
 tempfile = "3.27.0"
+time = { version = "0.3.49", default-features = false, features = [
+    "std",
+    "formatting",
+    "local-offset",
+] }
 tokio = { version = "1.52.3", features = ["rt", "net", "fs"] }
 tokio-rustls = { version = "0.26.4", features = [
     "ring",
