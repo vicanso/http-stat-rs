@@ -20,7 +20,7 @@
 - **内核 TCP 统计** — Linux 和 macOS 下会在 `connect(2)` 完成后和读完响应体后各采样一次 `getsockopt(TCP_INFO)`。`--verbose` 或独立的 `--tcp-info` 开关下展示 RTT / MSS / cwnd 以及本次请求期间的重传次数，可以把"Content Transfer 慢"判定到丢包、TCP 慢启动还是应用层延迟。经 HTTP/SOCKS 代理时采样反映客户端到代理的 socket，而非到源站。
 - **下载吞吐 + 慢启动拆分** — 响应体大于 1 MiB 时，会在 `Body size` 旁加一行 `Throughput: X MB/s`；`--verbose` 下进一步拆成"首 100 KB"与"后续"两段速率，可以把"TCP 慢启动主导"和"服务器流式推得慢"两类问题区分开。
 - **中英双语输出** — `--lang en|zh` 显式指定显示语言；不指定时自动读取 `LC_ALL` / `LC_MESSAGES` / `LANG`（`zh*` 走中文），无匹配则回退英文。JSON 输出始终保持英文键，避免影响下游脚本。
-- **JSON 输出** — `--json` 方便脚本集成、CI/CD 流水线和监控系统对接
+- **JSON 输出** — `--json` 方便脚本集成、CI/CD 流水线和监控系统对接。完整的输出契约见 [JSON_SCHEMA.md](./JSON_SCHEMA.md)，包含退出码、可选字段以及可直接复用的 `jq` 配方
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
 - **TLS 握手诊断** — 每次 HTTPS 请求都会报告握手类型（`Full` / `Resumed`）、服务器是否进行 OCSP stapling，以及在 `-n` 基准测试模式下后续请求是否接受了 0-RTT 早期数据
 - **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 重定向自动合并 `Set-Cookie`

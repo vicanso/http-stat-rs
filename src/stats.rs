@@ -322,7 +322,7 @@ where
 }
 
 /// Parse a single `Strict-Transport-Security` header value. Returns `None`
-/// if `max-age` is missing or unparseable (a directive without `max-age` is
+/// if `max-age` is missing or unparsable (a directive without `max-age` is
 /// not a valid HSTS policy per RFC 6797 §6.1).
 pub fn parse_hsts(value: &str) -> Option<Hsts> {
     let mut max_age: Option<u64> = None;
