@@ -19,7 +19,6 @@ use crate::i18n::Lang;
 use crate::tcp_info::{TcpInfo, TcpInfoDelta};
 use bytes::Bytes;
 use bytesize::ByteSize;
-use time::{OffsetDateTime, UtcOffset};
 use heck::ToTrainCase;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -30,6 +29,7 @@ use std::fmt;
 use std::io::Write;
 use std::time::Duration;
 use tempfile::NamedTempFile;
+use time::{OffsetDateTime, UtcOffset};
 use unicode_truncate::Alignment;
 use unicode_truncate::UnicodeTruncateStr;
 
