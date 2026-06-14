@@ -44,12 +44,14 @@ use tokio_rustls::TlsConnector;
 
 /// Transport used by a DoH/DoT preset, captured so we can run a parallel
 /// cold-connect probe and split `dns_lookup` into `dns_connect` + `dns_query`.
+#[cfg(feature = "doh")]
 #[derive(Debug, Clone, Copy)]
 enum DnsTransport {
     Doh,
     Dot,
 }
 
+#[cfg(feature = "doh")]
 #[derive(Debug, Clone)]
 struct DnsProbeEndpoint {
     transport: DnsTransport,
@@ -63,6 +65,7 @@ struct DnsProbeEndpoint {
 /// will surface real errors via `dns_lookup`. Designed to run in parallel
 /// with the resolver via `tokio::join!`, so it doesn't inflate wall-clock
 /// (the resolver's connect+query path dominates).
+#[cfg(feature = "doh")]
 async fn probe_dns_endpoint(ep: &DnsProbeEndpoint, max: Duration) -> Option<Duration> {
     let work = async move {
         let start = Instant::now();
@@ -187,6 +190,7 @@ pub(crate) async fn dns_resolve(
     let mut server_config: Option<ResolverConfig> = None;
     // When a DoH/DoT preset matches, remember its endpoint so we can probe
     // the cold connect cost in parallel with the actual resolver call.
+    #[cfg(feature = "doh")]
     let mut probe_endpoint: Option<DnsProbeEndpoint> = None;
     if let Some(dns_servers) = &req.dns_servers {
         let mut plain_ips: Vec<IpAddr> = vec![];
@@ -209,6 +213,7 @@ pub(crate) async fn dns_resolve(
                     break;
                 }
                 // DNS-over-HTTPS presets
+                #[cfg(feature = "doh")]
                 "google-doh" => {
                     server_config = Some(ResolverConfig::https(&GOOGLE));
                     probe_endpoint = Some(DnsProbeEndpoint {
@@ -220,6 +225,7 @@ pub(crate) async fn dns_resolve(
                     plain_ips.clear();
                     break;
                 }
+                #[cfg(feature = "doh")]
                 "cloudflare-doh" => {
                     server_config = Some(ResolverConfig::https(&CLOUDFLARE));
                     probe_endpoint = Some(DnsProbeEndpoint {
@@ -231,6 +237,7 @@ pub(crate) async fn dns_resolve(
                     plain_ips.clear();
                     break;
                 }
+                #[cfg(feature = "doh")]
                 "quad9-doh" => {
                     server_config = Some(ResolverConfig::https(&QUAD9));
                     probe_endpoint = Some(DnsProbeEndpoint {
@@ -243,6 +250,7 @@ pub(crate) async fn dns_resolve(
                     break;
                 }
                 // DNS-over-TLS presets
+                #[cfg(feature = "doh")]
                 "google-dot" => {
                     server_config = Some(ResolverConfig::tls(&GOOGLE));
                     probe_endpoint = Some(DnsProbeEndpoint {
@@ -254,6 +262,7 @@ pub(crate) async fn dns_resolve(
                     plain_ips.clear();
                     break;
                 }
+                #[cfg(feature = "doh")]
                 "cloudflare-dot" => {
                     server_config = Some(ResolverConfig::tls(&CLOUDFLARE));
                     probe_endpoint = Some(DnsProbeEndpoint {
@@ -265,6 +274,7 @@ pub(crate) async fn dns_resolve(
                     plain_ips.clear();
                     break;
                 }
+                #[cfg(feature = "doh")]
                 "quad9-dot" => {
                     server_config = Some(ResolverConfig::tls(&QUAD9));
                     probe_endpoint = Some(DnsProbeEndpoint {
@@ -315,13 +325,20 @@ pub(crate) async fn dns_resolve(
     let dns_timeout = req.dns_timeout.unwrap_or(Duration::from_secs(5));
     let dns_start = Instant::now();
     let lookup_fut = timeout(dns_timeout, resolver.lookup_ip(&lookup_host));
-    let probe_fut = async {
-        match &probe_endpoint {
-            Some(ep) => probe_dns_endpoint(ep, dns_timeout).await,
-            None => None,
-        }
+
+    #[cfg(feature = "doh")]
+    let (lookup_result, probe_result) = {
+        let probe_fut = async {
+            match &probe_endpoint {
+                Some(ep) => probe_dns_endpoint(ep, dns_timeout).await,
+                None => None,
+            }
+        };
+        tokio::join!(lookup_fut, probe_fut)
     };
-    let (lookup_result, probe_result) = tokio::join!(lookup_fut, probe_fut);
+    #[cfg(not(feature = "doh"))]
+    let (lookup_result, probe_result) = (lookup_fut.await, None::<Duration>);
+
     let addr = lookup_result
         .map_err(|e| Error::Timeout { source: e })?
         .map_err(|e| Error::Resolve { source: e })?;

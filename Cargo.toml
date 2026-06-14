@@ -19,6 +19,14 @@ name = "httpstat"
 path = "bin/httpstat.rs"
 
 
+[features]
+default = ["doh"]
+# DNS-over-HTTPS and DNS-over-TLS preset support
+# (`--dns-servers=cloudflare-doh`, `--dns-servers=cloudflare-dot`, etc.).
+# Default-on so the `httpstat` binary ships with full DoH/DoT support;
+# library consumers can drop it via `default-features = false`.
+doh = ["hickory-resolver/https-ring", "hickory-resolver/tls-ring"]
+
 [dependencies]
 brotli-decompressor = "5.0.1"
 bytes = "1.11.1"
@@ -29,10 +37,9 @@ futures = "0.3.32"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 heck = "0.5.0"
-hickory-resolver = { version = "0.26.1", features = [
+hickory-resolver = { version = "0.26.1", default-features = false, features = [
+    "system-config",
     "tokio",
-    "https-ring",
-    "tls-ring",
     "webpki-roots",
 ] }
 http = "1.4.2"
