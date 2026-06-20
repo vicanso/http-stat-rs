@@ -26,8 +26,9 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **TLS inspection** — verbose mode shows full certificate chain, cipher suite, SAN domains, and validity
 - **TLS handshake diagnostics** — every HTTPS request reports whether the handshake was `Full` or `Resumed`, whether the server stapled an OCSP response, and (in `-n` benchmark mode, where runs 2+ can resume) whether 0-RTT early data was accepted
 - **Cookie support** — `-b 'k=v'` or `-b @file`, auto-carried across `-L` redirects with `Set-Cookie` merging
+- **Standards-correct redirects** — `-L` follows up to 10 hops and resolves relative `Location` URLs; the request method downgrades per RFC 9110 (303 → GET, 301/302 POST → GET, 307/308 preserved) and `Authorization` is stripped when the redirect crosses to a different host
 - **ALPN negotiation display** — every response line shows the final protocol agreed between client and server (`HTTP/1.1`, `H2`, `H3`), so you always know which version was actually used
-- **JSON field selector** — `--jq '.items[].name'` extracts fields directly from the response body; no need to pipe through `jq`
+- **JSON field selector** — `--jq '.items[].name'` extracts fields directly from the response body (supports `.a.b`, `.[0]`, `.[]`); an unsupported filter or a non-JSON body prints a clear error instead of silently dumping the full body
 - **Pretty JSON** — `--pretty` formats the response body in-place; combine with `--jq` for focused, readable output
 - **Response header filtering** — `--include-header` shows only the headers you care about; `--exclude-header` hides the noisy ones
 - **curl-like UX** — familiar flags (`-H`, `-X`, `-d`, `-L`, `-k`, `-o`, `-4`/`-6`) for a smooth transition
@@ -37,6 +38,8 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **Source IP binding** — `--bind <IP>` pins outbound connections to a specific local address; essential for multi-NIC hosts, policy routing, or validating which interface reaches a target
 - **mTLS (mutual TLS)** — `--cert`/`--key` sends a client certificate for zero-trust and service mesh authentication
 - **Config file** — `~/.httpstatrc` sets persistent defaults (DNS, timeout, headers, etc.); CLI flags always win
+- **Fine-grained timeouts** — `--timeout` caps every phase; `--connect-timeout` bounds only the connection phase (DNS + TCP + TLS/QUIC); `--max-time` is an overall wall-clock cap covering the response body and any followed redirects
+- **Automatic retry** — `--retry N` retries transient failures (timeouts, connection errors, HTTP 408/429/500/502/503/504) with exponential backoff, or a fixed `--retry-delay`; ideal for flaky CI gates
 - **Semantic exit codes** — distinct codes for DNS, TCP, TLS, timeout, 4xx, 5xx failures for easy scripting
 - **Tiny binary** — release build uses LTO + `opt-level=z` + strip, typically < 5 MB
 - **Truly zero system dependencies** — statically linked, no libcurl, no OpenSSL, no libc on musl builds; drop the binary directly into a `scratch` or `alpine` Docker image for production diagnostics
@@ -154,8 +157,17 @@ httpstat --include-header content-type --include-header server https://example.c
 # Hide noisy response headers
 httpstat --exclude-header date --exclude-header via https://example.com
 
-# Set timeout
+# Set a timeout for every phase
 httpstat --timeout 5s https://example.com
+
+# Bound only the connection phase, plus an overall wall-clock cap
+httpstat --connect-timeout 3s --max-time 30s https://example.com
+
+# Retry transient failures with exponential backoff (great for CI gates)
+httpstat --retry 3 https://example.com
+
+# Retry with a fixed delay instead of backoff
+httpstat --retry 5 --retry-delay 2s https://example.com
 
 # mTLS — send client certificate
 httpstat --cert client.crt --key client.key https://mtls.example.com
@@ -211,18 +223,26 @@ Options:
       --dns-servers <DNS_SERVERS>  dns server address to use, format: 8.8.8.8,8.8.4.4; presets: google, cloudflare, quad9, google-doh, cloudflare-doh, quad9-doh, google-dot, cloudflare-dot, quad9-dot
   -v, --verbose                    verbose mode
       --pretty                     pretty mode
-      --timeout <TIMEOUT>          timeout
+      --waterfall                  show timing as a waterfall bar chart
+      --tcp-info                   show kernel TCP_INFO stats (RTT, cwnd, retransmits); Linux + macOS
+      --lang <LANG>                display language: en | zh (default: system)
+      --timeout <TIMEOUT>          timeout for every phase (DNS, TCP, TLS, request, QUIC)
+      --connect-timeout <DUR>      max time for the connection phase only (DNS + TCP + TLS/QUIC), e.g. 5s
+      --max-time <DUR>             overall time limit for the whole operation incl. body and redirects, e.g. 30s
+      --retry <RETRY>              retry up to N times on transient failure (timeout, conn error, 408/429/5xx)
+      --retry-delay <DUR>          fixed delay between retries (e.g. 2s); default is exponential backoff
   -n, --count <COUNT>              number of requests for benchmarking, show min/max/avg/p50/p95/p99 stats
   -K, --reuse                      reuse connection in benchmark mode (requires -n), test warm request performance
   -b, --cookie <COOKIE>            send cookies: 'name=value; name2=value2' or from file use @filename
       --json                       output results as JSON for scripting and CI/CD
-      --include-header <HEADER>    only show these response headers (repeatable, case-insensitive)
-      --exclude-header <HEADER>    hide these response headers (repeatable, case-insensitive)
-      --waterfall                  show timing as a waterfall bar chart
-      --connect-to <CONNECT_TO>    redirect HOST1:PORT1 to HOST2:PORT2 (repeatable, IPv6 uses [addr])
+      --connect-to <CONNECT_TO>    redirect HOST1:PORT1 to HOST2:PORT2 (repeatable); TLS SNI and Host header stay unchanged
       --proxy <PROXY>              proxy URL: http://host:port, https://host:port, socks5://host:port
       --cert <CERT>                client certificate for mTLS (PEM file)
       --key <KEY>                  client private key for mTLS (PEM file)
+      --bind <BIND>                bind to a specific local IP address (e.g. 192.168.1.100 or ::1)
+      --jq <JQ>                    filter JSON response body with a jq-style selector (e.g. ".items[].name")
+      --include-header <HEADER>    only show these response headers (repeatable, case-insensitive)
+      --exclude-header <HEADER>    hide these response headers (repeatable, case-insensitive)
   -h, --help                       Print help
   -V, --version                    Print version
 ```
@@ -238,6 +258,10 @@ Create `~/.httpstatrc` as a JSON object — any field can be omitted. CLI flags 
   "compressed": true,
   "dns_servers": "cloudflare",
   "timeout": "10s",
+  "connect_timeout": "5s",
+  "max_time": "30s",
+  "retry": 3,
+  "retry_delay": "2s",
   "verbose": false,
   "pretty": false,
   "silent": false,

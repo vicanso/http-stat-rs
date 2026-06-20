@@ -188,7 +188,7 @@ classify failures without parsing the `error` string.
 | `2` | DNS failure | `dns_lookup` phase never completed. |
 | `3` | TCP/QUIC failure | Connect phase never completed. |
 | `4` | TLS failure | Handshake / cert / SNI error. |
-| `5` | Timeout | Any phase exceeded its deadline. |
+| `5` | Timeout | A per-phase timeout or the overall `--max-time` deadline was exceeded. |
 | `6` | HTTP 4xx | Successful transport, client-error status. |
 | `7` | HTTP 5xx | Successful transport, server-error status. |
 

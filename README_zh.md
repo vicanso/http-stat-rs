@@ -24,8 +24,9 @@
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
 - **TLS 握手诊断** — 每次 HTTPS 请求都会报告握手类型（`Full` / `Resumed`）、服务器是否进行 OCSP stapling，以及在 `-n` 基准测试模式下后续请求是否接受了 0-RTT 早期数据
 - **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 重定向自动合并 `Set-Cookie`
+- **符合规范的重定向** — `-L` 最多跟随 10 跳并解析相对 `Location`；请求方法按 RFC 9110 降级（303 → GET，301/302 的 POST → GET，307/308 保持不变），跨 host 重定向时剥离 `Authorization`，避免凭据泄露给第三方
 - **ALPN 协议协商展示** — 每次响应明确显示客户端与服务端最终协商出的协议版本（`HTTP/1.1`、`H2`、`H3`），清楚知道实际使用了哪个版本
-- **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段，无需额外管道 `jq`
+- **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段（支持 `.a.b`、`.[0]`、`.[]`）；遇到不支持的语法或非 JSON 响应体会明确报错，而不是静默输出完整 body
 - **JSON 格式化输出** — `--pretty` 原地美化响应体；配合 `--jq` 使用，输出更聚焦、更易读
 - **响应头过滤** — `--include-header` 只显示关注的响应头；`--exclude-header` 隐藏噪音字段
 - **curl 风格操作** — 熟悉的参数（`-H`、`-X`、`-d`、`-L`、`-k`、`-o`、`-4`/`-6`），无缝上手
@@ -35,6 +36,8 @@
 - **源 IP 绑定** — `--bind <IP>` 将出站连接绑定到指定本地地址，多网卡环境、策略路由或验证特定网卡可达性时不可或缺
 - **mTLS（双向 TLS）** — `--cert`/`--key` 发送客户端证书，适用于零信任网络和服务网格
 - **配置文件** — `~/.httpstatrc` 设置持久化默认值（DNS、超时、请求头等），CLI 参数始终优先
+- **细粒度超时** — `--timeout` 作用于每个阶段；`--connect-timeout` 仅限制连接阶段（DNS + TCP + TLS/QUIC）；`--max-time` 是覆盖响应体与重定向的整体墙钟上限
+- **自动重试** — `--retry N` 对瞬时失败（超时、连接错误、HTTP 408/429/500/502/503/504）按指数退避重试，或用 `--retry-delay` 指定固定间隔；适合不稳定的 CI 门禁
 - **语义化退出码** — DNS、TCP、TLS、超时、4xx、5xx 各有独立退出码，脚本判断更便捷
 - **极小体积** — release 构建采用 LTO + `opt-level=z` + strip，通常 < 5 MB
 - **真正的零系统依赖** — 静态链接，不依赖 libcurl、OpenSSL 或 libc（musl 构建），可直接放入 `scratch` 或 `alpine` Docker 镜像用于生产环境排查
@@ -152,8 +155,17 @@ httpstat --include-header content-type --include-header server https://example.c
 # 隐藏特定响应头
 httpstat --exclude-header date --exclude-header via https://example.com
 
-# 设置超时时间
+# 为每个阶段设置超时
 httpstat --timeout 5s https://example.com
+
+# 仅限制连接阶段，并单独设置整体墙钟上限
+httpstat --connect-timeout 3s --max-time 30s https://example.com
+
+# 对瞬时失败按指数退避重试（适合 CI 门禁）
+httpstat --retry 3 https://example.com
+
+# 用固定间隔重试，而非退避
+httpstat --retry 5 --retry-delay 2s https://example.com
 
 # mTLS — 发送客户端证书
 httpstat --cert client.crt --key client.key https://mtls.example.com
@@ -209,16 +221,26 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
       --dns-servers <DNS_SERVERS>  指定 DNS 服务器，格式：8.8.8.8,8.8.4.4；预设：google、cloudflare、quad9、google-doh、cloudflare-doh、quad9-doh、google-dot、cloudflare-dot、quad9-dot
   -v, --verbose                    详细模式
       --pretty                     格式化输出模式
-      --timeout <TIMEOUT>          超时时间
+      --waterfall                  以 waterfall 条形图展示各阶段耗时
+      --tcp-info                   显示内核 TCP_INFO 统计（RTT、cwnd、重传）；仅 Linux + macOS
+      --lang <LANG>                显示语言：en | zh（默认跟随系统）
+      --timeout <TIMEOUT>          超时时间（作用于每个阶段：DNS、TCP、TLS、请求、QUIC）
+      --connect-timeout <DUR>      仅连接阶段的超时（DNS + TCP + TLS/QUIC），例如 5s
+      --max-time <DUR>             整个操作（含响应体与重定向）的总时限，例如 30s
+      --retry <RETRY>              瞬时失败时最多重试 N 次（超时、连接错误、408/429/5xx）
+      --retry-delay <DUR>          重试之间的固定间隔（例如 2s）；默认使用指数退避
   -n, --count <COUNT>              基准测试请求次数，输出 min/max/avg/p50/p95/p99 统计
   -K, --reuse                      基准测试中复用连接（需配合 -n），测试热请求性能
   -b, --cookie <COOKIE>            发送 Cookie：'name=value; name2=value2' 或从文件读取 @filename
       --json                       以 JSON 格式输出结果，方便脚本和 CI/CD 使用
-      --include-header <HEADER>    只显示指定响应头（可重复，不区分大小写）
-      --exclude-header <HEADER>    隐藏指定响应头（可重复，不区分大小写）
+      --connect-to <CONNECT_TO>    在 TCP 层将 HOST1:PORT1 重定向到 HOST2:PORT2（可重复）；TLS SNI 与 Host 头保持不变
       --proxy <PROXY>              代理 URL：http://host:port、https://host:port、socks5://host:port
       --cert <CERT>                mTLS 客户端证书（PEM 文件）
       --key <KEY>                  mTLS 客户端私钥（PEM 文件）
+      --bind <BIND>                绑定到指定本地 IP（例如 192.168.1.100 或 ::1）
+      --jq <JQ>                    用 jq 风格选择器过滤 JSON 响应体（例如 ".items[].name"）
+      --include-header <HEADER>    只显示指定响应头（可重复，不区分大小写）
+      --exclude-header <HEADER>    隐藏指定响应头（可重复，不区分大小写）
   -h, --help                       显示帮助信息
   -V, --version                    显示版本信息
 ```
@@ -234,6 +256,10 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
   "compressed": true,
   "dns_servers": "cloudflare",
   "timeout": "10s",
+  "connect_timeout": "5s",
+  "max_time": "30s",
+  "retry": 3,
+  "retry_delay": "2s",
   "verbose": false,
   "pretty": false,
   "silent": false,
