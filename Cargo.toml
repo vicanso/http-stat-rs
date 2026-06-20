@@ -1,6 +1,6 @@
 [package]
 name = "http-stat"
-version = "0.6.3"
+version = "0.7.0"
 authors = ["Tree Xie <tree.xie@outlook.com>"]
 edition = "2021"
 categories = ["web-programming"]
