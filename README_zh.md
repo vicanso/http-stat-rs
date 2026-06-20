@@ -26,6 +26,7 @@
 - **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 重定向自动合并 `Set-Cookie`
 - **符合规范的重定向** — `-L` 最多跟随 10 跳并解析相对 `Location`；请求方法按 RFC 9110 降级（303 → GET，301/302 的 POST → GET，307/308 保持不变），跨 host 重定向时剥离 `Authorization`，避免凭据泄露给第三方
 - **ALPN 协议协商展示** — 每次响应明确显示客户端与服务端最终协商出的协议版本（`HTTP/1.1`、`H2`、`H3`），清楚知道实际使用了哪个版本
+- **Alt-Svc 自动升级** — `--alt-svc` 检测响应中广告的 HTTP/3 端点（RFC 7838），自动用 h3 重试一次，无需手动 `--http3` 就能看到真实的 h3 耗时
 - **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段（支持 `.a.b`、`.[0]`、`.[]`）；遇到不支持的语法或非 JSON 响应体会明确报错，而不是静默输出完整 body
 - **JSON 格式化输出** — `--pretty` 原地美化响应体；配合 `--jq` 使用，输出更聚焦、更易读
 - **响应头过滤** — `--include-header` 只显示关注的响应头；`--exclude-header` 隐藏噪音字段
@@ -106,6 +107,9 @@ httpstat https://www.cloudflare.com/
 
 # HTTP/3 (QUIC) + 压缩响应
 httpstat --http3 --compressed https://cloudflare-quic.com/
+
+# 当服务器通过 Alt-Svc 广告 HTTP/3 时自动升级
+httpstat --alt-svc https://cloudflare.com
 
 # 多 IP 并发测试，静默模式
 httpstat --resolve=183.240.99.169,2409:8c54:870:310:0:ff:b0ed:40ac -s https://www.baidu.com/
@@ -217,6 +221,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
       --http3                      使用 HTTP/3
       --http2                      使用 HTTP/2
       --http1                      使用 HTTP/1.1
+      --alt-svc                    若响应通过 Alt-Svc 广告 HTTP/3，则用 h3 重试一次
   -s                               静默模式，仅输出连接地址和结果
       --dns-servers <DNS_SERVERS>  指定 DNS 服务器，格式：8.8.8.8,8.8.4.4；预设：google、cloudflare、quad9、google-doh、cloudflare-doh、quad9-doh、google-dot、cloudflare-dot、quad9-dot
   -v, --verbose                    详细模式
@@ -268,6 +273,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
   "http1": false,
   "http2": false,
   "http3": false,
+  "alt_svc": false,
   "json": false,
   "headers": ["Accept: application/json"],
   "include_header": [],

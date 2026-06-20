@@ -28,6 +28,7 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **Cookie support** — `-b 'k=v'` or `-b @file`, auto-carried across `-L` redirects with `Set-Cookie` merging
 - **Standards-correct redirects** — `-L` follows up to 10 hops and resolves relative `Location` URLs; the request method downgrades per RFC 9110 (303 → GET, 301/302 POST → GET, 307/308 preserved) and `Authorization` is stripped when the redirect crosses to a different host
 - **ALPN negotiation display** — every response line shows the final protocol agreed between client and server (`HTTP/1.1`, `H2`, `H3`), so you always know which version was actually used
+- **Alt-Svc auto-upgrade** — `--alt-svc` detects an advertised HTTP/3 endpoint (RFC 7838) in the response and automatically retries once over h3, so you see the real h3 timing without manually passing `--http3`
 - **JSON field selector** — `--jq '.items[].name'` extracts fields directly from the response body (supports `.a.b`, `.[0]`, `.[]`); an unsupported filter or a non-JSON body prints a clear error instead of silently dumping the full body
 - **Pretty JSON** — `--pretty` formats the response body in-place; combine with `--jq` for focused, readable output
 - **Response header filtering** — `--include-header` shows only the headers you care about; `--exclude-header` hides the noisy ones
@@ -108,6 +109,9 @@ httpstat https://www.cloudflare.com/
 
 # HTTP/3 (QUIC) with compressed response
 httpstat --http3 --compressed https://cloudflare-quic.com/
+
+# Auto-upgrade to HTTP/3 when the server advertises it via Alt-Svc
+httpstat --alt-svc https://cloudflare.com
 
 # Test multiple IPs concurrently in silent mode
 httpstat --resolve=183.240.99.169,2409:8c54:870:310:0:ff:b0ed:40ac -s https://www.baidu.com/
@@ -219,6 +223,7 @@ Options:
       --http3                      use http/3
       --http2                      use http/2
       --http1                      use http/1.1
+      --alt-svc                    if the response advertises HTTP/3 via Alt-Svc, retry once over h3
   -s                               silent mode, only output the connect address and result
       --dns-servers <DNS_SERVERS>  dns server address to use, format: 8.8.8.8,8.8.4.4; presets: google, cloudflare, quad9, google-doh, cloudflare-doh, quad9-doh, google-dot, cloudflare-dot, quad9-dot
   -v, --verbose                    verbose mode
@@ -270,6 +275,7 @@ Create `~/.httpstatrc` as a JSON object — any field can be omitted. CLI flags 
   "http1": false,
   "http2": false,
   "http3": false,
+  "alt_svc": false,
   "json": false,
   "headers": ["Accept: application/json"],
   "include_header": [],

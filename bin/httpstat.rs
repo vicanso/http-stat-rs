@@ -108,6 +108,14 @@ struct Args {
     #[arg(long = "http1", help = "use http/1.1")]
     http1: bool,
 
+    /// Auto-upgrade to HTTP/3 when the response advertises an h3 endpoint via
+    /// Alt-Svc (RFC 7838), retrying the request once over h3.
+    #[arg(
+        long = "alt-svc",
+        help = "if the response advertises HTTP/3 via Alt-Svc, retry once over h3"
+    )]
+    alt_svc: bool,
+
     /// Silent mode
     #[arg(
         short = 's',
@@ -318,6 +326,7 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
     cfg_bool!(http2);
     cfg_bool!(http3);
     cfg_bool!(json);
+    cfg_bool!(alt_svc);
     // Optional strings: config fills in when CLI left them None
     cfg_opt_str!(dns_servers);
     cfg_opt_str!(timeout);
@@ -686,6 +695,115 @@ where
     }
 }
 
+/// Parse an Alt-Svc `authority` (`[host]:port`, host optional) into
+/// `(host, port)`. An empty host means "same as the origin".
+fn parse_alt_authority(authority: &str) -> Option<(String, u16)> {
+    let (host, port_str) = authority.rsplit_once(':')?;
+    let port: u16 = port_str.trim().parse().ok()?;
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    Some((host.to_string(), port))
+}
+
+/// Find an advertised HTTP/3 endpoint in a response's `Alt-Svc` list, if any.
+fn h3_endpoint(stat: &HttpStat) -> Option<(String, u16)> {
+    stat.alt_svc
+        .as_ref()?
+        .iter()
+        .find(|e| e.protocol == "h3")
+        .and_then(|e| parse_alt_authority(&e.authority))
+}
+
+/// Format an Alt-Svc endpoint for display (`:443`, `host:443`, `[::1]:443`).
+fn fmt_alt_endpoint(host: &str, port: u16) -> String {
+    if host.is_empty() {
+        format!(":{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Rewrite `req` to attempt the advertised HTTP/3 endpoint: force the h3 ALPN
+/// and, when the endpoint differs from the origin, add a connect-to override so
+/// the TCP/QUIC target changes while TLS SNI and the Host header stay on the
+/// origin (the Alt-Svc contract).
+fn apply_alt_endpoint(req: &mut HttpRequest, alt_host: &str, alt_port: u16) {
+    req.alpn_protocols = vec![ALPN_HTTP3.to_string()];
+    let origin_host = req.uri.host().unwrap_or("").to_string();
+    let origin_port = req.get_port();
+    let target_host = if alt_host.is_empty() {
+        origin_host.as_str()
+    } else {
+        alt_host
+    };
+    if target_host != origin_host || alt_port != origin_port {
+        req.connect_to = vec![format!(
+            "{}:{}",
+            fmt_alt_endpoint(&origin_host, origin_port),
+            fmt_alt_endpoint(target_host, alt_port)
+        )];
+    }
+}
+
+/// Per-invocation options shared by the single-request and `--resolve` paths.
+struct RunOpts {
+    follow_redirect: bool,
+    max_time: Option<std::time::Duration>,
+    retries: usize,
+    retry_delay: Option<std::time::Duration>,
+    alt_svc: bool,
+}
+
+/// Run one request through retry + max-time, then optionally upgrade to HTTP/3
+/// when `--alt-svc` is set and the response advertised an h3 endpoint. On a
+/// failed upgrade the original result is kept (with a note on stderr).
+async fn run_request(req: HttpRequest, opts: &RunOpts) -> HttpStat {
+    let forced_h3 = req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3);
+    let stat = run_with_retry(
+        || with_max_time(do_request(req.clone(), opts.follow_redirect), opts.max_time),
+        opts.retries,
+        opts.retry_delay,
+    )
+    .await;
+
+    if !opts.alt_svc || forced_h3 {
+        return stat;
+    }
+    let Some((host, port)) = h3_endpoint(&stat) else {
+        return stat;
+    };
+
+    let mut h3_req = req;
+    apply_alt_endpoint(&mut h3_req, &host, port);
+    let h3_stat = run_with_retry(
+        || {
+            with_max_time(
+                do_request(h3_req.clone(), opts.follow_redirect),
+                opts.max_time,
+            )
+        },
+        opts.retries,
+        opts.retry_delay,
+    )
+    .await;
+
+    if h3_stat.error.is_none() {
+        eprintln!(
+            "alt-svc: upgraded to HTTP/3 via {}",
+            fmt_alt_endpoint(&host, port)
+        );
+        h3_stat
+    } else {
+        eprintln!(
+            "alt-svc: HTTP/3 upgrade to {} failed ({}); showing original result",
+            fmt_alt_endpoint(&host, port),
+            h3_stat.error.as_deref().unwrap_or("unknown")
+        );
+        stat
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = Args::parse();
@@ -761,6 +879,13 @@ async fn main() {
         .as_deref()
         .map(|v| parse_dur("retry-delay", v));
     let follow_redirect = args.follow_redirect;
+    let run_opts = RunOpts {
+        follow_redirect,
+        max_time,
+        retries,
+        retry_delay,
+        alt_svc: args.alt_svc,
+    };
 
     // Parse headers if provided
     if !args.headers.is_empty() {
@@ -939,11 +1064,7 @@ async fn main() {
                 continue;
             };
             req.resolve = Some(ip);
-            futs.push(run_with_retry(
-                move || with_max_time(do_request(req.clone(), follow_redirect), max_time),
-                retries,
-                retry_delay,
-            ));
+            futs.push(run_request(req, &run_opts));
         }
         let mut stats_list = futures::future::join_all(futs).await;
         // error request last
@@ -1076,12 +1197,7 @@ async fn main() {
             println!("{summary}");
         }
     } else {
-        let mut stat = run_with_retry(
-            || with_max_time(do_request(req.clone(), follow_redirect), max_time),
-            retries,
-            retry_delay,
-        )
-        .await;
+        let mut stat = run_request(req, &run_opts).await;
         if json_output {
             println!(
                 "{}",
@@ -1428,5 +1544,85 @@ mod tests {
         let stat = run_with_retry(make, 5, Some(std::time::Duration::from_millis(1))).await;
         assert_eq!(stat.exit_code(), 6); // 404 → no retry
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- Alt-Svc auto-upgrade ----
+    #[test]
+    fn parse_alt_authority_forms() {
+        assert_eq!(parse_alt_authority(":443"), Some((String::new(), 443)));
+        assert_eq!(
+            parse_alt_authority("alt.example.com:8443"),
+            Some(("alt.example.com".to_string(), 8443))
+        );
+        assert_eq!(
+            parse_alt_authority("[::1]:443"),
+            Some(("::1".to_string(), 443))
+        );
+        assert!(parse_alt_authority("noport").is_none());
+        assert!(parse_alt_authority(":notnum").is_none());
+    }
+
+    #[test]
+    fn h3_endpoint_picks_h3() {
+        let stat = HttpStat {
+            alt_svc: Some(vec![
+                http_stat::AltSvc {
+                    protocol: "h2".into(),
+                    authority: ":443".into(),
+                    max_age: None,
+                },
+                http_stat::AltSvc {
+                    protocol: "h3".into(),
+                    authority: ":8443".into(),
+                    max_age: Some(86400),
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(h3_endpoint(&stat), Some((String::new(), 8443)));
+
+        let no_h3 = HttpStat {
+            alt_svc: Some(vec![http_stat::AltSvc {
+                protocol: "h2".into(),
+                authority: ":443".into(),
+                max_age: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(h3_endpoint(&no_h3).is_none());
+        assert!(h3_endpoint(&HttpStat::default()).is_none());
+    }
+
+    #[test]
+    fn fmt_alt_endpoint_forms() {
+        assert_eq!(fmt_alt_endpoint("", 443), ":443");
+        assert_eq!(fmt_alt_endpoint("h", 8443), "h:8443");
+        assert_eq!(fmt_alt_endpoint("::1", 443), "[::1]:443");
+    }
+
+    #[test]
+    fn apply_alt_endpoint_same_origin_needs_no_connect_to() {
+        let mut req = HttpRequest::try_from("https://example.com").unwrap();
+        apply_alt_endpoint(&mut req, "", 443); // same host, same default port
+        assert_eq!(req.alpn_protocols, vec![ALPN_HTTP3.to_string()]);
+        assert!(req.connect_to.is_empty());
+    }
+
+    #[test]
+    fn apply_alt_endpoint_different_endpoint_uses_connect_to() {
+        // different port, same host
+        let mut req = HttpRequest::try_from("https://example.com").unwrap();
+        apply_alt_endpoint(&mut req, "", 8443);
+        assert_eq!(
+            req.connect_to,
+            vec!["example.com:443:example.com:8443".to_string()]
+        );
+        // different host
+        let mut req2 = HttpRequest::try_from("https://example.com").unwrap();
+        apply_alt_endpoint(&mut req2, "alt.example.com", 443);
+        assert_eq!(
+            req2.connect_to,
+            vec!["example.com:443:alt.example.com:443".to_string()]
+        );
     }
 }
