@@ -310,7 +310,8 @@ mod tests {
     fn connect_to_rejects_malformed() {
         assert!(ConnectTo::parse("example.com").is_none()); // no ':' after host
         assert!(ConnectTo::parse("example.com:443").is_none()); // missing destination
-        assert!(ConnectTo::parse("example.com:notaport:1.2.3.4:8443").is_none()); // bad src port
+        assert!(ConnectTo::parse("example.com:notaport:1.2.3.4:8443").is_none());
+        // bad src port
     }
 
     // ---- HttpRequest::try_from ----

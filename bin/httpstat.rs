@@ -341,6 +341,55 @@ fn collect_cookies(stat: &HttpStat, existing: &str) -> String {
         .join("; ")
 }
 
+/// Decide whether a redirect with `status` should rewrite the request to GET
+/// and drop its body, matching curl/browser behavior:
+/// - 303 See Other: switch to GET, except HEAD stays HEAD (RFC 9110 §15.4.4)
+/// - 301/302: downgrade POST to GET (de-facto web convention)
+/// - 307/308: preserve the method and body verbatim
+fn redirect_downgrades_to_get(status: StatusCode, method: &str) -> bool {
+    match status {
+        StatusCode::SEE_OTHER => !method.eq_ignore_ascii_case("HEAD"),
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => method.eq_ignore_ascii_case("POST"),
+        _ => false,
+    }
+}
+
+/// Resolve a redirect `Location` against the request's current URI, covering
+/// the common RFC 3986 reference forms: absolute URLs, scheme-relative
+/// (`//host/path`), absolute-path (`/path`), and relative-path references.
+/// Returns `None` for an empty location or when the base lacks scheme/authority.
+fn resolve_redirect(base: &Uri, location: &str) -> Option<Uri> {
+    let location = location.trim();
+    if location.is_empty() {
+        return None;
+    }
+    // Already absolute (has both scheme and authority).
+    if let Ok(uri) = location.parse::<Uri>() {
+        if uri.scheme().is_some() && uri.authority().is_some() {
+            return Some(uri);
+        }
+    }
+    let scheme = base.scheme_str()?;
+    let authority = base.authority()?.as_str();
+    if let Some(rest) = location.strip_prefix("//") {
+        // Scheme-relative: //host/path
+        format!("{scheme}://{rest}").parse().ok()
+    } else if location.starts_with('/') {
+        // Absolute path on the same authority.
+        format!("{scheme}://{authority}{location}").parse().ok()
+    } else {
+        // Relative path: resolve against the base path's directory.
+        let base_path = base.path();
+        let dir = match base_path.rfind('/') {
+            Some(i) => &base_path[..=i],
+            None => "/",
+        };
+        format!("{scheme}://{authority}{dir}{location}")
+            .parse()
+            .ok()
+    }
+}
+
 async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
     let mut stat = request(req.clone()).await;
     if follow_redirect {
@@ -357,16 +406,48 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
             {
                 break;
             }
-            let redirect_url = stat
+            let location = stat
                 .headers
                 .as_ref()
-                .and_then(|header| header.get("Location"))
-                .map(|value| value.to_str().unwrap_or(""))
-                .unwrap_or("");
-            if redirect_url.is_empty() {
+                .and_then(|header| header.get(http::header::LOCATION))
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let Some(new_uri) = resolve_redirect(&req.uri, &location) else {
                 break;
+            };
+
+            // Method/body rewrite per RFC 9110 (see redirect_downgrades_to_get).
+            // When downgrading to GET we must also drop the request body and any
+            // body-describing headers the user supplied, so we don't send a
+            // stale Content-Length / Content-Type with a now-empty GET.
+            let current_method = req.method.as_deref().unwrap_or("GET");
+            if redirect_downgrades_to_get(status, current_method) {
+                req.method = Some("GET".to_string());
+                req.body = None;
+                if let Some(h) = req.headers.as_mut() {
+                    h.remove(http::header::CONTENT_TYPE);
+                    h.remove(http::header::CONTENT_LENGTH);
+                    h.remove(http::header::TRANSFER_ENCODING);
+                }
             }
-            // Carry cookies across redirects
+
+            // Drop credentials when the redirect crosses to a different host, so
+            // an Authorization header isn't leaked to a third party (curl strips
+            // it too unless --location-trusted is given).
+            let same_host = req
+                .uri
+                .host()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(new_uri.host().unwrap_or_default());
+            if !same_host {
+                if let Some(h) = req.headers.as_mut() {
+                    h.remove(http::header::AUTHORIZATION);
+                }
+            }
+
+            // Carry cookies across the redirect (this hop's Set-Cookie merged
+            // into the forwarded Cookie header).
             let existing_cookie = req
                 .headers
                 .as_ref()
@@ -381,10 +462,9 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
                     header_map.insert(http::header::COOKIE, value);
                 }
             }
-            if let Ok(uri) = redirect_url.parse::<Uri>() {
-                req.uri = uri;
-                stat = request(req.clone()).await;
-            }
+
+            req.uri = new_uri;
+            stat = request(req.clone()).await;
         }
     }
     stat
@@ -951,5 +1031,67 @@ mod tests {
             args.headers,
             vec!["X-Config: 0".to_string(), "X-Cli: 1".to_string()]
         );
+    }
+
+    // ---- redirect_downgrades_to_get ----
+    #[test]
+    fn redirect_303_forces_get_except_head() {
+        assert!(redirect_downgrades_to_get(StatusCode::SEE_OTHER, "POST"));
+        assert!(redirect_downgrades_to_get(StatusCode::SEE_OTHER, "GET"));
+        assert!(redirect_downgrades_to_get(StatusCode::SEE_OTHER, "PUT"));
+        // HEAD is preserved across a 303
+        assert!(!redirect_downgrades_to_get(StatusCode::SEE_OTHER, "HEAD"));
+    }
+
+    #[test]
+    fn redirect_301_302_downgrade_only_post() {
+        for s in [StatusCode::MOVED_PERMANENTLY, StatusCode::FOUND] {
+            assert!(redirect_downgrades_to_get(s, "POST"));
+            assert!(!redirect_downgrades_to_get(s, "GET"));
+            assert!(!redirect_downgrades_to_get(s, "PUT"));
+        }
+    }
+
+    #[test]
+    fn redirect_307_308_preserve_method() {
+        for s in [
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            assert!(!redirect_downgrades_to_get(s, "POST"));
+            assert!(!redirect_downgrades_to_get(s, "GET"));
+        }
+    }
+
+    // ---- resolve_redirect ----
+    #[test]
+    fn resolve_redirect_forms() {
+        let base: Uri = "http://example.com/a/b".parse().unwrap();
+        // absolute URL is used as-is
+        assert_eq!(
+            resolve_redirect(&base, "https://other.com/x")
+                .unwrap()
+                .to_string(),
+            "https://other.com/x"
+        );
+        // scheme-relative inherits the base scheme
+        assert_eq!(
+            resolve_redirect(&base, "//cdn.example.com/y")
+                .unwrap()
+                .to_string(),
+            "http://cdn.example.com/y"
+        );
+        // absolute path keeps the base authority and carries the query
+        assert_eq!(
+            resolve_redirect(&base, "/x?q=1").unwrap().to_string(),
+            "http://example.com/x?q=1"
+        );
+        // relative path resolves against the base path's directory
+        assert_eq!(
+            resolve_redirect(&base, "c").unwrap().to_string(),
+            "http://example.com/a/c"
+        );
+        // empty location is rejected
+        assert!(resolve_redirect(&base, "").is_none());
     }
 }
