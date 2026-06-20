@@ -148,13 +148,8 @@ pub struct HttpRequest {
 
 impl HttpRequest {
     pub fn get_port(&self) -> u16 {
-        let schema = if let Some(scheme) = self.uri.scheme() {
-            scheme.to_string()
-        } else {
-            "".to_string()
-        };
-
-        let default_port = if ["https", "grpcs"].contains(&schema.as_str()) {
+        let scheme = self.uri.scheme_str().unwrap_or("");
+        let default_port = if matches!(scheme, "https" | "grpcs") {
             443
         } else {
             80
@@ -186,7 +181,9 @@ impl HttpRequest {
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
                 builder = builder.header(key, value);
-                match key.to_string().to_lowercase().as_str() {
+                // HeaderName::as_str() is always canonical lower-case, so no
+                // allocation or explicit lowercasing is needed here.
+                match key.as_str() {
                     "host" => set_host = true,
                     "user-agent" => set_user_agent = true,
                     _ => {}

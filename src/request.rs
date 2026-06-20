@@ -692,16 +692,12 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
 /// ```
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
-    let schema = if let Some(schema) = http_req.uri.scheme() {
-        schema.to_string()
-    } else {
-        "".to_string()
-    };
+    let is_grpc = matches!(http_req.uri.scheme_str().unwrap_or(""), "grpc" | "grpcs");
 
     // Handle HTTP/3 request
-    let mut stat = if ["grpc", "grpcs"].contains(&schema.as_str()) {
+    let mut stat = if is_grpc {
         grpc_request(http_req).await
-    } else if http_req.alpn_protocols.contains(&ALPN_HTTP3.to_string()) {
+    } else if http_req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3) {
         http3_request(http_req).await
     } else {
         http1_2_request(http_req).await
