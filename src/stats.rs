@@ -398,6 +398,7 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 }
 
 /// Apply a simple jq-style field selector to a JSON string.
+///
 /// Supported syntax:
 ///   .                    identity (pretty-print)
 ///   .field               object key access
@@ -405,16 +406,21 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 ///   .[0]                 array index
 ///   .[]                  iterate all array/object values
 ///   combinations: .items[].name, .a.b[2].c, etc.
-fn apply_jq_filter(body: &str, filter: &str) -> Option<String> {
-    let root: serde_json::Value = serde_json::from_str(body).ok()?;
-    let filter = filter.trim();
+///
+/// Returns `Err(reason)` when the body is not JSON or the filter uses syntax
+/// outside this subset (pipes, functions, `select()`, `?`, …) so the caller
+/// can show a clear message instead of silently printing the unfiltered body.
+fn apply_jq_filter(body: &str, filter: &str) -> Result<String, String> {
+    let root: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| "response body is not JSON, cannot apply --jq filter".to_string())?;
+    let trimmed = filter.trim();
     // Allow omitting the leading '.' for convenience (e.g. "os" → ".os")
     let owned;
-    let filter = if !filter.starts_with('.') {
-        owned = format!(".{filter}");
+    let normalized = if !trimmed.starts_with('.') {
+        owned = format!(".{trimmed}");
         owned.as_str()
     } else {
-        filter
+        trimmed
     };
 
     // Tokenise the filter string into a list of access steps.
@@ -425,6 +431,8 @@ fn apply_jq_filter(body: &str, filter: &str) -> Option<String> {
         Iter,
     }
 
+    // Returns `None` for anything outside the supported subset; the caller
+    // turns that into an "unsupported filter" error.
     fn tokenize(s: &str) -> Option<Vec<Step>> {
         let s = s.strip_prefix('.')?;
         if s.is_empty() {
@@ -453,9 +461,17 @@ fn apply_jq_filter(body: &str, filter: &str) -> Option<String> {
                 // read up to next '.' or '['
                 let end = remaining.find(['.', '[']).unwrap_or(remaining.len());
                 let key = &remaining[..end];
-                if !key.is_empty() {
-                    steps.push(Step::Key(key.to_string()));
+                // Only plain object keys are supported. Reject anything that
+                // signals unsupported jq syntax (pipes, functions, `?`,
+                // whitespace, …) instead of silently matching nothing.
+                if key.is_empty()
+                    || !key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return None;
                 }
+                steps.push(Step::Key(key.to_string()));
                 remaining = &remaining[end..];
                 if remaining.starts_with('.') {
                     remaining = &remaining[1..];
@@ -493,19 +509,20 @@ fn apply_jq_filter(body: &str, filter: &str) -> Option<String> {
         current
     }
 
-    let steps = tokenize(filter)?;
+    let steps = tokenize(normalized).ok_or_else(|| {
+        format!("unsupported --jq filter '{filter}' (supported: .a.b, .[0], .[])")
+    })?;
     let results = apply_steps(vec![root], &steps);
 
     if results.len() == 1 {
-        serde_json::to_string_pretty(&results[0]).ok()
+        serde_json::to_string_pretty(&results[0])
+            .map_err(|e| format!("failed to format --jq result: {e}"))
     } else {
-        Some(
-            results
-                .iter()
-                .filter_map(|v| serde_json::to_string_pretty(v).ok())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        Ok(results
+            .iter()
+            .filter_map(|v| serde_json::to_string_pretty(v).ok())
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 }
 
@@ -1504,9 +1521,12 @@ impl fmt::Display for HttpStat {
                 .unwrap_or_default()
                 .to_string();
             if let Some(filter) = &self.jq_filter {
-                if let Some(filtered) = apply_jq_filter(&body, filter) {
-                    body = filtered;
-                }
+                // On an unsupported filter or non-JSON body, show the reason in
+                // place of the body rather than silently dumping the full body.
+                body = match apply_jq_filter(&body, filter) {
+                    Ok(filtered) => filtered,
+                    Err(reason) => LightRed.paint(format!("jq: {reason}")).to_string(),
+                };
             } else if self.pretty && is_json {
                 if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&body) {
                     if let Ok(value) = serde_json::to_string_pretty(&json_body) {
@@ -1854,29 +1874,45 @@ mod tests {
     #[test]
     fn jq_identity_and_key() {
         assert!(apply_jq_filter(JQ_BODY, ".").unwrap().contains("\"name\""));
-        assert_eq!(apply_jq_filter(JQ_BODY, ".name"), Some("\"x\"".to_string()));
+        assert_eq!(apply_jq_filter(JQ_BODY, ".name"), Ok("\"x\"".to_string()));
         // the leading dot is optional
-        assert_eq!(apply_jq_filter(JQ_BODY, "name"), Some("\"x\"".to_string()));
+        assert_eq!(apply_jq_filter(JQ_BODY, "name"), Ok("\"x\"".to_string()));
     }
 
     #[test]
     fn jq_iterate_and_index() {
         assert_eq!(
             apply_jq_filter(JQ_BODY, ".items[].name"),
-            Some("\"a\"\n\"b\"".to_string())
+            Ok("\"a\"\n\"b\"".to_string())
         );
         assert_eq!(
             apply_jq_filter(JQ_BODY, ".items[0].name"),
-            Some("\"a\"".to_string())
+            Ok("\"a\"".to_string())
         );
     }
 
     #[test]
     fn jq_missing_key_and_bad_json() {
-        // a path that matches nothing yields an empty result
-        assert_eq!(apply_jq_filter(JQ_BODY, ".nope"), Some(String::new()));
-        // non-JSON input is rejected
-        assert_eq!(apply_jq_filter("{not json", ".x"), None);
+        // a path that matches nothing yields an empty result (not an error)
+        assert_eq!(apply_jq_filter(JQ_BODY, ".nope"), Ok(String::new()));
+        // non-JSON input is now a clear error instead of a silent fallback
+        assert!(apply_jq_filter("{not json", ".x").is_err());
+    }
+
+    #[test]
+    fn jq_unsupported_syntax_is_rejected() {
+        // pipes, functions, select(), and `?` are outside the supported subset
+        for f in [
+            ".items | length",
+            ".items[] | select(.name)",
+            ".name?",
+            "keys | length",
+        ] {
+            assert!(
+                apply_jq_filter(JQ_BODY, f).is_err(),
+                "expected '{f}' to be rejected"
+            );
+        }
     }
 
     // ---- is_success / exit_code ----
