@@ -150,6 +150,22 @@ struct Args {
     #[arg(long = "timeout", help = "timeout")]
     timeout: Option<String>,
 
+    /// Connection-phase timeout (DNS + TCP + TLS/QUIC). Overrides --timeout
+    /// for the connection phase only; the request/response phase is unaffected.
+    #[arg(
+        long = "connect-timeout",
+        help = "max time for the connection phase only (DNS + TCP + TLS/QUIC), e.g. 5s"
+    )]
+    connect_timeout: Option<String>,
+
+    /// Overall wall-clock limit for the whole operation, including the
+    /// response body and any followed redirects (like curl --max-time).
+    #[arg(
+        long = "max-time",
+        help = "overall time limit for the whole operation incl. body and redirects, e.g. 30s"
+    )]
+    max_time: Option<String>,
+
     /// Number of requests to make for benchmarking
     #[arg(
         short = 'n',
@@ -289,6 +305,8 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
     // Optional strings: config fills in when CLI left them None
     cfg_opt_str!(dns_servers);
     cfg_opt_str!(timeout);
+    cfg_opt_str!(connect_timeout);
+    cfg_opt_str!(max_time);
     cfg_opt_str!(cookie);
     cfg_opt_str!(output);
     // Vecs: config values are prepended (CLI values take precedence / extend)
@@ -545,6 +563,48 @@ async fn handle_output(body: Option<Bytes>, output: Option<String>) {
         println!("write output error: {e}");
     }
 }
+
+/// Parse a humantime duration (e.g. `5s`, `1m30s`), exiting with a clear
+/// message on a malformed value. `name` is the flag name for the error text.
+fn parse_dur(name: &str, value: &str) -> std::time::Duration {
+    match value.parse::<humantime::Duration>() {
+        Ok(d) => d.into(),
+        Err(e) => {
+            eprintln!("httpstat: invalid {name} '{value}': {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Synthesize the `HttpStat` returned when `--max-time` is exceeded. The error
+/// text contains "timeout" so `exit_code()` maps it to the timeout code (5).
+fn max_time_error_stat(d: std::time::Duration) -> HttpStat {
+    HttpStat {
+        total: Some(d),
+        error: Some(format!(
+            "timeout: exceeded --max-time of {}",
+            format_duration(d)
+        )),
+        ..Default::default()
+    }
+}
+
+/// Run `fut` under an optional overall wall-clock deadline. When `max_time`
+/// elapses first, the in-flight request is cancelled and a timeout `HttpStat`
+/// is returned instead (mirroring curl --max-time).
+async fn with_max_time<F>(fut: F, max_time: Option<std::time::Duration>) -> HttpStat
+where
+    F: std::future::Future<Output = HttpStat>,
+{
+    match max_time {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(stat) => stat,
+            Err(_) => max_time_error_stat(d),
+        },
+        None => fut.await,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = Args::parse();
@@ -594,20 +654,26 @@ async fn main() {
         req.dns_servers = Some(dns_servers.split(',').map(|s| s.to_string()).collect());
     }
 
+    // --timeout is the coarse catch-all: it sets every phase timeout.
     if let Some(timeout_str) = args.timeout {
-        let timeout: std::time::Duration = match timeout_str.parse::<humantime::Duration>() {
-            Ok(d) => d.into(),
-            Err(e) => {
-                eprintln!("httpstat: invalid timeout '{timeout_str}': {e}");
-                std::process::exit(1);
-            }
-        };
+        let timeout = parse_dur("timeout", &timeout_str);
         req.dns_timeout = Some(timeout);
         req.tcp_timeout = Some(timeout);
         req.tls_timeout = Some(timeout);
         req.request_timeout = Some(timeout);
         req.quic_timeout = Some(timeout);
     }
+    // --connect-timeout refines the connection phase only (DNS + TCP + TLS/QUIC),
+    // overriding whatever --timeout set there; the request phase is untouched.
+    if let Some(ct_str) = args.connect_timeout {
+        let ct = parse_dur("connect-timeout", &ct_str);
+        req.dns_timeout = Some(ct);
+        req.tcp_timeout = Some(ct);
+        req.tls_timeout = Some(ct);
+        req.quic_timeout = Some(ct);
+    }
+    // --max-time is an overall wall-clock cap enforced around each operation.
+    let max_time = args.max_time.as_deref().map(|v| parse_dur("max-time", v));
 
     // Parse headers if provided
     if !args.headers.is_empty() {
@@ -786,7 +852,10 @@ async fn main() {
                 continue;
             };
             req.resolve = Some(ip);
-            futs.push(do_request(req, args.follow_redirect));
+            futs.push(with_max_time(
+                do_request(req, args.follow_redirect),
+                max_time,
+            ));
         }
         let mut stats_list = futures::future::join_all(futs).await;
         // error request last
@@ -833,7 +902,7 @@ async fn main() {
             let width = count.to_string().len();
             let mut stats = Vec::with_capacity(count);
             for i in 0..count {
-                let mut stat = conn.send(&req).await;
+                let mut stat = with_max_time(conn.send(&req), max_time).await;
                 stat.addr.clone_from(&connect_stat.addr);
                 stat.alpn.clone_from(&connect_stat.alpn);
                 stat.silent = true;
@@ -896,7 +965,7 @@ async fn main() {
         for i in 0..count {
             let mut req = req.clone();
             req.tls_session_store = Some(Arc::clone(&session_store));
-            let mut stat = do_request(req, args.follow_redirect).await;
+            let mut stat = with_max_time(do_request(req, args.follow_redirect), max_time).await;
             stat.silent = true;
             stat.lang = lang;
             if !json_output {
@@ -919,7 +988,7 @@ async fn main() {
             println!("{summary}");
         }
     } else {
-        let mut stat = do_request(req, args.follow_redirect).await;
+        let mut stat = with_max_time(do_request(req, args.follow_redirect), max_time).await;
         if json_output {
             println!(
                 "{}",
@@ -1093,5 +1162,50 @@ mod tests {
         );
         // empty location is rejected
         assert!(resolve_redirect(&base, "").is_none());
+    }
+
+    // ---- --max-time handling ----
+    #[test]
+    fn max_time_error_stat_maps_to_timeout_exit() {
+        let s = max_time_error_stat(std::time::Duration::from_secs(2));
+        assert!(!s.is_success());
+        assert_eq!(s.exit_code(), 5); // timeout
+        assert!(s.error.as_deref().unwrap().contains("max-time"));
+    }
+
+    #[tokio::test]
+    async fn with_max_time_passes_through_fast_result() {
+        let fast = async {
+            HttpStat {
+                status: Some(StatusCode::OK),
+                ..Default::default()
+            }
+        };
+        let s = with_max_time(fast, Some(std::time::Duration::from_secs(10))).await;
+        assert_eq!(s.exit_code(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_max_time_cancels_slow_result() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            HttpStat {
+                status: Some(StatusCode::OK),
+                ..Default::default()
+            }
+        };
+        let s = with_max_time(slow, Some(std::time::Duration::from_millis(10))).await;
+        assert_eq!(s.exit_code(), 5); // synthesized timeout
+    }
+
+    #[tokio::test]
+    async fn with_max_time_none_is_unbounded() {
+        let fut = async {
+            HttpStat {
+                status: Some(StatusCode::OK),
+                ..Default::default()
+            }
+        };
+        assert_eq!(with_max_time(fut, None).await.exit_code(), 0);
     }
 }
