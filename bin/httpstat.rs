@@ -166,6 +166,22 @@ struct Args {
     )]
     max_time: Option<String>,
 
+    /// Retry the request on transient failures (timeouts, connection errors,
+    /// or HTTP 408/429/500/502/503/504). Useful for flaky CI gates.
+    #[arg(
+        long = "retry",
+        help = "retry up to N times on transient failure (timeout, conn error, 408/429/5xx)"
+    )]
+    retry: Option<usize>,
+
+    /// Fixed delay between retries. When omitted, exponential backoff is used
+    /// (1s, 2s, 4s, ... capped at 30s).
+    #[arg(
+        long = "retry-delay",
+        help = "fixed delay between retries (e.g. 2s); default is exponential backoff"
+    )]
+    retry_delay: Option<String>,
+
     /// Number of requests to make for benchmarking
     #[arg(
         short = 'n',
@@ -307,8 +323,15 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
     cfg_opt_str!(timeout);
     cfg_opt_str!(connect_timeout);
     cfg_opt_str!(max_time);
+    cfg_opt_str!(retry_delay);
     cfg_opt_str!(cookie);
     cfg_opt_str!(output);
+    // Numeric: retry count
+    if args.retry.is_none() {
+        if let Some(n) = cfg.get("retry").and_then(|v| v.as_u64()) {
+            args.retry = Some(n as usize);
+        }
+    }
     // Vecs: config values are prepended (CLI values take precedence / extend)
     for key in &["headers", "include_header", "exclude_header"] {
         if let Some(arr) = cfg.get(*key).and_then(|v| v.as_array()) {
@@ -605,6 +628,64 @@ where
     }
 }
 
+/// Whether a result is worth retrying. With an HTTP response we only retry the
+/// transient status codes (curl's default set). Without a response we retry
+/// transient connection failures — timeouts and TCP errors — but not DNS or
+/// TLS/cert failures, where a retry won't help.
+fn is_retryable(stat: &HttpStat) -> bool {
+    if let Some(status) = stat.status {
+        return matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+    }
+    if stat.error.is_some() {
+        // 1 = generic (e.g. connection reset), 3 = TCP connect, 5 = timeout.
+        return matches!(stat.exit_code(), 1 | 3 | 5);
+    }
+    false
+}
+
+/// Exponential backoff for retry attempt `n` (0-based): 1s, 2s, 4s, ...
+/// capped at 30s.
+fn backoff_delay(n: usize) -> std::time::Duration {
+    let secs = (1u64 << n.min(5)).min(30);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Run an operation with up to `retries` retries on transient failure. `make`
+/// builds a fresh operation future per attempt. Between attempts it waits
+/// `retry_delay` (fixed) or an exponential backoff, logging each retry to
+/// stderr so it never pollutes stdout / JSON output.
+async fn run_with_retry<F, Fut>(
+    make: F,
+    retries: usize,
+    retry_delay: Option<std::time::Duration>,
+) -> HttpStat
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = HttpStat>,
+{
+    let mut attempt = 0usize;
+    loop {
+        let stat = make().await;
+        if attempt >= retries || !is_retryable(&stat) {
+            return stat;
+        }
+        let delay = retry_delay.unwrap_or_else(|| backoff_delay(attempt));
+        let reason = stat
+            .status
+            .map(|s| format!("HTTP {}", s.as_u16()))
+            .or_else(|| stat.error.clone())
+            .unwrap_or_else(|| "request failed".to_string());
+        eprintln!(
+            "httpstat: attempt {}/{} failed ({reason}); retrying in {}",
+            attempt + 1,
+            retries + 1,
+            format_duration(delay)
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = Args::parse();
@@ -674,6 +755,12 @@ async fn main() {
     }
     // --max-time is an overall wall-clock cap enforced around each operation.
     let max_time = args.max_time.as_deref().map(|v| parse_dur("max-time", v));
+    let retries = args.retry.unwrap_or(0);
+    let retry_delay = args
+        .retry_delay
+        .as_deref()
+        .map(|v| parse_dur("retry-delay", v));
+    let follow_redirect = args.follow_redirect;
 
     // Parse headers if provided
     if !args.headers.is_empty() {
@@ -852,9 +939,10 @@ async fn main() {
                 continue;
             };
             req.resolve = Some(ip);
-            futs.push(with_max_time(
-                do_request(req, args.follow_redirect),
-                max_time,
+            futs.push(run_with_retry(
+                move || with_max_time(do_request(req.clone(), follow_redirect), max_time),
+                retries,
+                retry_delay,
             ));
         }
         let mut stats_list = futures::future::join_all(futs).await;
@@ -988,7 +1076,12 @@ async fn main() {
             println!("{summary}");
         }
     } else {
-        let mut stat = with_max_time(do_request(req, args.follow_redirect), max_time).await;
+        let mut stat = run_with_retry(
+            || with_max_time(do_request(req.clone(), follow_redirect), max_time),
+            retries,
+            retry_delay,
+        )
+        .await;
         if json_output {
             println!(
                 "{}",
@@ -1207,5 +1300,133 @@ mod tests {
             }
         };
         assert_eq!(with_max_time(fut, None).await.exit_code(), 0);
+    }
+
+    // ---- retry logic ----
+    #[test]
+    fn is_retryable_status_codes() {
+        for code in [408u16, 429, 500, 502, 503, 504] {
+            let s = HttpStat {
+                status: Some(StatusCode::from_u16(code).unwrap()),
+                ..Default::default()
+            };
+            assert!(is_retryable(&s), "expected {code} retryable");
+        }
+        for code in [200u16, 404, 501, 505] {
+            let s = HttpStat {
+                status: Some(StatusCode::from_u16(code).unwrap()),
+                ..Default::default()
+            };
+            assert!(!is_retryable(&s), "expected {code} non-retryable");
+        }
+    }
+
+    #[test]
+    fn is_retryable_connection_errors() {
+        let ms = std::time::Duration::from_millis(1);
+        // timeout (exit 5) and TCP connect failure (exit 3) are transient
+        let to = HttpStat {
+            error: Some("operation timeout".into()),
+            ..Default::default()
+        };
+        assert!(is_retryable(&to));
+        let tcp = HttpStat {
+            error: Some("connection refused".into()),
+            dns_lookup: Some(ms),
+            ..Default::default()
+        };
+        assert!(is_retryable(&tcp));
+        // generic mid-flight error / reset (exit 1) is retried too
+        let reset = HttpStat {
+            error: Some("connection reset by peer".into()),
+            dns_lookup: Some(ms),
+            tcp_connect: Some(ms),
+            ..Default::default()
+        };
+        assert!(is_retryable(&reset));
+        // DNS (exit 2) and TLS/cert (exit 4) failures are NOT retried
+        let dns = HttpStat {
+            error: Some("no such host".into()),
+            ..Default::default()
+        };
+        assert!(!is_retryable(&dns));
+        let tls = HttpStat {
+            error: Some("rustls: bad certificate".into()),
+            dns_lookup: Some(ms),
+            tcp_connect: Some(ms),
+            ..Default::default()
+        };
+        assert!(!is_retryable(&tls));
+        // a clean (empty) stat is not retryable
+        assert!(!is_retryable(&HttpStat::default()));
+    }
+
+    #[test]
+    fn backoff_is_exponential_capped() {
+        assert_eq!(backoff_delay(0), std::time::Duration::from_secs(1));
+        assert_eq!(backoff_delay(1), std::time::Duration::from_secs(2));
+        assert_eq!(backoff_delay(2), std::time::Duration::from_secs(4));
+        assert_eq!(backoff_delay(4), std::time::Duration::from_secs(16));
+        assert_eq!(backoff_delay(5), std::time::Duration::from_secs(30)); // capped
+        assert_eq!(backoff_delay(20), std::time::Duration::from_secs(30)); // capped
+    }
+
+    #[tokio::test]
+    async fn run_with_retry_retries_then_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let make = || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let status = if n < 2 {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                };
+                HttpStat {
+                    status: Some(status),
+                    ..Default::default()
+                }
+            }
+        };
+        let stat = run_with_retry(make, 5, Some(std::time::Duration::from_millis(1))).await;
+        assert_eq!(stat.exit_code(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 3); // 2 failures + 1 success
+    }
+
+    #[tokio::test]
+    async fn run_with_retry_gives_up_after_n() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let make = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                HttpStat {
+                    status: Some(StatusCode::BAD_GATEWAY),
+                    ..Default::default()
+                }
+            }
+        };
+        let stat = run_with_retry(make, 2, Some(std::time::Duration::from_millis(1))).await;
+        assert_eq!(stat.exit_code(), 7); // 502 → 5xx exit code
+        assert_eq!(calls.load(Ordering::SeqCst), 3); // initial + 2 retries
+    }
+
+    #[tokio::test]
+    async fn run_with_retry_does_not_retry_non_transient() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let make = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                HttpStat {
+                    status: Some(StatusCode::NOT_FOUND),
+                    ..Default::default()
+                }
+            }
+        };
+        let stat = run_with_retry(make, 5, Some(std::time::Duration::from_millis(1))).await;
+        assert_eq!(stat.exit_code(), 6); // 404 → no retry
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
