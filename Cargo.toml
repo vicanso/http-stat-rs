@@ -49,7 +49,6 @@ humantime = "2.3.0"
 hyper = { version = "1.10.1", features = ["client", "http1", "http2"] }
 libc = "0.2"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
-mimalloc = "0.1.52"
 nu-ansi-term = "0.50.3"
 quinn = { version = "0.11.9", default-features = false, features = [
     "runtime-tokio",
@@ -79,6 +78,12 @@ tower-service = "0.3.3"
 unicode-truncate = "2.0.1"
 x509-parser = "0.18.1"
 zstd = { version = "0.13.3", default-features = false }
+
+# mimalloc is only wired in as the global allocator on musl targets
+# (see the `#[cfg(target_env = "musl")]` global_allocator in bin/httpstat.rs).
+# Keep it out of glibc/macOS builds so it isn't compiled or linked there.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1.52"
 
 
 [profile.release]
