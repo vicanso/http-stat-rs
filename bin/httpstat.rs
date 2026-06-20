@@ -868,3 +868,88 @@ async fn main() {
         std::process::exit(exit_code);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    // ---- collect_cookies ----
+    #[test]
+    fn collect_cookies_merges_set_cookie_and_existing() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("a=1; Path=/; HttpOnly"),
+        );
+        headers.append(http::header::SET_COOKIE, HeaderValue::from_static("b=2"));
+        let stat = HttpStat {
+            headers: Some(headers),
+            ..Default::default()
+        };
+        let merged = collect_cookies(&stat, "c=3");
+        // HashMap ordering is unspecified, so compare as a set
+        let set: std::collections::HashSet<&str> = merged.split("; ").collect();
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("a=1"));
+        assert!(set.contains("b=2"));
+        assert!(set.contains("c=3"));
+    }
+
+    #[test]
+    fn collect_cookies_response_overrides_existing() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("session=new"),
+        );
+        let stat = HttpStat {
+            headers: Some(headers),
+            ..Default::default()
+        };
+        assert_eq!(collect_cookies(&stat, "session=old"), "session=new");
+    }
+
+    // ---- apply_config ----
+    #[test]
+    fn apply_config_fills_missing_values() {
+        let mut args = Args::parse_from(["httpstat", "http://example.com"]);
+        assert!(!args.verbose);
+        assert!(args.timeout.is_none());
+
+        let map = cfg_map(serde_json::json!({
+            "verbose": true,
+            "timeout": "5s",
+            "headers": ["X-From-Config: yes"],
+        }));
+        apply_config(&mut args, &map);
+
+        assert!(args.verbose);
+        assert_eq!(args.timeout.as_deref(), Some("5s"));
+        assert_eq!(args.headers, vec!["X-From-Config: yes".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_does_not_override_cli_values() {
+        let mut args = Args::parse_from(["httpstat", "--timeout", "1s", "http://example.com"]);
+        let map = cfg_map(serde_json::json!({ "timeout": "99s" }));
+        apply_config(&mut args, &map);
+        // an explicit CLI value wins over config
+        assert_eq!(args.timeout.as_deref(), Some("1s"));
+    }
+
+    #[test]
+    fn apply_config_prepends_header_defaults() {
+        let mut args = Args::parse_from(["httpstat", "-H", "X-Cli: 1", "http://example.com"]);
+        let map = cfg_map(serde_json::json!({ "headers": ["X-Config: 0"] }));
+        apply_config(&mut args, &map);
+        // config defaults come first; CLI-provided headers are appended
+        assert_eq!(
+            args.headers,
+            vec!["X-Config: 0".to_string(), "X-Cli: 1".to_string()]
+        );
+    }
+}

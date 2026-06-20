@@ -241,3 +241,59 @@ pub(crate) async fn http_connect(
 
     Ok(stream)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_schemes_and_ports() {
+        let h = ProxyConfig::parse("http://127.0.0.1:3128").unwrap();
+        assert!(matches!(h.kind, ProxyKind::Http));
+        assert_eq!(h.host, "127.0.0.1");
+        assert_eq!(h.port, 3128);
+
+        let s = ProxyConfig::parse("socks5://localhost:1080").unwrap();
+        assert!(matches!(s.kind, ProxyKind::Socks5));
+        assert_eq!(s.port, 1080);
+
+        // an https:// proxy is treated as an HTTP-kind proxy
+        let hs = ProxyConfig::parse("https://proxy:8443").unwrap();
+        assert!(matches!(hs.kind, ProxyKind::Http));
+        assert_eq!(hs.port, 8443);
+    }
+
+    #[test]
+    fn parse_defaults_credentials_and_path() {
+        // bare host → HTTP kind, default port 8080
+        let bare = ProxyConfig::parse("proxy.local").unwrap();
+        assert!(matches!(bare.kind, ProxyKind::Http));
+        assert_eq!(bare.host, "proxy.local");
+        assert_eq!(bare.port, 8080);
+
+        // socks5 default port 1080
+        assert_eq!(ProxyConfig::parse("socks5://h").unwrap().port, 1080);
+
+        // credentials are stripped
+        let creds = ProxyConfig::parse("http://user:pass@host:3128").unwrap();
+        assert_eq!(creds.host, "host");
+        assert_eq!(creds.port, 3128);
+
+        // path is stripped
+        let path = ProxyConfig::parse("http://host:3128/ignored").unwrap();
+        assert_eq!(path.host, "host");
+        assert_eq!(path.port, 3128);
+    }
+
+    #[test]
+    fn parse_ipv6_bracketed() {
+        let v6 = ProxyConfig::parse("http://[::1]:3128").unwrap();
+        assert_eq!(v6.host, "::1");
+        assert_eq!(v6.port, 3128);
+
+        // no explicit port → scheme default
+        let v6d = ProxyConfig::parse("socks5://[::1]").unwrap();
+        assert_eq!(v6d.host, "::1");
+        assert_eq!(v6d.port, 1080);
+    }
+}

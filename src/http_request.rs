@@ -252,3 +252,134 @@ impl TryFrom<&HttpRequest> for Request<Full<Bytes>> {
             .map_err(|e| Error::Http { source: e })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_host_segment ----
+    #[test]
+    fn parse_host_segment_plain_and_bracketed() {
+        assert_eq!(parse_host_segment("host:443"), ("host".to_string(), ":443"));
+        assert_eq!(parse_host_segment("[::1]:443"), ("::1".to_string(), ":443"));
+        assert_eq!(parse_host_segment("host"), ("host".to_string(), ""));
+    }
+
+    // ---- ConnectTo::parse / matches ----
+    #[test]
+    fn connect_to_full_entry() {
+        let c = ConnectTo::parse("example.com:443:1.2.3.4:8443").unwrap();
+        assert_eq!(c.dst_host, "1.2.3.4");
+        assert_eq!(c.dst_port, Some(8443));
+        assert!(c.matches("example.com", 443));
+        assert!(c.matches("EXAMPLE.COM", 443)); // host match is case-insensitive
+        assert!(!c.matches("other.com", 443));
+        assert!(!c.matches("example.com", 80));
+    }
+
+    #[test]
+    fn connect_to_wildcards() {
+        // empty source host → matches any host on that port
+        let any_host = ConnectTo::parse(":443:1.2.3.4:8443").unwrap();
+        assert!(any_host.matches("whatever.com", 443));
+        assert!(!any_host.matches("whatever.com", 80));
+
+        // empty source port → matches that host on any port
+        let any_port = ConnectTo::parse("example.com::1.2.3.4:8443").unwrap();
+        assert!(any_port.matches("example.com", 1));
+        assert!(any_port.matches("example.com", 65535));
+        assert!(!any_port.matches("other.com", 443));
+    }
+
+    #[test]
+    fn connect_to_ipv6_and_optional_dst_port() {
+        let dst6 = ConnectTo::parse("example.com:443:[2001:db8::1]:8443").unwrap();
+        assert_eq!(dst6.dst_host, "2001:db8::1");
+        assert_eq!(dst6.dst_port, Some(8443));
+
+        let src6 = ConnectTo::parse("[2001:db8::1]:443:1.2.3.4:8443").unwrap();
+        assert!(src6.matches("2001:db8::1", 443));
+
+        // omitted destination port → None (keep the original)
+        let no_dst_port = ConnectTo::parse("example.com:443:1.2.3.4").unwrap();
+        assert_eq!(no_dst_port.dst_host, "1.2.3.4");
+        assert_eq!(no_dst_port.dst_port, None);
+    }
+
+    #[test]
+    fn connect_to_rejects_malformed() {
+        assert!(ConnectTo::parse("example.com").is_none()); // no ':' after host
+        assert!(ConnectTo::parse("example.com:443").is_none()); // missing destination
+        assert!(ConnectTo::parse("example.com:notaport:1.2.3.4:8443").is_none()); // bad src port
+    }
+
+    // ---- HttpRequest::try_from ----
+    #[test]
+    fn try_from_adds_scheme_and_default_alpn() {
+        let req = HttpRequest::try_from("example.com").unwrap();
+        assert_eq!(req.uri.scheme_str(), Some("http"));
+        assert_eq!(
+            req.alpn_protocols,
+            vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()]
+        );
+
+        assert_eq!(
+            HttpRequest::try_from("https://example.com/path")
+                .unwrap()
+                .uri
+                .scheme_str(),
+            Some("https")
+        );
+        assert_eq!(
+            HttpRequest::try_from("grpc://svc:50051")
+                .unwrap()
+                .uri
+                .scheme_str(),
+            Some("grpc")
+        );
+    }
+
+    // ---- get_port ----
+    #[test]
+    fn get_port_defaults_by_scheme() {
+        assert_eq!(HttpRequest::try_from("http://x").unwrap().get_port(), 80);
+        assert_eq!(HttpRequest::try_from("https://x").unwrap().get_port(), 443);
+        assert_eq!(HttpRequest::try_from("grpcs://x").unwrap().get_port(), 443);
+        assert_eq!(
+            HttpRequest::try_from("http://x:8080").unwrap().get_port(),
+            8080
+        );
+    }
+
+    // ---- builder ----
+    #[test]
+    fn builder_sets_default_host_and_user_agent() {
+        let req = HttpRequest::try_from("http://example.com/path").unwrap();
+        let r = req.builder(true).body(()).unwrap();
+        assert_eq!(r.headers().get("host").unwrap(), "example.com");
+        assert!(r
+            .headers()
+            .get("user-agent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("httpstat.rs/"));
+    }
+
+    #[test]
+    fn builder_includes_nondefault_port_in_host() {
+        let req = HttpRequest::try_from("http://example.com:8080/").unwrap();
+        let r = req.builder(true).body(()).unwrap();
+        assert_eq!(r.headers().get("host").unwrap(), "example.com:8080");
+    }
+
+    #[test]
+    fn builder_respects_custom_host_header() {
+        let mut req = HttpRequest::try_from("http://example.com/").unwrap();
+        let mut hm = HeaderMap::new();
+        hm.insert(http::header::HOST, HeaderValue::from_static("custom.test"));
+        req.headers = Some(hm);
+        let r = req.builder(true).body(()).unwrap();
+        assert_eq!(r.headers().get("host").unwrap(), "custom.test");
+    }
+}

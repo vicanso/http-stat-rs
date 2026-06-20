@@ -1732,3 +1732,316 @@ impl fmt::Display for BenchmarkSummary {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- format_duration ----
+    #[test]
+    fn format_duration_units() {
+        assert_eq!(format_duration(Duration::from_micros(999)), "999µs");
+        assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
+        assert_eq!(format_duration(Duration::from_secs_f64(1.5)), "1.50s");
+    }
+
+    #[test]
+    fn format_duration_boundaries() {
+        // exactly 1ms is NOT strictly greater than 1ms, so it renders as µs
+        assert_eq!(format_duration(Duration::from_millis(1)), "1000µs");
+        // exactly 1s is NOT strictly greater than 1s, so it renders as ms
+        assert_eq!(format_duration(Duration::from_secs(1)), "1000ms");
+    }
+
+    // ---- format_throughput ----
+    #[test]
+    fn format_throughput_units() {
+        assert_eq!(format_throughput(1_500_000.0), "1.5 MB/s");
+        assert_eq!(format_throughput(1_000_000.0), "1.0 MB/s");
+        assert_eq!(format_throughput(2_048.0), "2.0 KB/s");
+        assert_eq!(format_throughput(500.0), "500 B/s");
+    }
+
+    #[test]
+    fn format_throughput_invalid_inputs_render_dash() {
+        assert_eq!(format_throughput(0.0), "-");
+        assert_eq!(format_throughput(-5.0), "-");
+        assert_eq!(format_throughput(f64::NAN), "-");
+        assert_eq!(format_throughput(f64::INFINITY), "-");
+    }
+
+    // ---- format_time ----
+    #[test]
+    fn format_time_invalid_falls_back_to_number() {
+        // out-of-range timestamp can't be represented; we echo the raw number
+        assert_eq!(format_time(i64::MAX), i64::MAX.to_string());
+    }
+
+    #[test]
+    fn format_time_shape() {
+        // "YYYY-MM-DD HH:MM:SS ±HH:MM" — 26 chars regardless of the local offset.
+        let s = format_time(0);
+        assert_eq!(s.len(), 26, "unexpected format: {s}");
+        let sign = s.as_bytes()[20] as char;
+        assert!(sign == '+' || sign == '-', "no offset sign in: {s}");
+    }
+
+    // ---- parse_server_timing ----
+    #[test]
+    fn parse_server_timing_basic() {
+        let st = parse_server_timing(["db;dur=53.2, app;dur=47.1;desc=\"App Server\""]).unwrap();
+        assert_eq!(st.len(), 2);
+        assert_eq!(st[0].name, "db");
+        assert_eq!(st[0].duration, Some(Duration::from_secs_f64(53.2 / 1000.0)));
+        assert_eq!(st[1].name, "app");
+        assert_eq!(st[1].description.as_deref(), Some("App Server"));
+    }
+
+    #[test]
+    fn parse_server_timing_name_only_and_empty() {
+        let st = parse_server_timing(["cache"]).unwrap();
+        assert_eq!(st[0].name, "cache");
+        assert_eq!(st[0].duration, None);
+        assert!(parse_server_timing(Vec::<&str>::new()).is_none());
+        assert!(parse_server_timing([""]).is_none());
+    }
+
+    // ---- parse_alt_svc ----
+    #[test]
+    fn parse_alt_svc_basic() {
+        let v = parse_alt_svc(["h3=\":443\"; ma=86400, h2=\"alt.example:443\""]).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].protocol, "h3");
+        assert_eq!(v[0].authority, ":443");
+        assert_eq!(v[0].max_age, Some(86400));
+        assert_eq!(v[1].protocol, "h2");
+        assert_eq!(v[1].authority, "alt.example:443");
+        assert_eq!(v[1].max_age, None);
+    }
+
+    #[test]
+    fn parse_alt_svc_clear_resets() {
+        assert!(parse_alt_svc(["clear"]).is_none());
+        let v = parse_alt_svc(["h3=\":443\", clear, h2=\":8443\""]).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].protocol, "h2");
+    }
+
+    // ---- parse_hsts ----
+    #[test]
+    fn parse_hsts_full() {
+        let h = parse_hsts("max-age=31536000; includeSubDomains; preload").unwrap();
+        assert_eq!(h.max_age, 31536000);
+        assert!(h.include_subdomains);
+        assert!(h.preload);
+    }
+
+    #[test]
+    fn parse_hsts_minimal_and_invalid() {
+        let h = parse_hsts("max-age=0").unwrap();
+        assert_eq!(h.max_age, 0);
+        assert!(!h.include_subdomains);
+        assert!(!h.preload);
+        // a policy without max-age is not valid per RFC 6797
+        assert!(parse_hsts("includeSubDomains; preload").is_none());
+        // quoted value is accepted
+        assert_eq!(parse_hsts("max-age=\"100\"").unwrap().max_age, 100);
+    }
+
+    // ---- apply_jq_filter ----
+    const JQ_BODY: &str = r#"{"name":"x","items":[{"name":"a"},{"name":"b"}]}"#;
+
+    #[test]
+    fn jq_identity_and_key() {
+        assert!(apply_jq_filter(JQ_BODY, ".").unwrap().contains("\"name\""));
+        assert_eq!(apply_jq_filter(JQ_BODY, ".name"), Some("\"x\"".to_string()));
+        // the leading dot is optional
+        assert_eq!(apply_jq_filter(JQ_BODY, "name"), Some("\"x\"".to_string()));
+    }
+
+    #[test]
+    fn jq_iterate_and_index() {
+        assert_eq!(
+            apply_jq_filter(JQ_BODY, ".items[].name"),
+            Some("\"a\"\n\"b\"".to_string())
+        );
+        assert_eq!(
+            apply_jq_filter(JQ_BODY, ".items[0].name"),
+            Some("\"a\"".to_string())
+        );
+    }
+
+    #[test]
+    fn jq_missing_key_and_bad_json() {
+        // a path that matches nothing yields an empty result
+        assert_eq!(apply_jq_filter(JQ_BODY, ".nope"), Some(String::new()));
+        // non-JSON input is rejected
+        assert_eq!(apply_jq_filter("{not json", ".x"), None);
+    }
+
+    // ---- is_success / exit_code ----
+    #[test]
+    fn success_and_status_exit_codes() {
+        assert!(!HttpStat::default().is_success());
+        assert_eq!(HttpStat::default().exit_code(), 1);
+
+        let ok = HttpStat {
+            status: Some(StatusCode::OK),
+            ..Default::default()
+        };
+        assert!(ok.is_success());
+        assert_eq!(ok.exit_code(), 0);
+
+        let c404 = HttpStat {
+            status: Some(StatusCode::NOT_FOUND),
+            ..Default::default()
+        };
+        assert!(!c404.is_success());
+        assert_eq!(c404.exit_code(), 6);
+
+        let c500 = HttpStat {
+            status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+            ..Default::default()
+        };
+        assert_eq!(c500.exit_code(), 7);
+    }
+
+    #[test]
+    fn error_exit_codes_by_phase() {
+        let timeout = HttpStat {
+            error: Some("operation timeout".into()),
+            ..Default::default()
+        };
+        assert_eq!(timeout.exit_code(), 5);
+
+        let dns = HttpStat {
+            error: Some("no such host".into()),
+            ..Default::default()
+        };
+        assert_eq!(dns.exit_code(), 2);
+
+        let tcp = HttpStat {
+            error: Some("connection refused".into()),
+            dns_lookup: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
+        assert_eq!(tcp.exit_code(), 3);
+
+        let tls = HttpStat {
+            error: Some("rustls: bad certificate".into()),
+            dns_lookup: Some(Duration::from_millis(1)),
+            tcp_connect: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
+        assert_eq!(tls.exit_code(), 4);
+    }
+
+    #[test]
+    fn grpc_success_and_failure() {
+        let ok = HttpStat {
+            is_grpc: true,
+            grpc_status: Some("0".into()),
+            ..Default::default()
+        };
+        assert!(ok.is_success());
+        assert_eq!(ok.exit_code(), 0);
+
+        let bad = HttpStat {
+            is_grpc: true,
+            grpc_status: Some("5".into()),
+            ..Default::default()
+        };
+        assert!(!bad.is_success());
+        assert_eq!(bad.exit_code(), 1);
+    }
+
+    // ---- throughput / dns_query ----
+    #[test]
+    fn throughput_overall() {
+        let s = HttpStat {
+            wire_body_size: Some(1_000_000),
+            content_transfer: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert!((s.throughput_bps().unwrap() - 1_000_000.0).abs() < 1.0);
+
+        // zero transfer time → undefined
+        let z = HttpStat {
+            wire_body_size: Some(100),
+            content_transfer: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        assert!(z.throughput_bps().is_none());
+        assert!(HttpStat::default().throughput_bps().is_none());
+    }
+
+    #[test]
+    fn throughput_split_first_chunk_and_tail() {
+        let s = HttpStat {
+            wire_body_size: Some(200 * 1024),
+            content_transfer: Some(Duration::from_secs(2)),
+            time_to_first_100k: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        // first 100 KiB in 1s
+        assert!((s.first_chunk_throughput_bps().unwrap() - FIRST_CHUNK_BYTES as f64).abs() < 1.0);
+        // remaining 100 KiB over the remaining 1s
+        assert!((s.tail_throughput_bps().unwrap() - 100.0 * 1024.0).abs() < 1.0);
+
+        // a body that never crosses the first-chunk threshold has no tail
+        let small = HttpStat {
+            wire_body_size: Some(50_000),
+            content_transfer: Some(Duration::from_secs(2)),
+            time_to_first_100k: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert!(small.tail_throughput_bps().is_none());
+    }
+
+    #[test]
+    fn dns_query_derivation() {
+        let s = HttpStat {
+            dns_lookup: Some(Duration::from_millis(50)),
+            dns_connect: Some(Duration::from_millis(20)),
+            ..Default::default()
+        };
+        assert_eq!(s.dns_query(), Some(Duration::from_millis(30)));
+
+        // probe racing ahead clamps to zero rather than underflowing
+        let racy = HttpStat {
+            dns_lookup: Some(Duration::from_millis(10)),
+            dns_connect: Some(Duration::from_millis(20)),
+            ..Default::default()
+        };
+        assert_eq!(racy.dns_query(), Some(Duration::ZERO));
+
+        // no probe → no derived query phase
+        let plain = HttpStat {
+            dns_lookup: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        assert!(plain.dns_query().is_none());
+    }
+
+    // ---- to_json ----
+    #[test]
+    fn to_json_blocks_are_conditional() {
+        let with_body = HttpStat {
+            status: Some(StatusCode::OK),
+            wire_body_size: Some(1_000_000),
+            content_transfer: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let v = with_body.to_json();
+        assert!(v.is_object());
+        assert!(v.get("timing").is_some());
+        assert!(v.get("throughput").is_some());
+
+        // no body → throughput block omitted
+        let no_body = HttpStat {
+            status: Some(StatusCode::OK),
+            ..Default::default()
+        };
+        assert!(no_body.to_json().get("throughput").is_none());
+    }
+}

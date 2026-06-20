@@ -289,3 +289,20 @@ pub const ZH: Strings = Strings {
     max: "最大",
     avg: "均值",
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_arg_maps_languages() {
+        assert_eq!(Lang::parse_arg("zh"), Lang::Zh);
+        assert_eq!(Lang::parse_arg("ZH-CN"), Lang::Zh);
+        assert_eq!(Lang::parse_arg("zh_TW"), Lang::Zh);
+        assert_eq!(Lang::parse_arg("cn"), Lang::Zh);
+        assert_eq!(Lang::parse_arg("chinese"), Lang::Zh);
+        assert_eq!(Lang::parse_arg("en"), Lang::En);
+        assert_eq!(Lang::parse_arg("fr"), Lang::En); // unknown → English
+        assert_eq!(Lang::parse_arg(""), Lang::En);
+    }
+}
