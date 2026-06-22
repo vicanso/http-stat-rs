@@ -198,6 +198,8 @@ pub struct HttpStat {
     /// in English (machine contract). Driven by `--lang` or auto-detected
     /// from LC_ALL/LC_MESSAGES/LANG.
     pub lang: Lang,
+    /// Display Response Version
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
