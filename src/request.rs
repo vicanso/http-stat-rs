@@ -395,6 +395,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
 
         sub_stat.status = Some(resp.status());
         sub_stat.headers = Some(resp.headers().clone());
+        sub_stat.version = Some(format!("{:?}", resp.version()));
         capture_server_timing(&mut sub_stat, resp.headers());
         capture_protocol_advertisements(&mut sub_stat, resp.headers());
 
@@ -429,6 +430,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
             stat.wire_body_size = sub_stat.wire_body_size;
             stat.time_to_first_100k = sub_stat.time_to_first_100k;
             stat.server_timing = sub_stat.server_timing;
+            stat.version = sub_stat.version;
         }
         Err(err) => {
             if !err.is_h3_no_error() {
@@ -623,6 +625,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     // Process response
     stat.status = Some(resp.status());
     stat.headers = Some(resp.headers().clone());
+    stat.version = Some(format!("{:?}", resp.version()));
     capture_server_timing(&mut stat, resp.headers());
     capture_protocol_advertisements(&mut stat, resp.headers());
 
@@ -925,6 +928,7 @@ impl HttpConnection {
         record_send_split(&mut stat, send_start, response_at, &done);
         stat.status = Some(resp.status());
         stat.headers = Some(resp.headers().clone());
+        stat.version = Some(format!("{:?}", resp.version()));
         capture_server_timing(&mut stat, resp.headers());
         capture_protocol_advertisements(&mut stat, resp.headers());
 
