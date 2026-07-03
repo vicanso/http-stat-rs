@@ -9,7 +9,7 @@
 ## 亮点
 
 - **HTTP/1.1、HTTP/2 和 HTTP/3 (QUIC)** — 全面支持现代协议，一个参数即可切换
-- **gRPC 健康检查** — 使用 `grpc://` 或 `grpcs://` 协议直接探测 gRPC 服务
+- **gRPC 健康检查** — 使用 `grpc://` 或 `grpcs://` 协议直接探测 gRPC 服务；`grpcs://` 执行真实的 rustls 握手（支持 `-k` 与 mTLS），并报告 TLS 耗时和证书详情
 - **请求发送阶段独立计时** — 将请求体上传与服务端处理拆开，POST/PUT 上传慢不再被误判为"服务器慢"
 - **Server-Timing 解析** — 解析 RFC 8673 `Server-Timing` 响应头，把服务端报告的子阶段耗时（CDN edge / origin / worker 等）直接展开在 TTFB 之下
 - **基准测试模式** — `-n 10` 重复 N 次输出 min/max/avg/p50/p95/p99；加 `-K` 复用连接，对比冷启动与热请求延迟
@@ -23,8 +23,8 @@
 - **JSON 输出** — `--json` 方便脚本集成、CI/CD 流水线和监控系统对接。完整的输出契约见 [JSON_SCHEMA.md](./JSON_SCHEMA.md)，包含退出码、可选字段以及可直接复用的 `jq` 配方
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
 - **TLS 握手诊断** — 每次 HTTPS 请求都会报告握手类型（`Full` / `Resumed`）、服务器是否进行 OCSP stapling，以及在 `-n` 基准测试模式下后续请求是否接受了 0-RTT 早期数据
-- **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 重定向自动合并 `Set-Cookie`
-- **符合规范的重定向** — `-L` 最多跟随 10 跳并解析相对 `Location`；请求方法按 RFC 9110 降级（303 → GET，301/302 的 POST → GET，307/308 保持不变），跨 host 重定向时剥离 `Authorization`，避免凭据泄露给第三方
+- **Cookie 支持** — `-b 'k=v'` 或 `-b @file`，配合 `-L` 同 host 重定向自动合并 `Set-Cookie`
+- **符合规范的重定向** — `-L` 最多跟随 10 跳并解析相对 `Location`；请求方法按 RFC 9110 降级（303 → GET，301/302 的 POST → GET，307/308 保持不变），跨 host 重定向时剥离 `Authorization`、Cookie 与 `--resolve` 钉扎，避免凭据泄露给第三方
 - **ALPN 协议协商展示** — 每次响应明确显示客户端与服务端最终协商出的协议版本（`HTTP/1.1`、`H2`、`H3`），清楚知道实际使用了哪个版本
 - **Alt-Svc 自动升级** — `--alt-svc` 检测响应中广告的 HTTP/3 端点（RFC 7838），自动用 h3 重试一次，无需手动 `--http3` 就能看到真实的 h3 耗时
 - **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段（支持 `.a.b`、`.[0]`、`.[]`）；遇到不支持的语法或非 JSON 响应体会明确报错，而不是静默输出完整 body
@@ -37,8 +37,9 @@
 - **源 IP 绑定** — `--bind <IP>` 将出站连接绑定到指定本地地址，多网卡环境、策略路由或验证特定网卡可达性时不可或缺
 - **mTLS（双向 TLS）** — `--cert`/`--key` 发送客户端证书，适用于零信任网络和服务网格
 - **配置文件** — `~/.httpstatrc` 设置持久化默认值（DNS、超时、请求头等），CLI 参数始终优先
-- **细粒度超时** — `--timeout` 作用于每个阶段；`--connect-timeout` 仅限制连接阶段（DNS + TCP + TLS/QUIC）；`--max-time` 是覆盖响应体与重定向的整体墙钟上限
+- **细粒度超时** — `--timeout` 作用于每个阶段，包括等待响应头与响应体传输，服务器只连接不应答也无法把进程吊死；`--connect-timeout` 仅限制连接阶段（DNS + TCP + TLS/QUIC）；`--max-time` 是覆盖响应体与重定向的整体墙钟上限
 - **自动重试** — `--retry N` 对瞬时失败（超时、连接错误、HTTP 408/429/500/502/503/504）按指数退避重试，或用 `--retry-delay` 指定固定间隔；适合不稳定的 CI 门禁
+- **响应体大小上限** — 响应体整体缓冲在内存中，`--max-filesize` 在超限时直接中止传输（默认 1GB，`0` 表示不限），防止失控的超大响应耗尽内存
 - **语义化退出码** — DNS、TCP、TLS、超时、4xx、5xx 各有独立退出码，脚本判断更便捷
 - **极小体积** — release 构建采用 LTO + `opt-level=z` + strip，通常 < 5 MB
 - **真正的零系统依赖** — 静态链接，不依赖 libcurl、OpenSSL 或 libc（musl 构建），可直接放入 `scratch` 或 `alpine` Docker 镜像用于生产环境排查
@@ -171,6 +172,9 @@ httpstat --retry 3 https://example.com
 # 用固定间隔重试，而非退避
 httpstat --retry 5 --retry-delay 2s https://example.com
 
+# 响应体超过 10MB 直接中止（默认上限 1GB）
+httpstat --max-filesize 10MB https://example.com/big.bin
+
 # mTLS — 发送客户端证书
 httpstat --cert client.crt --key client.key https://mtls.example.com
 
@@ -234,6 +238,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
       --max-time <DUR>             整个操作（含响应体与重定向）的总时限，例如 30s
       --retry <RETRY>              瞬时失败时最多重试 N 次（超时、连接错误、408/429/5xx）
       --retry-delay <DUR>          重试之间的固定间隔（例如 2s）；默认使用指数退避
+      --max-filesize <SIZE>        响应体缓冲上限，例如 100MB（默认 1GB）；0 表示不限
   -n, --count <COUNT>              基准测试请求次数，输出 min/max/avg/p50/p95/p99 统计
   -K, --reuse                      基准测试中复用连接（需配合 -n），测试热请求性能
   -b, --cookie <COOKIE>            发送 Cookie：'name=value; name2=value2' 或从文件读取 @filename
@@ -265,6 +270,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
   "max_time": "30s",
   "retry": 3,
   "retry_delay": "2s",
+  "max_filesize": "1GB",
   "verbose": false,
   "pretty": false,
   "silent": false,

@@ -36,7 +36,7 @@ the terminal renderer only.
   "status":        200,
   "alpn":          "h2 | http/1.1 | h3 | null",
   "tls":           { /* present whenever the connection used TLS */ },
-  "headers":       { /* response headers as a flat string->string map */ },
+  "headers":       { /* response headers; string, or array of strings for repeated headers */ },
   "body_size":     12345,
   "error":         "string | null",
   "exit_code":     0
@@ -170,7 +170,7 @@ parseable `max-age`.
 | `addr` | string \| null | Resolved `ip:port` (or `[ipv6]:port`). `null` if DNS failed. |
 | `status` | integer \| null | HTTP status code, or `null` if no response. |
 | `alpn` | string \| null | ALPN-selected protocol (`"h2"`, `"http/1.1"`, `"h3"`). |
-| `headers` | object \| null | Response headers as a flat `{string: string}` map. Multi-value headers are joined per `http::HeaderMap` semantics. |
+| `headers` | object \| null | Response headers. A header that appears once maps to a string; a repeated header (e.g. `Set-Cookie`) maps to an array of strings, so no value is dropped. |
 | `body_size` | integer \| null | Decoded body size in bytes (after `gzip`/`brotli`/`zstd`). |
 | `error` | string \| null | Human-readable error string when the request failed. |
 | `exit_code` | integer | Process exit code (see table below). Always present. |

@@ -11,7 +11,7 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 ## Highlights
 
 - **HTTP/1.1, HTTP/2 & HTTP/3 (QUIC)** — first-class support for all modern protocols, switch with a single flag
-- **gRPC health check** — use `grpc://` or `grpcs://` scheme to probe gRPC services
+- **gRPC health check** — use `grpc://` or `grpcs://` scheme to probe gRPC services; `grpcs://` performs a real rustls handshake (honoring `-k` and mTLS) and reports the TLS timing and certificate details
 - **Request Send phase** — request body upload is timed separately from Server Processing, so a slow POST upload no longer hides as "server is slow"
 - **Server-Timing inspection** — parses the `Server-Timing` response header (RFC 8673) and displays the server-reported breakdown *inside* TTFB (CDN edge vs origin vs worker, etc.)
 - **Benchmark mode** — `-n 10` repeats N times with min/max/avg/p50/p95/p99; add `-K` to reuse the connection and compare cold vs warm latency
@@ -25,8 +25,8 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **JSON output** — `--json` for scripting, CI/CD pipelines, and monitoring integration. The full output contract is documented in [JSON_SCHEMA.md](./JSON_SCHEMA.md), including exit codes, optional blocks, and ready-to-use `jq` recipes
 - **TLS inspection** — verbose mode shows full certificate chain, cipher suite, SAN domains, and validity
 - **TLS handshake diagnostics** — every HTTPS request reports whether the handshake was `Full` or `Resumed`, whether the server stapled an OCSP response, and (in `-n` benchmark mode, where runs 2+ can resume) whether 0-RTT early data was accepted
-- **Cookie support** — `-b 'k=v'` or `-b @file`, auto-carried across `-L` redirects with `Set-Cookie` merging
-- **Standards-correct redirects** — `-L` follows up to 10 hops and resolves relative `Location` URLs; the request method downgrades per RFC 9110 (303 → GET, 301/302 POST → GET, 307/308 preserved) and `Authorization` is stripped when the redirect crosses to a different host
+- **Cookie support** — `-b 'k=v'` or `-b @file`, auto-carried across same-host `-L` redirects with `Set-Cookie` merging
+- **Standards-correct redirects** — `-L` follows up to 10 hops and resolves relative `Location` URLs; the request method downgrades per RFC 9110 (303 → GET, 301/302 POST → GET, 307/308 preserved), and `Authorization`, cookies and `--resolve` pins are all dropped when the redirect crosses to a different host
 - **ALPN negotiation display** — every response line shows the final protocol agreed between client and server (`HTTP/1.1`, `H2`, `H3`), so you always know which version was actually used
 - **Alt-Svc auto-upgrade** — `--alt-svc` detects an advertised HTTP/3 endpoint (RFC 7838) in the response and automatically retries once over h3, so you see the real h3 timing without manually passing `--http3`
 - **JSON field selector** — `--jq '.items[].name'` extracts fields directly from the response body (supports `.a.b`, `.[0]`, `.[]`); an unsupported filter or a non-JSON body prints a clear error instead of silently dumping the full body
@@ -39,8 +39,9 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **Source IP binding** — `--bind <IP>` pins outbound connections to a specific local address; essential for multi-NIC hosts, policy routing, or validating which interface reaches a target
 - **mTLS (mutual TLS)** — `--cert`/`--key` sends a client certificate for zero-trust and service mesh authentication
 - **Config file** — `~/.httpstatrc` sets persistent defaults (DNS, timeout, headers, etc.); CLI flags always win
-- **Fine-grained timeouts** — `--timeout` caps every phase; `--connect-timeout` bounds only the connection phase (DNS + TCP + TLS/QUIC); `--max-time` is an overall wall-clock cap covering the response body and any followed redirects
+- **Fine-grained timeouts** — `--timeout` caps every phase, including the wait for response headers and the body transfer, so a server that accepts the connection but never answers can't hang the process; `--connect-timeout` bounds only the connection phase (DNS + TCP + TLS/QUIC); `--max-time` is an overall wall-clock cap covering the response body and any followed redirects
 - **Automatic retry** — `--retry N` retries transient failures (timeouts, connection errors, HTTP 408/429/500/502/503/504) with exponential backoff, or a fixed `--retry-delay`; ideal for flaky CI gates
+- **Response body cap** — bodies are buffered in memory, so `--max-filesize` aborts any transfer that would exceed the limit (default 1GB, `0` = unlimited) before a runaway response can exhaust memory
 - **Semantic exit codes** — distinct codes for DNS, TCP, TLS, timeout, 4xx, 5xx failures for easy scripting
 - **Tiny binary** — release build uses LTO + `opt-level=z` + strip, typically < 5 MB
 - **Truly zero system dependencies** — statically linked, no libcurl, no OpenSSL, no libc on musl builds; drop the binary directly into a `scratch` or `alpine` Docker image for production diagnostics
@@ -173,6 +174,9 @@ httpstat --retry 3 https://example.com
 # Retry with a fixed delay instead of backoff
 httpstat --retry 5 --retry-delay 2s https://example.com
 
+# Abort if the response body exceeds 10MB (default cap is 1GB)
+httpstat --max-filesize 10MB https://example.com/big.bin
+
 # mTLS — send client certificate
 httpstat --cert client.crt --key client.key https://mtls.example.com
 
@@ -236,6 +240,7 @@ Options:
       --max-time <DUR>             overall time limit for the whole operation incl. body and redirects, e.g. 30s
       --retry <RETRY>              retry up to N times on transient failure (timeout, conn error, 408/429/5xx)
       --retry-delay <DUR>          fixed delay between retries (e.g. 2s); default is exponential backoff
+      --max-filesize <SIZE>        max response body size to buffer, e.g. 100MB (default 1GB); 0 = unlimited
   -n, --count <COUNT>              number of requests for benchmarking, show min/max/avg/p50/p95/p99 stats
   -K, --reuse                      reuse connection in benchmark mode (requires -n), test warm request performance
   -b, --cookie <COOKIE>            send cookies: 'name=value; name2=value2' or from file use @filename
@@ -267,6 +272,7 @@ Create `~/.httpstatrc` as a JSON object — any field can be omitted. CLI flags 
   "max_time": "30s",
   "retry": 3,
   "retry_delay": "2s",
+  "max_filesize": "1GB",
   "verbose": false,
   "pretty": false,
   "silent": false,
