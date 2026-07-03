@@ -15,16 +15,22 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
-use crate::{dns_resolve, finish_with_error, tcp_connect, Error, HttpRequest, HttpStat};
+use crate::{
+    dns_resolve, finish_with_error, tcp_connect, tls_handshake, Error, HttpRequest, HttpStat,
+    ALPN_HTTP2,
+};
 use http::uri::Uri;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio_rustls::client::TlsStream;
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::{pb::HealthCheckRequest, ServingStatus};
 use tower_service::Service;
@@ -32,13 +38,60 @@ use tower_service::Service;
 // Version information from Cargo.toml
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Transport handed to tonic: plain TCP for `grpc://`, rustls-wrapped TCP
+/// for `grpcs://`.
+pub(crate) enum GrpcStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for GrpcStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            GrpcStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for GrpcStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            GrpcStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            GrpcStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            GrpcStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 struct CustomHttpConnector {
     http_req: HttpRequest,
     stat: Arc<Mutex<HttpStat>>,
 }
 
 impl Service<Uri> for CustomHttpConnector {
-    type Response = TokioIo<TcpStream>;
+    type Response = TokioIo<GrpcStream>;
     type Error = Error;
     type Future = ConnectorConnecting;
 
@@ -51,13 +104,23 @@ impl Service<Uri> for CustomHttpConnector {
         let stat = Arc::clone(&self.stat);
         let fut = async move {
             let mut stat = stat.lock().await;
-            let (addr, _host) = dns_resolve(&http_req, &mut stat).await?;
+            let (addr, host) = dns_resolve(&http_req, &mut stat).await?;
             // gRPC uses tonic's high-level client; we can't reliably sample
             // post-transfer TCP_INFO, so drop the probe. The post-connect
             // baseline is already populated by tcp_connect.
             let (tcp_stream, _tcp_probe) =
                 tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, &mut stat).await?;
-            Ok(TokioIo::new(tcp_stream))
+            // grpcs:// = gRPC over TLS: run the rustls handshake (honoring
+            // --skip-verify and mTLS) with h2 as the only ALPN offer, since
+            // gRPC requires HTTP/2.
+            if http_req.uri.scheme_str() == Some("grpcs") {
+                let mut tls_req = http_req.clone();
+                tls_req.alpn_protocols = vec![ALPN_HTTP2.to_string()];
+                let (tls_stream, _) = tls_handshake(host, tcp_stream, &tls_req, &mut stat).await?;
+                Ok(TokioIo::new(GrpcStream::Tls(Box::new(tls_stream))))
+            } else {
+                Ok(TokioIo::new(GrpcStream::Plain(tcp_stream)))
+            }
         };
         ConnectorConnecting {
             inner: Box::pin(fut),
@@ -65,7 +128,7 @@ impl Service<Uri> for CustomHttpConnector {
     }
 }
 
-type ConnectResult = Result<TokioIo<TcpStream>, Error>;
+type ConnectResult = Result<TokioIo<GrpcStream>, Error>;
 
 pub(crate) struct ConnectorConnecting {
     inner: Pin<Box<dyn Future<Output = ConnectResult> + Send>>,
@@ -79,13 +142,30 @@ impl Future for ConnectorConnecting {
     }
 }
 
+/// The `:scheme` pseudo-header tonic sends comes from the endpoint URI.
+/// `grpc`/`grpcs` are not valid HTTP schemes and strict servers reset the
+/// stream with PROTOCOL_ERROR, so normalize to `http`/`https` here; the
+/// connector keeps looking at the original request URI for TLS routing.
+fn endpoint_uri(uri: &Uri) -> Uri {
+    let mut parts = uri.clone().into_parts();
+    parts.scheme = Some(if uri.scheme_str() == Some("grpcs") {
+        http::uri::Scheme::HTTPS
+    } else {
+        http::uri::Scheme::HTTP
+    });
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    }
+    Uri::from_parts(parts).unwrap_or_else(|_| uri.clone())
+}
+
 pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
     let start = Instant::now();
     let stat = Arc::new(Mutex::new(HttpStat {
         is_grpc: true,
         ..Default::default()
     }));
-    let endpoint = tonic::transport::Endpoint::from(http_req.uri.clone());
+    let endpoint = tonic::transport::Endpoint::from(endpoint_uri(&http_req.uri));
     let endpoint = match endpoint.user_agent(format!("httpstat.rs/{VERSION}")) {
         Ok(endpoint) => endpoint,
         Err(e) => {

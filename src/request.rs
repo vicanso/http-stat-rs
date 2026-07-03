@@ -171,9 +171,12 @@ fn capture_protocol_advertisements(stat: &mut HttpStat, headers: &http::HeaderMa
 /// accumulator first crosses [`FIRST_CHUNK_BYTES`]. The returned tuple is
 /// `(body_bytes, time_to_first_100k)`. `time_to_first_100k` is `None` when
 /// the body is smaller than the threshold — there's no split to report.
+/// The body is buffered whole in memory, so `max_body_size` aborts the
+/// transfer once the accumulator would exceed it.
 async fn drain_body_with_split(
     body: Incoming,
     start: Instant,
+    max_body_size: Option<usize>,
 ) -> std::result::Result<(Bytes, Option<Duration>), String> {
     let mut body = body;
     let mut buf = BytesMut::new();
@@ -181,6 +184,11 @@ async fn drain_body_with_split(
     while let Some(frame_res) = body.frame().await {
         let frame = frame_res.map_err(|e| format!("Failed to read response body: {e}"))?;
         if let Ok(data) = frame.into_data() {
+            if let Some(max) = max_body_size {
+                if buf.len() + data.len() > max {
+                    return Err(body_limit_error(max));
+                }
+            }
             buf.extend_from_slice(&data);
             if first_chunk_at.is_none() && buf.len() >= FIRST_CHUNK_BYTES {
                 first_chunk_at = Some(start.elapsed());
@@ -189,6 +197,15 @@ async fn drain_body_with_split(
     }
     Ok((buf.freeze(), first_chunk_at))
 }
+
+fn body_limit_error(max: usize) -> String {
+    format!("response body exceeds the {max} byte limit (--max-filesize, 0 = unlimited)")
+}
+
+/// Default deadline for a single request/response phase when the caller
+/// didn't set `request_timeout` — keeps a silent server from hanging the
+/// process forever.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Initialize crypto provider once
 static INIT: Once = Once::new();
@@ -212,7 +229,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut sender, conn) = timeout(
-        request_timeout.unwrap_or(Duration::from_secs(30)),
+        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
         hyper::client::conn::http1::handshake(TokioIo::new(stream)),
     )
     .await
@@ -227,10 +244,16 @@ where
     });
 
     let send_start = Instant::now();
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
+    // send_request resolves when the response *headers* arrive, so this
+    // timeout bounds request send + server processing — without it a
+    // server that accepts the connection but never answers hangs forever.
+    let resp = timeout(
+        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+        sender.send_request(req),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Hyper { source: e })?;
     let response_at = Instant::now();
     record_send_split(stat, send_start, response_at, &done);
     Ok(resp)
@@ -246,7 +269,7 @@ async fn send_https2_request(
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
-        request_timeout.unwrap_or(Duration::from_secs(30)),
+        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
     )
     .await
@@ -266,10 +289,14 @@ async fn send_https2_request(
     req.headers_mut().remove("Host");
 
     let send_start = Instant::now();
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| Error::Hyper { source: e })?;
+    // Bounds request send + server processing (see send_http1_request).
+    let resp = timeout(
+        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+        sender.send_request(req),
+    )
+    .await
+    .map_err(|e| Error::Timeout { source: e })?
+    .map_err(|e| Error::Hyper { source: e })?;
     let response_at = Instant::now();
     record_send_split(stat, send_start, response_at, &done);
     Ok(resp)
@@ -320,26 +347,12 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     stat.tls = Some("tls 1.3".to_string()); // QUIC always uses TLS 1.3
     stat.alpn = Some(ALPN_HTTP3.to_string()); // We always use HTTP/3 for QUIC
 
-    // Extract certificate information
+    // Extract certificate information. Note: quinn's public API only exposes
+    // ALPN + server_name (`HandshakeData`), not the negotiated cipher suite,
+    // so `cert_cipher` is intentionally left unset for HTTP/3 — reporting the
+    // certificate's signature algorithm as a "cipher" would be fabrication.
     if let Some(peer_identity) = conn.peer_identity() {
         if let Ok(certs) = peer_identity.downcast::<Vec<rustls::pki_types::CertificateDer>>() {
-            // Set cipher from first cert's signature algorithm (HTTP/3 specific)
-            if let Some(first_cert) = certs.first() {
-                if let Ok((_, cert)) = x509_parser::parse_x509_certificate(first_cert.as_ref()) {
-                    let oid_str = match cert.signature_algorithm.algorithm.to_string().as_str() {
-                        "1.2.840.113549.1.1.11" => "AES_256_GCM_SHA384".to_string(),
-                        "1.2.840.113549.1.1.12" => "AES_128_GCM_SHA256".to_string(),
-                        "1.2.840.113549.1.1.13" => "CHACHA20_POLY1305_SHA256".to_string(),
-                        "1.2.840.10045.4.3.2" => "AES_256_GCM_SHA384".to_string(),
-                        "1.2.840.10045.4.3.3" => "AES_128_GCM_SHA256".to_string(),
-                        "1.2.840.10045.4.3.4" => "CHACHA20_POLY1305_SHA256".to_string(),
-                        "1.3.101.112" => "AES_256_GCM_SHA384".to_string(),
-                        "1.3.101.113" => "AES_128_GCM_SHA256".to_string(),
-                        _ => format!("{:?}", cert.signature_algorithm.algorithm),
-                    };
-                    stat.cert_cipher = Some(oid_str);
-                }
-            }
             parse_certificates(&certs, &mut stat);
         }
     }
@@ -371,6 +384,8 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
     };
     *req.version_mut() = Version::HTTP_3;
     stat.request_headers = req.headers().clone();
+    let request_timeout = http_req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+    let max_body_size = http_req.max_body_size;
     let body = http_req.body.unwrap_or_default();
 
     // Handle connection driver
@@ -404,6 +419,12 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         let mut buf = BytesMut::new();
         let mut first_chunk_at: Option<Duration> = None;
         while let Some(chunk) = stream.recv_data().await? {
+            if let Some(max) = max_body_size {
+                if buf.len() + chunk.chunk().len() > max {
+                    sub_stat.error = Some(body_limit_error(max));
+                    break;
+                }
+            }
             buf.extend(chunk.chunk());
             if first_chunk_at.is_none() && buf.len() >= FIRST_CHUNK_BYTES {
                 first_chunk_at = Some(content_transfer_start.elapsed());
@@ -416,10 +437,12 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
         Ok::<HttpStat, h3::error::StreamError>(sub_stat)
     };
 
-    // Execute request and handle results
-    let (req_res, drive_res) = tokio::join!(request, drive);
+    // Execute request and handle results. The timeout bounds request send +
+    // server processing + body transfer — without it a server that completes
+    // the QUIC handshake but never answers hangs the process.
+    let (req_res, drive_res) = tokio::join!(timeout(request_timeout, request), drive);
     match req_res {
-        Ok(sub_stat) => {
+        Ok(Ok(sub_stat)) => {
             stat.request_send = sub_stat.request_send;
             stat.server_processing = sub_stat.server_processing;
             stat.content_transfer = sub_stat.content_transfer;
@@ -429,11 +452,18 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
             stat.wire_body_size = sub_stat.wire_body_size;
             stat.time_to_first_100k = sub_stat.time_to_first_100k;
             stat.server_timing = sub_stat.server_timing;
+            stat.alt_svc = sub_stat.alt_svc;
+            stat.hsts = sub_stat.hsts;
+            // e.g. the body-size limit tripped mid-transfer
+            stat.error = sub_stat.error;
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             if !err.is_h3_no_error() {
                 stat.error = Some(err.to_string());
             }
+        }
+        Err(e) => {
+            stat.error = Some(format!("request timeout: {e}"));
         }
     }
     if let Err(err) = drive_res {
@@ -635,10 +665,19 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     // us split throughput into "first 100 KB" (TCP slow-start dominated)
     // and "tail" (steady-state server send rate).
     let content_transfer_start = Instant::now();
-    let drain_result = drain_body_with_split(resp.into_body(), content_transfer_start).await;
+    let drain_result = timeout(
+        http_req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+        drain_body_with_split(
+            resp.into_body(),
+            content_transfer_start,
+            http_req.max_body_size,
+        ),
+    )
+    .await;
     let (body_bytes, time_to_first_100k) = match drain_result {
-        Ok(p) => p,
-        Err(e) => return finish_with_error(stat, e, start),
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return finish_with_error(stat, e, start),
+        Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
     };
     stat.wire_body_size = Some(body_bytes.len());
     stat.time_to_first_100k = time_to_first_100k;
@@ -907,19 +946,24 @@ impl HttpConnection {
         }
 
         let send_start = Instant::now();
+        let request_timeout = http_req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        // Bounds request send + server processing (see send_http1_request).
         let resp = match &mut self.sender {
-            ConnectionSender::Http1(sender) => sender.send_request(req).await,
+            ConnectionSender::Http1(sender) => {
+                timeout(request_timeout, sender.send_request(req)).await
+            }
             ConnectionSender::Http2(sender) => {
                 let mut req = req;
                 *req.version_mut() = Version::HTTP_2;
                 req.headers_mut().remove("Host");
-                sender.send_request(req).await
+                timeout(request_timeout, sender.send_request(req)).await
             }
         };
 
         let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) => return finish_with_error(stat, Error::Hyper { source: e }, start),
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return finish_with_error(stat, Error::Hyper { source: e }, start),
+            Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
         };
         let response_at = Instant::now();
         record_send_split(&mut stat, send_start, response_at, &done);
@@ -932,15 +976,27 @@ impl HttpConnection {
         // time-to-first-100K marker for throughput-split diagnosis (matches
         // the http1_2_request path).
         let content_transfer_start = Instant::now();
-        match drain_body_with_split(resp.into_body(), content_transfer_start).await {
-            Ok((body_bytes, first_100k)) => {
+        let drained = timeout(
+            request_timeout,
+            drain_body_with_split(
+                resp.into_body(),
+                content_transfer_start,
+                http_req.max_body_size,
+            ),
+        )
+        .await;
+        match drained {
+            Ok(Ok((body_bytes, first_100k))) => {
                 stat.wire_body_size = Some(body_bytes.len());
                 stat.time_to_first_100k = first_100k;
                 stat.body = Some(body_bytes);
                 stat.content_transfer = Some(content_transfer_start.elapsed());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return finish_with_error(stat, e, start);
+            }
+            Err(e) => {
+                return finish_with_error(stat, Error::Timeout { source: e }, start);
             }
         }
 

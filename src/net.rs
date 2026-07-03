@@ -185,6 +185,10 @@ pub(crate) async fn dns_resolve(
         return Ok((addr, host));
     }
 
+    // Past the IP-literal / --resolve shortcuts: a real resolver runs from
+    // here on, so a missing dns_lookup now means the lookup itself failed.
+    stat.dns_attempted = true;
+
     // Configure DNS resolver
     let provider = TokioRuntimeProvider::default();
     let mut server_config: Option<ResolverConfig> = None;
@@ -409,11 +413,11 @@ pub(crate) async fn tls_handshake(
     let mut root_store = RootCertStore::empty();
     let certs = rustls_native_certs::load_native_certs().certs;
 
-    // Add root certificates
+    // Add root certificates. Skip entries the parser rejects instead of
+    // failing outright: one malformed cert in the OS trust store shouldn't
+    // take down every TLS connection (matches the DoH probe path).
     for cert in certs {
-        root_store
-            .add(cert)
-            .map_err(|e| Error::Rustls { source: e })?;
+        let _ = root_store.add(cert);
     }
 
     // Build a webpki-backed verifier that we can wrap to observe OCSP stapling.
@@ -563,11 +567,9 @@ pub(crate) async fn quic_connect(
     let mut root_store = RootCertStore::empty();
     let certs = rustls_native_certs::load_native_certs().certs;
 
-    // Add root certificates
+    // Add root certificates, skipping malformed entries (see tls_handshake).
     for cert in certs {
-        root_store
-            .add(cert)
-            .map_err(|e| Error::Rustls { source: e })?;
+        let _ = root_store.add(cert);
     }
 
     let builder = ClientConfig::builder().with_root_certificates(root_store);

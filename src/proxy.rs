@@ -110,6 +110,17 @@ pub(crate) async fn socks5_connect(
 
     // CONNECT request using domain name address type (0x03)
     let host_bytes = target_host.as_bytes();
+    // The domain-name length is a single byte: a longer host would silently
+    // wrap `len() as u8` and produce a corrupt CONNECT request.
+    if host_bytes.len() > 255 {
+        return Err(Error::Common {
+            category: "socks5".to_string(),
+            message: format!(
+                "target host too long for socks5 domain addressing ({} bytes, max 255)",
+                host_bytes.len()
+            ),
+        });
+    }
     let mut req = vec![
         0x05,                   // version
         0x01,                   // command: CONNECT

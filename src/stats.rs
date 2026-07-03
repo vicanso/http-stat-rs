@@ -126,6 +126,11 @@ struct Timeline {
 pub struct HttpStat {
     pub is_grpc: bool,
     pub request_headers: HeaderMap<HeaderValue>,
+    /// True when a real DNS resolution was attempted for this request.
+    /// Stays false for IP-literal hosts, `--resolve` pins and proxied
+    /// requests (the proxy resolves the target itself), so `exit_code()`
+    /// can tell "DNS failed" apart from "DNS was never needed".
+    pub dns_attempted: bool,
     pub dns_lookup: Option<Duration>,
     /// Cold connect cost (TCP + TLS) to the DNS server. Only populated when
     /// using DoH or DoT — for plain UDP DNS this stays None. When present,
@@ -558,8 +563,11 @@ impl HttpStat {
         if err.contains("timeout") || err.contains("elapsed") {
             return 5;
         }
-        // DNS failure: dns_lookup phase never completed
-        if self.dns_lookup.is_none() {
+        // DNS failure: resolution was attempted but never completed. The
+        // `dns_attempted` guard keeps IP-literal / --resolve / proxied
+        // requests (which legitimately skip DNS) from being misreported
+        // as DNS failures when their TCP connect fails.
+        if self.dns_attempted && self.dns_lookup.is_none() {
             return 2;
         }
         // TCP failure: tcp/quic connection phase never completed
@@ -934,12 +942,23 @@ impl HttpStat {
             obj.insert("tls".into(), Value::Object(tls));
         }
 
-        // Headers
+        // Headers. A name can repeat (e.g. multiple Set-Cookie); emit a
+        // string for the common single-value case and an array when the
+        // header appeared more than once, so no value is silently dropped.
         if let Some(headers) = &self.headers {
             let mut hdr_map = Map::new();
-            for (key, value) in headers.iter() {
-                let v = value.to_str().unwrap_or_default().to_string();
-                hdr_map.insert(key.to_string(), json!(v));
+            for key in headers.keys() {
+                let mut values: Vec<Value> = headers
+                    .get_all(key)
+                    .iter()
+                    .map(|value| json!(value.to_str().unwrap_or_default()))
+                    .collect();
+                let v = if values.len() == 1 {
+                    values.remove(0)
+                } else {
+                    Value::Array(values)
+                };
+                hdr_map.insert(key.to_string(), v);
             }
             obj.insert("headers".into(), Value::Object(hdr_map));
         }
@@ -1041,12 +1060,10 @@ impl fmt::Display for HttpStat {
         if let Some(tls) = &self.tls {
             writeln!(f)?;
             writeln!(f, "{}: {}", s.tls_label, LightCyan.paint(tls))?;
-            writeln!(
-                f,
-                "{}: {}",
-                s.cipher,
-                LightCyan.paint(self.cert_cipher.as_deref().unwrap_or_default())
-            )?;
+            // Unknown for HTTP/3: quinn doesn't expose the negotiated suite.
+            if let Some(cipher) = self.cert_cipher.as_deref() {
+                writeln!(f, "{}: {}", s.cipher, LightCyan.paint(cipher))?;
+            }
             if let Some(resumed) = self.tls_resumed {
                 let label = if resumed {
                     s.handshake_resumed
@@ -1915,6 +1932,29 @@ mod tests {
         }
     }
 
+    // ---- to_json ----
+    #[test]
+    fn to_json_keeps_duplicate_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append("set-cookie", "a=1".parse().unwrap());
+        headers.append("set-cookie", "b=2".parse().unwrap());
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let stat = HttpStat {
+            headers: Some(headers),
+            ..Default::default()
+        };
+        let json = stat.to_json();
+        let hdrs = json.get("headers").unwrap();
+        assert_eq!(
+            hdrs.get("set-cookie").unwrap(),
+            &serde_json::json!(["a=1", "b=2"])
+        );
+        assert_eq!(
+            hdrs.get("content-type").unwrap(),
+            &serde_json::json!("text/html")
+        );
+    }
+
     // ---- is_success / exit_code ----
     #[test]
     fn success_and_status_exit_codes() {
@@ -1952,16 +1992,26 @@ mod tests {
 
         let dns = HttpStat {
             error: Some("no such host".into()),
+            dns_attempted: true,
             ..Default::default()
         };
         assert_eq!(dns.exit_code(), 2);
 
         let tcp = HttpStat {
             error: Some("connection refused".into()),
+            dns_attempted: true,
             dns_lookup: Some(Duration::from_millis(1)),
             ..Default::default()
         };
         assert_eq!(tcp.exit_code(), 3);
+
+        // IP-literal / --resolve / proxy targets skip DNS entirely: a refused
+        // connection must map to the TCP code, not the DNS one.
+        let refused_no_dns = HttpStat {
+            error: Some("connection refused".into()),
+            ..Default::default()
+        };
+        assert_eq!(refused_no_dns.exit_code(), 3);
 
         let tls = HttpStat {
             error: Some("rustls: bad certificate".into()),

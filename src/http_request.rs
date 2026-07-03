@@ -138,6 +138,11 @@ pub struct HttpRequest {
     pub use_absolute_uri: bool,                  // Send absolute URI (HTTP forward proxy)
     pub connect_to: Vec<String>,                 // --connect-to HOST1:PORT1:HOST2:PORT2 overrides
     pub bind_addr: Option<IpAddr>,               // Local source IP to bind before connecting
+    /// Maximum response body bytes to buffer. The whole body is held in
+    /// memory, so an unbounded response could otherwise OOM the process;
+    /// when the limit is exceeded the transfer aborts with an error.
+    /// `None` = unlimited (the CLI applies its own default cap).
+    pub max_body_size: Option<usize>,
     /// Optional shared TLS session store. When set, the rustls `ClientConfig`
     /// is wired with `Resumption::store(...)` and `enable_early_data = true`,
     /// so subsequent requests sharing this store can perform a resumed

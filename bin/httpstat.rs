@@ -190,6 +190,14 @@ struct Args {
     )]
     retry_delay: Option<String>,
 
+    /// Abort the transfer when the response body exceeds this size. The body
+    /// is buffered in memory, so the cap protects against unbounded responses.
+    #[arg(
+        long = "max-filesize",
+        help = "max response body size to buffer, e.g. 100MB (default 1GB); 0 = unlimited"
+    )]
+    max_filesize: Option<String>,
+
     /// Number of requests to make for benchmarking
     #[arg(
         short = 'n',
@@ -333,6 +341,7 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
     cfg_opt_str!(connect_timeout);
     cfg_opt_str!(max_time);
     cfg_opt_str!(retry_delay);
+    cfg_opt_str!(max_filesize);
     cfg_opt_str!(cookie);
     cfg_opt_str!(output);
     // Numeric: retry count
@@ -494,23 +503,33 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
                 if let Some(h) = req.headers.as_mut() {
                     h.remove(http::header::AUTHORIZATION);
                 }
+                // A --resolve pin belongs to the original host only; keeping
+                // it would silently connect the new host to the pinned IP
+                // with the wrong SNI/Host. Fall back to real DNS instead.
+                req.resolve = None;
             }
 
             // Carry cookies across the redirect (this hop's Set-Cookie merged
-            // into the forwarded Cookie header).
-            let existing_cookie = req
-                .headers
-                .as_ref()
-                .and_then(|h| h.get(http::header::COOKIE))
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            let merged = collect_cookies(&stat, &existing_cookie);
-            if !merged.is_empty() {
-                if let Ok(value) = merged.parse::<HeaderValue>() {
-                    let header_map = req.headers.get_or_insert_with(HeaderMap::new);
-                    header_map.insert(http::header::COOKIE, value);
+            // into the forwarded Cookie header). Cookies are host-scoped
+            // credentials just like Authorization: on a cross-host redirect
+            // drop them instead of leaking the session to a third party.
+            if same_host {
+                let existing_cookie = req
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get(http::header::COOKIE))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let merged = collect_cookies(&stat, &existing_cookie);
+                if !merged.is_empty() {
+                    if let Ok(value) = merged.parse::<HeaderValue>() {
+                        let header_map = req.headers.get_or_insert_with(HeaderMap::new);
+                        header_map.insert(http::header::COOKIE, value);
+                    }
                 }
+            } else if let Some(h) = req.headers.as_mut() {
+                h.remove(http::header::COOKIE);
             }
 
             req.uri = new_uri;
@@ -604,6 +623,39 @@ fn parse_dur(name: &str, value: &str) -> std::time::Duration {
         Err(e) => {
             eprintln!("httpstat: invalid {name} '{value}': {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Default response-body cap applied when `--max-filesize` isn't given:
+/// generous enough for any diagnostic use, small enough to keep a hostile
+/// endless body from OOMing the process.
+const DEFAULT_MAX_FILESIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// Parse a human byte size (e.g. `100MB`, `1GiB`, `52428800`), exiting with a
+/// clear message on a malformed value. `name` is the flag name for the error.
+fn parse_size(name: &str, value: &str) -> u64 {
+    match value.trim().parse::<bytesize::ByteSize>() {
+        Ok(v) => v.as_u64(),
+        Err(e) => {
+            eprintln!("httpstat: invalid {name} '{value}': {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Resolve `--max-filesize` into the request's body cap: default 1 GiB,
+/// explicit `0` disables the limit entirely.
+fn resolve_max_filesize(arg: Option<&str>) -> Option<usize> {
+    match arg {
+        None => Some(DEFAULT_MAX_FILESIZE as usize),
+        Some(v) => {
+            let n = parse_size("max-filesize", v);
+            if n == 0 {
+                None
+            } else {
+                Some(n as usize)
+            }
         }
     }
 }
@@ -871,6 +923,9 @@ async fn main() {
         req.tls_timeout = Some(ct);
         req.quic_timeout = Some(ct);
     }
+    // Response-body cap: default 1 GiB, --max-filesize 0 lifts it.
+    req.max_body_size = resolve_max_filesize(args.max_filesize.as_deref());
+
     // --max-time is an overall wall-clock cap enforced around each operation.
     let max_time = args.max_time.as_deref().map(|v| parse_dur("max-time", v));
     let retries = args.retry.unwrap_or(0);
@@ -1463,6 +1518,7 @@ mod tests {
         // DNS (exit 2) and TLS/cert (exit 4) failures are NOT retried
         let dns = HttpStat {
             error: Some("no such host".into()),
+            dns_attempted: true,
             ..Default::default()
         };
         assert!(!is_retryable(&dns));
@@ -1624,5 +1680,23 @@ mod tests {
             req2.connect_to,
             vec!["example.com:443:alt.example.com:443".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_size_accepts_common_forms() {
+        assert_eq!(parse_size("max-filesize", "100MB"), 100_000_000);
+        assert_eq!(parse_size("max-filesize", "1MiB"), 1024 * 1024);
+        assert_eq!(parse_size("max-filesize", "52428800"), 52_428_800);
+        assert_eq!(parse_size("max-filesize", "0"), 0);
+    }
+
+    #[test]
+    fn resolve_max_filesize_default_and_unlimited() {
+        assert_eq!(
+            resolve_max_filesize(None),
+            Some(DEFAULT_MAX_FILESIZE as usize)
+        );
+        assert_eq!(resolve_max_filesize(Some("0")), None);
+        assert_eq!(resolve_max_filesize(Some("10MB")), Some(10_000_000));
     }
 }
