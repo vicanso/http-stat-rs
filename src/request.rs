@@ -12,22 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
-// It includes features like DNS resolution, TLS handshake, and request/response handling
+// HTTP/1.1, HTTP/2, and HTTP/3 request execution.
 
+use super::body_io::{BodyPump, DrainedBody};
 use super::decompress::decompress;
 use super::error::{Error, Result};
 use super::finish_with_error;
 use super::grpc::grpc_request;
-use super::net::{dns_resolve, parse_certificates, quic_connect, tcp_connect, tls_handshake};
-use super::proxy::{http_connect, socks5_connect, ProxyConfig, ProxyKind};
-use super::stats::{
-    parse_alt_svc, parse_hsts, parse_server_timing, HttpStat, ALPN_HTTP3, FIRST_CHUNK_BYTES,
+use super::net::{
+    capture_quic_certs, dns_resolve, quic_connect, tcp_connect, tls_connect_stream, tls_handshake,
+    QuicConnect,
 };
+use super::proxy::{basic_auth_header, http_connect, socks5_connect, ProxyConfig, ProxyKind};
+use super::quic_info::QuicInfo;
+use super::stats::{parse_alt_svc, parse_hsts, parse_server_timing, HttpStat, ALPN_HTTP3};
 use super::HttpRequest;
-use bytes::{Buf, Bytes, BytesMut};
-use futures::future;
-
+use bytes::{Buf, Bytes};
 use http::Request;
 use http::Response;
 use http::Version;
@@ -36,23 +36,72 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Once, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
+/// Returned when `--http3` is combined with a proxy that was not bypassed.
+pub(crate) const H3_PROXY_REFUSAL: &str =
+    "HTTP/3 does not support proxies; refusing to bypass --proxy";
+
+type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+
+/// Direct TCP, or a TLS session to an HTTPS proxy after CONNECT.
+/// One type so the origin handshake can wrap either path.
+enum BoxedIo {
+    Plain(TcpStream),
+    ProxyTls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for BoxedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            BoxedIo::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            BoxedIo::ProxyTls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BoxedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            BoxedIo::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            BoxedIo::ProxyTls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            BoxedIo::Plain(s) => Pin::new(s).poll_flush(cx),
+            BoxedIo::ProxyTls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            BoxedIo::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            BoxedIo::ProxyTls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Request body that records the `Instant` at which hyper finished consuming it.
-///
-/// Hyper does not expose a "request body fully sent" hook, but it does pull frames
-/// from this `Body` impl until `poll_frame` returns `Ready(None)`. We capture the
-/// timestamp at that boundary, which is the closest available signal to "last
-/// request byte handed to the transport." Used to split the new `request_send`
-/// phase from `server_processing`.
 pub(crate) struct TrackedBody {
     data: Option<Bytes>,
     done: Arc<OnceLock<Instant>>,
@@ -89,7 +138,6 @@ impl Body for TrackedBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        // Always force hyper to poll us so we can record completion.
         false
     }
 
@@ -101,7 +149,6 @@ impl Body for TrackedBody {
     }
 }
 
-/// Build a hyper `Request<TrackedBody>` plus the shared done-handle.
 fn build_tracked_request(
     req: &HttpRequest,
     is_http1: bool,
@@ -115,10 +162,6 @@ fn build_tracked_request(
     Ok((request, done))
 }
 
-/// Split a captured `send_request` future window into request_send + server_processing
-/// using a `TrackedBody`'s completion timestamp. Falls back to lumping into
-/// server_processing if the body wasn't consumed before the response arrived
-/// (which shouldn't happen for normal request/response flows).
 fn record_send_split(
     stat: &mut HttpStat,
     send_start: Instant,
@@ -136,7 +179,6 @@ fn record_send_split(
     }
 }
 
-/// Populate `stat.server_timing` from response headers (RFC 8673).
 fn capture_server_timing(stat: &mut HttpStat, headers: &http::HeaderMap) {
     let values: Vec<&str> = headers
         .get_all("server-timing")
@@ -148,8 +190,6 @@ fn capture_server_timing(stat: &mut HttpStat, headers: &http::HeaderMap) {
     }
 }
 
-/// Populate `stat.alt_svc` and `stat.hsts` from response headers.
-/// Pure header parse — no extra network cost.
 fn capture_protocol_advertisements(stat: &mut HttpStat, headers: &http::HeaderMap) {
     let alt_svc_values: Vec<&str> = headers
         .get_all("alt-svc")
@@ -167,47 +207,110 @@ fn capture_protocol_advertisements(stat: &mut HttpStat, headers: &http::HeaderMa
     }
 }
 
-/// Drain a streaming response body frame-by-frame, recording the moment the
-/// accumulator first crosses [`FIRST_CHUNK_BYTES`]. The returned tuple is
-/// `(body_bytes, time_to_first_100k)`. `time_to_first_100k` is `None` when
-/// the body is smaller than the threshold — there's no split to report.
-/// The body is buffered whole in memory, so `max_body_size` aborts the
-/// transfer once the accumulator would exceed it.
-async fn drain_body_with_split(
-    body: Incoming,
-    start: Instant,
-    max_body_size: Option<usize>,
-) -> std::result::Result<(Bytes, Option<Duration>), String> {
-    let mut body = body;
-    let mut buf = BytesMut::new();
-    let mut first_chunk_at: Option<Duration> = None;
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res.map_err(|e| format!("Failed to read response body: {e}"))?;
-        if let Ok(data) = frame.into_data() {
-            if let Some(max) = max_body_size {
-                if buf.len() + data.len() > max {
-                    return Err(body_limit_error(max));
-                }
+fn content_encoding(headers: &http::HeaderMap) -> String {
+    headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn pump_for(req: &HttpRequest, headers: &http::HeaderMap) -> std::result::Result<BodyPump, String> {
+    // Decode inside the pump only for the streaming `-o` path. Memory and
+    // discard keep the wire bytes; in-memory decode is timed after `total`.
+    let encoding = if req.output_path.is_some() {
+        content_encoding(headers)
+    } else {
+        String::new()
+    };
+    BodyPump::new(
+        req.max_body_size,
+        req.output_path.as_ref(),
+        req.discard_body,
+        &encoding,
+    )
+}
+
+async fn drain_incoming(
+    mut body: Incoming,
+    mut pump: BodyPump,
+    started: Instant,
+) -> std::result::Result<(DrainedBody, Option<http::HeaderMap>), String> {
+    let mut trailers = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| format!("Failed to read response body: {e}"))?;
+        let frame = match frame.into_data() {
+            Ok(data) => {
+                pump.push(&data, started)?;
+                continue;
             }
-            buf.extend_from_slice(&data);
-            if first_chunk_at.is_none() && buf.len() >= FIRST_CHUNK_BYTES {
-                first_chunk_at = Some(start.elapsed());
-            }
+            Err(frame) => frame,
+        };
+        if let Ok(t) = frame.into_trailers() {
+            trailers = Some(t);
         }
     }
-    Ok((buf.freeze(), first_chunk_at))
+    Ok((pump.finish()?, trailers))
 }
 
-fn body_limit_error(max: usize) -> String {
-    format!("response body exceeds the {max} byte limit (--max-filesize, 0 = unlimited)")
+/// In-memory decode runs after `total` is recorded. Streaming decode already
+/// stored its CPU time on `drained` and is not subtracted from
+/// `content_transfer`.
+fn finalize_body(stat: &mut HttpStat, drained: DrainedBody, encoding: &str) {
+    stat.wire_body_size = Some(drained.wire_len);
+    stat.time_to_first_100k = drained.first_100k;
+    if stat.output_saved.is_none() {
+        stat.output_saved = drained.saved_to.clone();
+    }
+    if let Some(d) = drained.decompress {
+        stat.decompress = Some(d);
+    }
+    match drained.bytes {
+        Some(bytes) => {
+            let enc = encoding.split(',').next().unwrap_or("").trim();
+            let enc = if enc.eq_ignore_ascii_case("x-gzip") {
+                "gzip"
+            } else {
+                enc
+            };
+            if enc.is_empty() || enc.eq_ignore_ascii_case("identity") {
+                stat.body_size = Some(bytes.len());
+                stat.body = Some(bytes);
+            } else {
+                let t0 = Instant::now();
+                match decompress(enc, &bytes) {
+                    Ok(data) => {
+                        stat.decompress = Some(t0.elapsed());
+                        stat.body_size = Some(data.len());
+                        stat.body = Some(data);
+                    }
+                    Err(e) => {
+                        if stat.error.is_none() {
+                            stat.error = Some(e.to_string());
+                        }
+                        stat.body_size = Some(drained.wire_len);
+                        stat.body = Some(bytes);
+                    }
+                }
+            }
+        }
+        None if drained.saved_to.is_some() => {
+            stat.body = None;
+            stat.body_size = Some(drained.decoded_len);
+        }
+        None => {
+            stat.body = None;
+            stat.body_size = Some(drained.wire_len);
+        }
+    }
 }
 
-/// Default deadline for a single request/response phase when the caller
-/// didn't set `request_timeout` — keeps a silent server from hanging the
-/// process forever.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Initialize crypto provider once
+fn phase_timeout(req: &HttpRequest) -> Duration {
+    req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
+
 static INIT: Once = Once::new();
 
 fn ensure_crypto_provider() {
@@ -216,7 +319,6 @@ fn ensure_crypto_provider() {
     });
 }
 
-// Send HTTP/1.1 request over any stream (plain TCP or TLS)
 async fn send_http1_request<S>(
     req: Request<TrackedBody>,
     done: Arc<OnceLock<Instant>>,
@@ -226,7 +328,7 @@ async fn send_http1_request<S>(
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
@@ -236,7 +338,6 @@ where
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
 
-    // Spawn connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             let _ = tx.send(e.to_string());
@@ -244,9 +345,6 @@ where
     });
 
     let send_start = Instant::now();
-    // send_request resolves when the response *headers* arrive, so this
-    // timeout bounds request send + server processing — without it a
-    // server that accepts the connection but never answers hangs forever.
     let resp = timeout(
         request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
         sender.send_request(req),
@@ -254,29 +352,29 @@ where
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
-    let response_at = Instant::now();
-    record_send_split(stat, send_start, response_at, &done);
+    record_send_split(stat, send_start, Instant::now(), &done);
     Ok(resp)
 }
 
-// Send HTTP/2 request
-async fn send_https2_request(
+async fn send_http2_request<S>(
     req: Request<TrackedBody>,
     done: Arc<OnceLock<Instant>>,
-    tls_stream: TlsStream<TcpStream>,
+    stream: S,
     request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
-) -> Result<Response<Incoming>> {
+) -> Result<Response<Incoming>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)),
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
     )
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
 
-    // Spawn connection task
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             let _ = tx.send(e.to_string());
@@ -284,12 +382,10 @@ async fn send_https2_request(
     });
 
     let mut req = req;
-    *req.version_mut() = hyper::Version::HTTP_2;
-    // Remove Host header for HTTP/2 as it's replaced by :authority
+    *req.version_mut() = Version::HTTP_2;
     req.headers_mut().remove("Host");
 
     let send_start = Instant::now();
-    // Bounds request send + server processing (see send_http1_request).
     let resp = timeout(
         request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
         sender.send_request(req),
@@ -297,208 +393,102 @@ async fn send_https2_request(
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
-    let response_at = Instant::now();
-    record_send_split(stat, send_start, response_at, &done);
+    record_send_split(stat, send_start, Instant::now(), &done);
     Ok(resp)
 }
 
-// Handle HTTP/3 request
-async fn http3_request(http_req: HttpRequest) -> HttpStat {
-    let start = Instant::now();
-    let mut stat = HttpStat {
-        alpn: Some(ALPN_HTTP3.to_string()),
-        ..Default::default()
-    };
-
-    // DNS resolution
-    let dns_result = dns_resolve(&http_req, &mut stat).await;
-    let (addr, host) = match dns_result {
-        Ok(result) => result,
-        Err(e) => {
-            return finish_with_error(stat, e, start);
-        }
-    };
-
-    // Establish QUIC connection
-    let (client_endpoint, conn) = match timeout(
-        http_req.quic_timeout.unwrap_or(Duration::from_secs(30)),
-        quic_connect(
-            host,
-            addr,
-            http_req.skip_verify,
-            http_req.client_cert.as_deref(),
-            http_req.client_key.as_deref(),
-            http_req.bind_addr,
-            &mut stat,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            return finish_with_error(stat, e, start);
-        }
-        Err(e) => {
-            return finish_with_error(stat, e, start);
-        }
-    };
-
-    // Set TLS information
-    stat.tls = Some("tls 1.3".to_string()); // QUIC always uses TLS 1.3
-    stat.alpn = Some(ALPN_HTTP3.to_string()); // We always use HTTP/3 for QUIC
-
-    // Extract certificate information. Note: quinn's public API only exposes
-    // ALPN + server_name (`HandshakeData`), not the negotiated cipher suite,
-    // so `cert_cipher` is intentionally left unset for HTTP/3 — reporting the
-    // certificate's signature algorithm as a "cipher" would be fabrication.
-    if let Some(peer_identity) = conn.peer_identity() {
-        if let Ok(certs) = peer_identity.downcast::<Vec<rustls::pki_types::CertificateDer>>() {
-            parse_certificates(&certs, &mut stat);
-        }
+async fn wait_udp_flush(conn: &quinn::Connection, before: u64) {
+    // `finish` only queues FIN. Yield until the driver writes UDP, capped so
+    // a peer that never ACKs cannot hold `request_send` open.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while conn.stats().udp_tx.bytes <= before && Instant::now() < deadline {
+        tokio::task::yield_now().await;
     }
+}
 
-    // Create HTTP/3 connection
-    let quinn_conn = h3_quinn::Connection::new(conn);
-
-    let (mut driver, mut send_request) = match timeout(
-        http_req.request_timeout.unwrap_or(Duration::from_secs(30)),
-        h3::client::new(quinn_conn),
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            return finish_with_error(stat, e, start);
-        }
-        Err(e) => {
-            return finish_with_error(stat, e, start);
-        }
+async fn settle_early(
+    early: Option<quinn::ZeroRttAccepted>,
+    conn: &quinn::Connection,
+    stat: &mut HttpStat,
+) {
+    let Some(early) = early else {
+        return;
     };
+    let accepted = timeout(Duration::from_millis(50), early).await;
+    stat.tls_early_data_accepted = Some(matches!(accepted, Ok(true)));
+    capture_quic_certs(conn, stat);
+}
 
-    // Prepare request
-    let mut req = match http_req.builder(false).body(()) {
-        Ok(req) => req,
-        Err(e) => {
-            return finish_with_error(stat, e, start);
-        }
-    };
+async fn h3_exchange(
+    send: &mut H3Send,
+    conn: &quinn::Connection,
+    http_req: &HttpRequest,
+    stat: &mut HttpStat,
+) -> std::result::Result<DrainedBody, String> {
+    let mut req = http_req
+        .builder(false)
+        .body(())
+        .map_err(|e| e.to_string())?;
     *req.version_mut() = Version::HTTP_3;
     stat.request_headers = req.headers().clone();
-    let request_timeout = http_req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
-    let max_body_size = http_req.max_body_size;
-    let body = http_req.body.unwrap_or_default();
+    let body = http_req.body.clone().unwrap_or_default();
+    let before = conn.stats().udp_tx.bytes;
+    let send_start = Instant::now();
+    let mut stream = send.send_request(req).await.map_err(|e| e.to_string())?;
+    stream.send_data(body).await.map_err(|e| e.to_string())?;
+    stream.finish().await.map_err(|e| e.to_string())?;
+    wait_udp_flush(conn, before).await;
+    stat.request_send = Some(send_start.elapsed());
 
-    // Handle connection driver
-    let drive = async move {
-        Err::<(), h3::error::ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
-    };
+    let server_start = Instant::now();
+    let resp = stream.recv_response().await.map_err(|e| {
+        if e.is_h3_no_error() {
+            "h3 stream closed".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    stat.server_processing = Some(server_start.elapsed());
+    stat.status = Some(resp.status());
+    stat.headers = Some(resp.headers().clone());
+    stat.version = Some(format!("{:?}", resp.version()));
+    capture_server_timing(stat, resp.headers());
+    capture_protocol_advertisements(stat, resp.headers());
 
-    // Send request and handle response
-    let request = async move {
-        let mut sub_stat = HttpStat::default();
-
-        let request_send_start = Instant::now();
-        let mut stream = send_request.send_request(req).await?;
-        stream.send_data(body).await?;
-        // Finish sending — last request byte is now on the wire (or in QUIC's buffer).
-        stream.finish().await?;
-        sub_stat.request_send = Some(request_send_start.elapsed());
-
-        let server_processing_start = Instant::now();
-        let resp = stream.recv_response().await?;
-        sub_stat.server_processing = Some(server_processing_start.elapsed());
-
-        sub_stat.status = Some(resp.status());
-        sub_stat.headers = Some(resp.headers().clone());
-        sub_stat.version = Some(format!("{:?}", resp.version()));
-        capture_server_timing(&mut sub_stat, resp.headers());
-        capture_protocol_advertisements(&mut sub_stat, resp.headers());
-
-        // Receive response body. Capture the first-100KB instant so we can
-        // split throughput into "slow start" vs "steady state" later.
-        let content_transfer_start = Instant::now();
-        let mut buf = BytesMut::new();
-        let mut first_chunk_at: Option<Duration> = None;
-        while let Some(chunk) = stream.recv_data().await? {
-            if let Some(max) = max_body_size {
-                if buf.len() + chunk.chunk().len() > max {
-                    sub_stat.error = Some(body_limit_error(max));
+    let pump = pump_for(http_req, resp.headers())?;
+    let ct = Instant::now();
+    let mut pump = pump;
+    loop {
+        match stream.recv_data().await {
+            Ok(Some(mut chunk)) => {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                if let Err(e) = pump.push(&bytes, ct) {
+                    stat.error = Some(e);
                     break;
                 }
             }
-            buf.extend(chunk.chunk());
-            if first_chunk_at.is_none() && buf.len() >= FIRST_CHUNK_BYTES {
-                first_chunk_at = Some(content_transfer_start.elapsed());
-            }
-        }
-        sub_stat.content_transfer = Some(content_transfer_start.elapsed());
-        sub_stat.wire_body_size = Some(buf.len());
-        sub_stat.time_to_first_100k = first_chunk_at;
-        sub_stat.body = Some(Bytes::from(buf));
-        Ok::<HttpStat, h3::error::StreamError>(sub_stat)
-    };
-
-    // Execute request and handle results. The timeout bounds request send +
-    // server processing + body transfer — without it a server that completes
-    // the QUIC handshake but never answers hangs the process.
-    let (req_res, drive_res) = tokio::join!(timeout(request_timeout, request), drive);
-    match req_res {
-        Ok(Ok(sub_stat)) => {
-            stat.request_send = sub_stat.request_send;
-            stat.server_processing = sub_stat.server_processing;
-            stat.content_transfer = sub_stat.content_transfer;
-            stat.status = sub_stat.status;
-            stat.headers = sub_stat.headers;
-            stat.body = sub_stat.body;
-            stat.wire_body_size = sub_stat.wire_body_size;
-            stat.time_to_first_100k = sub_stat.time_to_first_100k;
-            stat.server_timing = sub_stat.server_timing;
-            stat.alt_svc = sub_stat.alt_svc;
-            stat.hsts = sub_stat.hsts;
-            // e.g. the body-size limit tripped mid-transfer
-            stat.error = sub_stat.error;
-            stat.version = sub_stat.version;
-        }
-        Ok(Err(err)) => {
-            if !err.is_h3_no_error() {
-                stat.error = Some(err.to_string());
-            }
-        }
-        Err(e) => {
-            stat.error = Some(format!("request timeout: {e}"));
+            Ok(None) => break,
+            Err(e) if e.is_h3_no_error() => break,
+            Err(e) => return Err(e.to_string()),
         }
     }
-    if let Err(err) = drive_res {
-        if !err.is_h3_no_error() {
-            stat.error = Some(err.to_string());
-        }
+    match stream.recv_trailers().await {
+        Ok(t) => stat.trailers = t,
+        Err(e) if e.is_h3_no_error() || stat.error.is_some() => {}
+        Err(e) => return Err(e.to_string()),
     }
-
-    stat.total = Some(start.elapsed());
-    // Close the connection immediately instead of waiting for idle
-    client_endpoint.close(0u32.into(), b"done");
-
-    stat
+    stat.content_transfer = Some(ct.elapsed());
+    pump.finish()
 }
 
-/// Connect to the effective TCP endpoint (direct or via proxy).
-/// Returns `(stream, target_host, is_http_forward_proxy, tcp_info_probe)`.
-/// - Direct: uses dns_resolve + tcp_connect, sets stat.dns_lookup / stat.addr / stat.tcp_connect.
-/// - Proxy:  connects to proxy (system DNS), sets stat.addr / stat.tcp_connect.
-///
-/// `tcp_info_probe` is a `dup(2)`'d FD pointing at the socket we'll actually
-/// use for HTTP traffic. Through a proxy the probe reflects the
-/// client-to-proxy socket, not the origin — `getsockopt(TCP_INFO)` can't see
-/// past the proxy.
-async fn tcp_via_proxy(
-    http_req: &HttpRequest,
-    stat: &mut HttpStat,
-) -> Result<(
-    TcpStream,
-    String,
-    bool,
-    Option<crate::tcp_info::TcpInfoProbe>,
-)> {
+struct TcpReady {
+    io: BoxedIo,
+    host: String,
+    is_http_forward: bool,
+    probe: Option<crate::tcp_info::TcpInfoProbe>,
+}
+
+async fn tcp_via_proxy(http_req: &HttpRequest, stat: &mut HttpStat) -> Result<TcpReady> {
     let uri = &http_req.uri;
     let is_https = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
     let target_host = uri.host().unwrap_or_default().to_string();
@@ -509,85 +499,239 @@ async fn tcp_via_proxy(
         let tcp_start = Instant::now();
         let proxy_stream = timeout(
             http_req.tcp_timeout.unwrap_or(Duration::from_secs(5)),
-            TcpStream::connect(&proxy_addr),
+            tokio::net::TcpStream::connect(&proxy_addr),
         )
         .await
         .map_err(|e| Error::Timeout { source: e })?
         .map_err(|e| Error::Io { source: e })?;
-
+        stat.proxy_connect = Some(tcp_start.elapsed());
         if let Ok(peer) = proxy_stream.peer_addr() {
             stat.addr = Some(peer.to_string());
         }
-
-        // Sample baseline TCP_INFO on the proxy connection (what we'll
-        // actually carry traffic over) before any SOCKS5/HTTP CONNECT bytes.
         let (baseline, probe) = crate::tcp_info::TcpInfoProbe::capture(&proxy_stream);
         stat.tcp_info_post_connect = baseline;
 
-        // HTTP proxy + plain HTTP target: forward mode, no tunnel
-        let is_http_forward = !is_https && matches!(proxy.kind, ProxyKind::Http);
-        let stream = if is_http_forward {
-            proxy_stream
+        let auth = proxy
+            .username
+            .as_deref()
+            .map(|user| basic_auth_header(user, proxy.password.as_deref().unwrap_or("")));
+        let user = proxy.username.as_deref();
+        let pass = proxy.password.as_deref();
+        let handshake_start = Instant::now();
+        // `https://` proxy is TLS to the proxy, then CONNECT. Plain HTTP to
+        // an `http://` proxy stays a forward request (absolute URI, no tunnel).
+        let is_http_forward = !proxy.tls && !is_https && matches!(proxy.kind, ProxyKind::Http);
+        let io: BoxedIo = if proxy.tls {
+            let tls = tls_connect_stream(
+                &proxy.host,
+                proxy_stream,
+                vec![b"http/1.1".to_vec()],
+                http_req.skip_verify,
+                http_req.tls_timeout,
+            )
+            .await?;
+            let tunneled = http_connect(tls, &target_host, target_port, auth.as_deref()).await?;
+            stat.proxy_handshake = Some(handshake_start.elapsed());
+            BoxedIo::ProxyTls(Box::new(tunneled))
+        } else if is_http_forward {
+            BoxedIo::Plain(proxy_stream)
         } else {
             match proxy.kind {
                 ProxyKind::Socks5 => {
-                    socks5_connect(proxy_stream, &target_host, target_port).await?
+                    let tunneled =
+                        socks5_connect(proxy_stream, &target_host, target_port, user, pass).await?;
+                    stat.proxy_handshake = Some(handshake_start.elapsed());
+                    BoxedIo::Plain(tunneled)
                 }
-                ProxyKind::Http => http_connect(proxy_stream, &target_host, target_port).await?,
+                ProxyKind::Http => {
+                    let tunneled =
+                        http_connect(proxy_stream, &target_host, target_port, auth.as_deref())
+                            .await?;
+                    stat.proxy_handshake = Some(handshake_start.elapsed());
+                    BoxedIo::Plain(tunneled)
+                }
             }
         };
-        stat.tcp_connect = Some(tcp_start.elapsed());
-        Ok((stream, target_host, is_http_forward, probe))
+        stat.tcp_connect =
+            Some(stat.proxy_connect.unwrap_or_default() + stat.proxy_handshake.unwrap_or_default());
+        Ok(TcpReady {
+            io,
+            host: target_host,
+            is_http_forward,
+            probe,
+        })
     } else {
-        let (addr, host) = dns_resolve(http_req, stat).await?;
-        let (stream, probe) =
-            tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, stat).await?;
-        Ok((stream, host, false, probe))
+        let resolved = dns_resolve(http_req, stat).await?;
+        let (stream, probe, winner) = tcp_connect(
+            resolved.addrs,
+            http_req.tcp_timeout,
+            http_req.bind_addr,
+            stat,
+        )
+        .await?;
+        http_req.note_dns_winner(&resolved.cache_host, resolved.cache_port, winner);
+        Ok(TcpReady {
+            io: BoxedIo::Plain(stream),
+            host: resolved.host,
+            is_http_forward: false,
+            probe,
+        })
     }
+}
+
+async fn consume_response(
+    resp: Response<Incoming>,
+    http_req: &HttpRequest,
+    mut stat: HttpStat,
+    start: Instant,
+    probe: Option<&crate::tcp_info::TcpInfoProbe>,
+) -> HttpStat {
+    stat.status = Some(resp.status());
+    let encoding = content_encoding(resp.headers());
+    stat.headers = Some(resp.headers().clone());
+    stat.version = Some(format!("{:?}", resp.version()));
+    capture_server_timing(&mut stat, resp.headers());
+    capture_protocol_advertisements(&mut stat, resp.headers());
+    let pump = match pump_for(http_req, resp.headers()) {
+        Ok(p) => p,
+        Err(e) => return finish_with_error(stat, e, start),
+    };
+    let ct = Instant::now();
+    let drained = timeout(
+        phase_timeout(http_req),
+        drain_incoming(resp.into_body(), pump, ct),
+    )
+    .await;
+    let (drained, trailers) = match drained {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return finish_with_error(stat, e, start),
+        Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
+    };
+    stat.content_transfer = Some(ct.elapsed());
+    stat.trailers = trailers;
+    if let Some(probe) = probe {
+        stat.tcp_info_final = probe.sample();
+    }
+    stat.total = Some(start.elapsed());
+    finalize_body(&mut stat, drained, &encoding);
+    stat
+}
+
+async fn http3_request(http_req: HttpRequest) -> HttpStat {
+    let start = Instant::now();
+    let mut stat = HttpStat {
+        alpn: Some(ALPN_HTTP3.to_string()),
+        ..Default::default()
+    };
+    if http_req.proxy.is_some() {
+        return finish_with_error(stat, H3_PROXY_REFUSAL, start);
+    }
+
+    let resolved = match dns_resolve(&http_req, &mut stat).await {
+        Ok(v) => v,
+        Err(e) => return finish_with_error(stat, e, start),
+    };
+    let QuicConnect {
+        endpoint,
+        conn,
+        early,
+    } = match quic_connect(resolved.host, resolved.addrs, &http_req, &mut stat).await {
+        Ok(v) => v,
+        Err(e) => return finish_with_error(stat, e, start),
+    };
+    http_req.note_dns_winner(
+        &resolved.cache_host,
+        resolved.cache_port,
+        conn.remote_address(),
+    );
+    stat.quic_info_post_connect = Some(QuicInfo::from_conn(&conn));
+    let conn_stats = conn.clone();
+
+    let h3_conn = h3_quinn::Connection::new(conn);
+    let (mut driver, mut send_request) =
+        match timeout(phase_timeout(&http_req), h3::client::new(h3_conn)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return finish_with_error(stat, e, start),
+            Err(e) => return finish_with_error(stat, e, start),
+        };
+
+    let req_for_exchange = http_req.clone();
+    let request = async move {
+        let mut sub = HttpStat::default();
+        let drained =
+            h3_exchange(&mut send_request, &conn_stats, &req_for_exchange, &mut sub).await?;
+        sub.quic_info_final = Some(QuicInfo::from_conn(&conn_stats));
+        Ok::<_, String>((sub, drained, conn_stats))
+    };
+    let drive = async move { driver.wait_idle().await };
+    let (req_res, drive_res) = tokio::join!(timeout(phase_timeout(&http_req), request), drive);
+
+    match req_res {
+        Ok(Ok((sub, drained, conn_stats))) => {
+            stat.request_headers = sub.request_headers;
+            stat.request_send = sub.request_send;
+            stat.server_processing = sub.server_processing;
+            stat.content_transfer = sub.content_transfer;
+            stat.status = sub.status;
+            stat.headers = sub.headers;
+            stat.version = sub.version;
+            stat.server_timing = sub.server_timing;
+            stat.alt_svc = sub.alt_svc;
+            stat.hsts = sub.hsts;
+            stat.trailers = sub.trailers;
+            stat.error = sub.error;
+            stat.quic_info_final = sub.quic_info_final;
+            stat.total = Some(start.elapsed());
+            settle_early(early, &conn_stats, &mut stat).await;
+            let encoding = stat
+                .headers
+                .as_ref()
+                .map(content_encoding)
+                .unwrap_or_default();
+            finalize_body(&mut stat, drained, &encoding);
+        }
+        Ok(Err(err)) => {
+            stat.error = Some(err);
+            stat.total = Some(start.elapsed());
+        }
+        Err(e) => {
+            stat.error = Some(format!("request timeout: {e}"));
+            stat.total = Some(start.elapsed());
+        }
+    }
+    if stat.status.is_none() && stat.error.is_none() && !drive_res.is_h3_no_error() {
+        stat.error = Some(drive_res.to_string());
+    }
+    endpoint.close(0u32.into(), b"done");
+    stat
 }
 
 async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
     let start = Instant::now();
     let mut stat = HttpStat::default();
-
     let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
 
-    // Establish TCP (direct or via proxy)
-    let (tcp_stream, host, is_http_forward, tcp_probe) =
-        match tcp_via_proxy(&http_req, &mut stat).await {
-            Ok(r) => r,
-            Err(e) => return finish_with_error(stat, e, start),
-        };
-
-    // HTTP forward proxy: request must use the full absolute URI
-    if is_http_forward {
+    let ready = match tcp_via_proxy(&http_req, &mut stat).await {
+        Ok(r) => r,
+        Err(e) => return finish_with_error(stat, e, start),
+    };
+    if ready.is_http_forward {
         http_req.use_absolute_uri = true;
     }
-
-    // Create channel for connection errors
     let (tx, mut rx) = oneshot::channel();
-
-    // Send request based on protocol
     let resp = if is_https {
-        // TLS handshake
-        let tls_result = tls_handshake(host.clone(), tcp_stream, &http_req, &mut stat).await;
-        let (tls_stream, is_http2) = match tls_result {
-            Ok(result) => result,
-            Err(e) => {
-                return finish_with_error(stat, e, start);
-            }
-        };
-
-        // Send HTTPS request
+        let (tls_stream, is_http2) =
+            match tls_handshake(ready.host, ready.io, &http_req, &mut stat).await {
+                Ok(v) => v,
+                Err(e) => return finish_with_error(stat, e, start),
+            };
         if is_http2 {
             let (req, done) = match build_tracked_request(&http_req, false) {
                 Ok(r) => r,
-                Err(e) => {
-                    return finish_with_error(stat, e, start);
-                }
+                Err(e) => return finish_with_error(stat, e, start),
             };
             stat.request_headers = req.headers().clone();
-            match send_https2_request(
+            match send_http2_request(
                 req,
                 done,
                 tls_stream,
@@ -598,16 +742,12 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             .await
             {
                 Ok(resp) => resp,
-                Err(e) => {
-                    return finish_with_error(stat, e, start);
-                }
+                Err(e) => return finish_with_error(stat, e, start),
             }
         } else {
             let (req, done) = match build_tracked_request(&http_req, true) {
                 Ok(r) => r,
-                Err(e) => {
-                    return finish_with_error(stat, e, start);
-                }
+                Err(e) => return finish_with_error(stat, e, start),
             };
             stat.request_headers = req.headers().clone();
             match send_http1_request(
@@ -621,176 +761,112 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             .await
             {
                 Ok(resp) => resp,
-                Err(e) => {
-                    return finish_with_error(stat, e, start);
-                }
+                Err(e) => return finish_with_error(stat, e, start),
             }
+        }
+    } else if http_req.h2_prior_knowledge {
+        let (req, done) = match build_tracked_request(&http_req, false) {
+            Ok(r) => r,
+            Err(e) => return finish_with_error(stat, e, start),
+        };
+        stat.request_headers = req.headers().clone();
+        match send_http2_request(req, done, ready.io, http_req.request_timeout, tx, &mut stat).await
+        {
+            Ok(resp) => resp,
+            Err(e) => return finish_with_error(stat, e, start),
         }
     } else {
         let (req, done) = match build_tracked_request(&http_req, true) {
             Ok(r) => r,
-            Err(e) => {
-                return finish_with_error(stat, e, start);
-            }
+            Err(e) => return finish_with_error(stat, e, start),
         };
         stat.request_headers = req.headers().clone();
-        // Send HTTP request
-        match send_http1_request(
-            req,
-            done,
-            tcp_stream,
-            http_req.request_timeout,
-            tx,
-            &mut stat,
-        )
-        .await
+        match send_http1_request(req, done, ready.io, http_req.request_timeout, tx, &mut stat).await
         {
             Ok(resp) => resp,
-            Err(e) => {
-                return finish_with_error(stat, e, start);
-            }
+            Err(e) => return finish_with_error(stat, e, start),
         }
     };
 
-    // Process response
-    stat.status = Some(resp.status());
-    stat.headers = Some(resp.headers().clone());
-    stat.version = Some(format!("{:?}", resp.version()));
-    capture_server_timing(&mut stat, resp.headers());
-    capture_protocol_advertisements(&mut stat, resp.headers());
-
-    // Check for connection errors
     if let Ok(error) = rx.try_recv() {
         stat.error = Some(error);
     }
-    // Read response body — stream frame-by-frame so we can timestamp the
-    // moment 100 KiB has arrived. Combined with content_transfer, this lets
-    // us split throughput into "first 100 KB" (TCP slow-start dominated)
-    // and "tail" (steady-state server send rate).
-    let content_transfer_start = Instant::now();
-    let drain_result = timeout(
-        http_req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-        drain_body_with_split(
-            resp.into_body(),
-            content_transfer_start,
-            http_req.max_body_size,
-        ),
-    )
-    .await;
-    let (body_bytes, time_to_first_100k) = match drain_result {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => return finish_with_error(stat, e, start),
-        Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
-    };
-    stat.wire_body_size = Some(body_bytes.len());
-    stat.time_to_first_100k = time_to_first_100k;
-    stat.body = Some(body_bytes);
-    stat.content_transfer = Some(content_transfer_start.elapsed());
-
-    // Second kernel TCP sample: retransmits accumulated during the body read,
-    // final RTT/cwnd. dup'd FD is dropped here (closes only the duplicate;
-    // the real socket lives on inside hyper).
-    if let Some(probe) = &tcp_probe {
-        stat.tcp_info_final = probe.sample();
-    }
-
-    stat.total = Some(start.elapsed());
-    stat
+    consume_response(resp, &http_req, stat, start, ready.probe.as_ref()).await
 }
 
 /// Performs an HTTP request and returns detailed statistics about the request lifecycle.
-///
-/// This function handles HTTP/1.1, HTTP/2, and HTTP/3 requests with the following features:
-/// - Automatic protocol selection based on ALPN negotiation
-/// - DNS resolution with support for custom IP mappings
-/// - TLS handshake with certificate verification
-/// - Response body handling with optional file output
-/// - Detailed timing statistics for each phase of the request
-///
-/// # Arguments
-///
-/// * `http_req` - An `HttpRequest` struct containing the request configuration including:
-///   - URI and HTTP method
-///   - ALPN protocols to negotiate
-///   - Custom DNS resolutions
-///   - Headers and request body
-///   - TLS verification settings
-///   - Output file path (optional)
-///
-/// # Returns
-///
-/// Returns an `HttpStat` struct containing:
-/// - DNS lookup time
-/// - QUIC connection time
-/// - TCP connection time
-/// - TLS handshake time (for HTTPS)
-/// - Server processing time
-/// - Content transfer time
-/// - Total request time
-/// - Response status and headers
-/// - Response body (if not written to file)
-/// - TLS and certificate information (for HTTPS)
-/// - Any errors that occurred during the request
-/// ```
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
     let is_grpc = matches!(http_req.uri.scheme_str().unwrap_or(""), "grpc" | "grpcs");
-
-    // Handle HTTP/3 request
-    let mut stat = if is_grpc {
+    if is_grpc {
         grpc_request(http_req).await
     } else if http_req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3) {
         http3_request(http_req).await
     } else {
         http1_2_request(http_req).await
-    };
-    if let Some(body) = &stat.body {
-        stat.body_size = Some(body.len());
     }
-    let encoding = if let Some(headers) = &stat.headers {
-        headers
-            .get("content-encoding")
-            .map(|v| v.to_str().unwrap_or_default())
-            .unwrap_or_default()
-    } else {
-        ""
-    };
-
-    if !encoding.is_empty() {
-        if let Some(body) = &stat.body {
-            match decompress(encoding, body) {
-                Ok(data) => {
-                    stat.body = Some(data);
-                }
-                Err(e) => {
-                    stat.error = Some(e.to_string());
-                }
-            }
-        }
-    }
-
-    stat
 }
-
-// --- Connection reuse API ---
 
 enum ConnectionSender {
     Http1(hyper::client::conn::http1::SendRequest<TrackedBody>),
     Http2(hyper::client::conn::http2::SendRequest<TrackedBody>),
+    Http3 {
+        conn: quinn::Connection,
+        send: H3Send,
+    },
 }
 
-/// A reusable HTTP connection handle for benchmarking.
+enum WorkerKind {
+    Http2(hyper::client::conn::http2::SendRequest<TrackedBody>),
+    Http3 {
+        conn: quinn::Connection,
+        send: H3Send,
+    },
+}
+
+/// Cloned sender for one in-flight request on a multiplexed connection.
+pub struct HttpWorker {
+    kind: WorkerKind,
+}
+
+/// A reusable HTTP connection. `endpoint` is last so it drops after the
+/// QUIC connection: dropping a `quinn::Endpoint` aborts every connection it owns.
 pub struct HttpConnection {
     sender: ConnectionSender,
-    is_http2: bool,
-    /// dup'd FD so we can sample TCP_INFO after each `send()` even though
-    /// the original socket has been moved into hyper. None on non-Unix or
-    /// when `dup(2)` failed.
     tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
-    /// Most recent TCP_INFO snapshot. Used as the "post-connect" baseline
-    /// for the next `send()`'s delta calculation, so each iteration's
-    /// `retransmits_during` reflects only that iteration's window.
     last_tcp_info: Option<crate::TcpInfo>,
+    last_quic: Option<QuicInfo>,
+    /// Kept so the endpoint drops after the QUIC connection. Dropping an
+    /// endpoint aborts every connection it owns.
+    #[allow(dead_code)]
+    endpoint: Option<quinn::Endpoint>,
+}
+
+impl HttpConnection {
+    /// HTTP/2 and HTTP/3 can have several requests in flight. HTTP/1.1 cannot.
+    pub fn multiplexes(&self) -> bool {
+        matches!(
+            self.sender,
+            ConnectionSender::Http2(_) | ConnectionSender::Http3 { .. }
+        )
+    }
+
+    /// Clone a sender for a concurrent request. `None` for HTTP/1.1.
+    /// The parent keeps its own sender so the last drop does not close HTTP/3.
+    pub fn worker(&self) -> Option<HttpWorker> {
+        match &self.sender {
+            ConnectionSender::Http2(send) => Some(HttpWorker {
+                kind: WorkerKind::Http2(send.clone()),
+            }),
+            ConnectionSender::Http3 { conn, send } => Some(HttpWorker {
+                kind: WorkerKind::Http3 {
+                    conn: conn.clone(),
+                    send: send.clone(),
+                },
+            }),
+            ConnectionSender::Http1(_) => None,
+        }
+    }
 }
 
 async fn establish_http1<S>(
@@ -801,7 +877,7 @@ async fn establish_http1<S>(
     start: Instant,
 ) -> (HttpStat, Option<HttpConnection>)
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match timeout(
         handshake_timeout,
@@ -819,9 +895,10 @@ where
                 stat,
                 Some(HttpConnection {
                     sender: ConnectionSender::Http1(sender),
-                    is_http2: false,
                     tcp_probe,
                     last_tcp_info,
+                    last_quic: None,
+                    endpoint: None,
                 }),
             )
         }
@@ -844,7 +921,7 @@ async fn establish_http2<S>(
     start: Instant,
 ) -> (HttpStat, Option<HttpConnection>)
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match timeout(
         handshake_timeout,
@@ -862,9 +939,10 @@ where
                 stat,
                 Some(HttpConnection {
                     sender: ConnectionSender::Http2(sender),
-                    is_http2: true,
                     tcp_probe,
                     last_tcp_info,
+                    last_quic: None,
+                    endpoint: None,
                 }),
             )
         }
@@ -879,163 +957,229 @@ where
     }
 }
 
-/// Establish an HTTP/1.1 or HTTP/2 connection and return a reusable handle.
+async fn connect_h3(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection>) {
+    let start = Instant::now();
+    let mut stat = HttpStat {
+        alpn: Some(ALPN_HTTP3.to_string()),
+        ..Default::default()
+    };
+    if http_req.proxy.is_some() {
+        return (finish_with_error(stat, H3_PROXY_REFUSAL, start), None);
+    }
+    let resolved = match dns_resolve(http_req, &mut stat).await {
+        Ok(v) => v,
+        Err(e) => return (finish_with_error(stat, e, start), None),
+    };
+    let QuicConnect {
+        endpoint,
+        conn,
+        early,
+    } = match quic_connect(resolved.host, resolved.addrs, http_req, &mut stat).await {
+        Ok(v) => v,
+        Err(e) => return (finish_with_error(stat, e, start), None),
+    };
+    http_req.note_dns_winner(
+        &resolved.cache_host,
+        resolved.cache_port,
+        conn.remote_address(),
+    );
+    stat.quic_info_post_connect = Some(QuicInfo::from_conn(&conn));
+    let h3_conn = h3_quinn::Connection::new(conn.clone());
+    let (mut driver, send) = match timeout(phase_timeout(http_req), h3::client::new(h3_conn)).await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return (finish_with_error(stat, e, start), None),
+        Err(e) => return (finish_with_error(stat, e, start), None),
+    };
+    // The driver must outlive every cloned sender. It finishes when the last
+    // SendRequest is dropped. Spawn it; joining would wait for that drop.
+    tokio::spawn(async move {
+        let _ = driver.wait_idle().await;
+    });
+    stat.total = Some(start.elapsed());
+    settle_early(early, &conn, &mut stat).await;
+    let last_quic = stat.quic_info_post_connect.clone();
+    (
+        stat,
+        Some(HttpConnection {
+            sender: ConnectionSender::Http3 { conn, send },
+            tcp_probe: None,
+            last_tcp_info: None,
+            last_quic,
+            endpoint: Some(endpoint),
+        }),
+    )
+}
+
+/// Establish a connection and return a reusable handle.
 ///
-/// Returns `(connect_stat, Some(conn))` on success, or `(error_stat, None)` on failure.
-/// Only supports HTTP/1.1 and HTTP/2. For HTTP/3 or gRPC, use `request()` directly.
+/// HTTP/3 keeps the `quinn::Endpoint` alive for the handle's lifetime.
 pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection>) {
     ensure_crypto_provider();
+    if http_req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3) {
+        return connect_h3(http_req).await;
+    }
     let start = Instant::now();
     let mut stat = HttpStat::default();
-
     let is_https = http_req.uri.scheme() == Some(&http::uri::Scheme::HTTPS);
-
-    let (tcp_stream, host, _is_http_forward, tcp_probe) =
-        match tcp_via_proxy(http_req, &mut stat).await {
-            Ok(r) => r,
-            Err(e) => return (finish_with_error(stat, e, start), None),
-        };
-
-    let handshake_timeout = http_req.request_timeout.unwrap_or(Duration::from_secs(30));
-
+    let ready = match tcp_via_proxy(http_req, &mut stat).await {
+        Ok(r) => r,
+        Err(e) => return (finish_with_error(stat, e, start), None),
+    };
+    let handshake_timeout = phase_timeout(http_req);
     if is_https {
-        let (tls_stream, is_h2) = match tls_handshake(host, tcp_stream, http_req, &mut stat).await {
-            Ok(r) => r,
-            Err(e) => return (finish_with_error(stat, e, start), None),
-        };
-
+        let (tls_stream, is_h2) =
+            match tls_handshake(ready.host, ready.io, http_req, &mut stat).await {
+                Ok(r) => r,
+                Err(e) => return (finish_with_error(stat, e, start), None),
+            };
         if is_h2 {
-            establish_http2(tls_stream, handshake_timeout, stat, tcp_probe, start).await
+            establish_http2(tls_stream, handshake_timeout, stat, ready.probe, start).await
         } else {
-            establish_http1(tls_stream, handshake_timeout, stat, tcp_probe, start).await
+            establish_http1(tls_stream, handshake_timeout, stat, ready.probe, start).await
         }
+    } else if http_req.h2_prior_knowledge {
+        establish_http2(ready.io, handshake_timeout, stat, ready.probe, start).await
     } else {
-        establish_http1(tcp_stream, handshake_timeout, stat, tcp_probe, start).await
+        establish_http1(ready.io, handshake_timeout, stat, ready.probe, start).await
     }
 }
 
+async fn exchange_h2(
+    sender: &mut hyper::client::conn::http2::SendRequest<TrackedBody>,
+    http_req: &HttpRequest,
+    mut stat: HttpStat,
+    start: Instant,
+    probe: Option<&crate::tcp_info::TcpInfoProbe>,
+) -> HttpStat {
+    if let Err(e) = sender.ready().await {
+        return finish_with_error(stat, Error::Hyper { source: e }, start);
+    }
+    let (req, done) = match build_tracked_request(http_req, false) {
+        Ok(r) => r,
+        Err(e) => return finish_with_error(stat, e, start),
+    };
+    stat.request_headers = req.headers().clone();
+    let mut req = req;
+    *req.version_mut() = Version::HTTP_2;
+    req.headers_mut().remove("Host");
+    let send_start = Instant::now();
+    let resp = timeout(phase_timeout(http_req), sender.send_request(req)).await;
+    let resp = match resp {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return finish_with_error(stat, Error::Hyper { source: e }, start),
+        Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
+    };
+    record_send_split(&mut stat, send_start, Instant::now(), &done);
+    consume_response(resp, http_req, stat, start, probe).await
+}
+
+async fn exchange_h1(
+    sender: &mut hyper::client::conn::http1::SendRequest<TrackedBody>,
+    http_req: &HttpRequest,
+    mut stat: HttpStat,
+    start: Instant,
+    probe: Option<&crate::tcp_info::TcpInfoProbe>,
+) -> HttpStat {
+    if let Err(e) = sender.ready().await {
+        return finish_with_error(stat, Error::Hyper { source: e }, start);
+    }
+    let (req, done) = match build_tracked_request(http_req, true) {
+        Ok(r) => r,
+        Err(e) => return finish_with_error(stat, e, start),
+    };
+    stat.request_headers = req.headers().clone();
+    let send_start = Instant::now();
+    let resp = timeout(phase_timeout(http_req), sender.send_request(req)).await;
+    let resp = match resp {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return finish_with_error(stat, Error::Hyper { source: e }, start),
+        Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
+    };
+    record_send_split(&mut stat, send_start, Instant::now(), &done);
+    consume_response(resp, http_req, stat, start, probe).await
+}
+
+async fn exchange_h3(
+    send: &mut H3Send,
+    conn: &quinn::Connection,
+    http_req: &HttpRequest,
+    mut stat: HttpStat,
+    start: Instant,
+    sample_quic: bool,
+    quic_baseline: Option<QuicInfo>,
+) -> HttpStat {
+    if sample_quic {
+        stat.quic_info_post_connect = quic_baseline;
+    }
+    let drained = match timeout(
+        phase_timeout(http_req),
+        h3_exchange(send, conn, http_req, &mut stat),
+    )
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return finish_with_error(stat, e, start),
+        Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
+    };
+    if sample_quic {
+        stat.quic_info_final = Some(QuicInfo::from_conn(conn));
+    }
+    stat.total = Some(start.elapsed());
+    let encoding = stat
+        .headers
+        .as_ref()
+        .map(content_encoding)
+        .unwrap_or_default();
+    finalize_body(&mut stat, drained, &encoding);
+    stat
+}
+
 impl HttpConnection {
-    /// Send a request on the existing connection, returning only request-phase timing.
+    /// Send a request on the existing connection.
     pub async fn send(&mut self, http_req: &HttpRequest) -> HttpStat {
         let start = Instant::now();
-        // Seed the per-iteration TCP_INFO baseline from the previous send's
-        // final sample (or the connection's post-connect snapshot for the
-        // first iteration). This way each iteration's retransmits_during
-        // counts only retransmits in *this* iteration's window.
-        let mut stat = HttpStat {
+        let stat = HttpStat {
             tcp_info_post_connect: self.last_tcp_info.clone(),
             ..HttpStat::default()
         };
-
-        let is_http1 = !self.is_http2;
-        let (req, done) = match build_tracked_request(http_req, is_http1) {
-            Ok(r) => r,
-            Err(e) => return finish_with_error(stat, e, start),
-        };
-        stat.request_headers = req.headers().clone();
-
-        // Ensure the connection is ready (especially important for HTTP/1.1 keep-alive)
-        match &mut self.sender {
+        let baseline_quic = self.last_quic.clone();
+        // Take the probe so the sender can be borrowed for the duration of the
+        // request. The duplicate fd stays valid across that await.
+        let probe = self.tcp_probe.take();
+        let stat = match &mut self.sender {
             ConnectionSender::Http1(sender) => {
-                if let Err(e) = sender.ready().await {
-                    return finish_with_error(stat, Error::Hyper { source: e }, start);
-                }
+                exchange_h1(sender, http_req, stat, start, probe.as_ref()).await
             }
             ConnectionSender::Http2(sender) => {
-                if let Err(e) = sender.ready().await {
-                    return finish_with_error(stat, Error::Hyper { source: e }, start);
-                }
+                exchange_h2(sender, http_req, stat, start, probe.as_ref()).await
             }
-        }
-
-        let send_start = Instant::now();
-        let request_timeout = http_req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
-        // Bounds request send + server processing (see send_http1_request).
-        let resp = match &mut self.sender {
-            ConnectionSender::Http1(sender) => {
-                timeout(request_timeout, sender.send_request(req)).await
-            }
-            ConnectionSender::Http2(sender) => {
-                let mut req = req;
-                *req.version_mut() = Version::HTTP_2;
-                req.headers_mut().remove("Host");
-                timeout(request_timeout, sender.send_request(req)).await
+            ConnectionSender::Http3 { conn, send } => {
+                exchange_h3(send, conn, http_req, stat, start, true, baseline_quic).await
             }
         };
-
-        let resp = match resp {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => return finish_with_error(stat, Error::Hyper { source: e }, start),
-            Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
-        };
-        let response_at = Instant::now();
-        record_send_split(&mut stat, send_start, response_at, &done);
-        stat.status = Some(resp.status());
-        stat.headers = Some(resp.headers().clone());
-        stat.version = Some(format!("{:?}", resp.version()));
-        capture_server_timing(&mut stat, resp.headers());
-        capture_protocol_advertisements(&mut stat, resp.headers());
-
-        // Read response body — frame-by-frame so we capture the
-        // time-to-first-100K marker for throughput-split diagnosis (matches
-        // the http1_2_request path).
-        let content_transfer_start = Instant::now();
-        let drained = timeout(
-            request_timeout,
-            drain_body_with_split(
-                resp.into_body(),
-                content_transfer_start,
-                http_req.max_body_size,
-            ),
-        )
-        .await;
-        match drained {
-            Ok(Ok((body_bytes, first_100k))) => {
-                stat.wire_body_size = Some(body_bytes.len());
-                stat.time_to_first_100k = first_100k;
-                stat.body = Some(body_bytes);
-                stat.content_transfer = Some(content_transfer_start.elapsed());
-            }
-            Ok(Err(e)) => {
-                return finish_with_error(stat, e, start);
-            }
-            Err(e) => {
-                return finish_with_error(stat, Error::Timeout { source: e }, start);
-            }
+        self.tcp_probe = probe;
+        if stat.tcp_info_final.is_some() {
+            self.last_tcp_info = stat.tcp_info_final.clone();
         }
-
-        // End-of-iteration kernel TCP snapshot. Cache it as the baseline for
-        // the next send() so successive iterations don't double-count
-        // retransmits.
-        if let Some(probe) = &self.tcp_probe {
-            let now = probe.sample();
-            stat.tcp_info_final = now.clone();
-            if now.is_some() {
-                self.last_tcp_info = now;
-            }
+        if stat.quic_info_final.is_some() {
+            self.last_quic = stat.quic_info_final.clone();
         }
-
-        stat.total = Some(start.elapsed());
-
-        // Handle decompression
-        if let Some(body) = &stat.body {
-            stat.body_size = Some(body.len());
-        }
-        let encoding = stat
-            .headers
-            .as_ref()
-            .and_then(|h| h.get("content-encoding"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        if !encoding.is_empty() {
-            if let Some(body) = &stat.body {
-                match decompress(encoding, body) {
-                    Ok(data) => stat.body = Some(data),
-                    Err(e) => stat.error = Some(e.to_string()),
-                }
-            }
-        }
-
         stat
+    }
+}
+
+impl HttpWorker {
+    /// One request on a cloned sender. Skips TCP/QUIC path deltas: those
+    /// counters are connection-wide and race when several workers send.
+    pub async fn send(mut self, http_req: &HttpRequest) -> HttpStat {
+        let start = Instant::now();
+        let stat = HttpStat::default();
+        match &mut self.kind {
+            WorkerKind::Http2(sender) => exchange_h2(sender, http_req, stat, start, None).await,
+            WorkerKind::Http3 { conn, send } => {
+                exchange_h3(send, conn, http_req, stat, start, false, None).await
+            }
+        }
     }
 }

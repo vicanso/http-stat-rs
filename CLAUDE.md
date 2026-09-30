@@ -35,5 +35,5 @@ The library (`src/lib.rs`) exposes the public API through re-exports:
 - Uses single-threaded tokio runtime (`#[tokio::main(flavor = "current_thread")]`).
 - Release profile is optimized for binary size: `opt-level = "z"`, LTO, strip, panic=abort.
 - The `--resolve` flag tests multiple IPs simultaneously, sorting results so errors appear last.
-- Redirect following (`-L`) is implemented manually with a max of 10 redirects.
+- Redirect following (`-L`) is implemented manually. `--max-redirs` caps the chain (default 10) and a repeated method+URI is treated as a loop.
 - URL schemes `grpc://` and `grpcs://` route to gRPC health check path.

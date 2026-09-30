@@ -16,6 +16,7 @@
 // limitations under the License.
 
 use crate::i18n::Lang;
+use crate::quic_info::{QuicInfo, QuicInfoDelta};
 use crate::tcp_info::{TcpInfo, TcpInfoDelta};
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -27,7 +28,7 @@ use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 use time::{OffsetDateTime, UtcOffset};
 use unicode_truncate::Alignment;
@@ -96,6 +97,56 @@ struct Timeline {
     duration: Duration,
 }
 
+/// One followed redirect. Phase times belong to that hop; the parent
+/// [`HttpStat`] timings stay the last hop.
+#[derive(Debug, Clone)]
+pub struct RedirectHop {
+    pub url: String,
+    pub status: u16,
+    pub dns_lookup: Option<Duration>,
+    pub dns_connect: Option<Duration>,
+    pub tcp_connect: Option<Duration>,
+    pub tls_handshake: Option<Duration>,
+    pub quic_connect: Option<Duration>,
+    pub proxy_connect: Option<Duration>,
+    pub proxy_handshake: Option<Duration>,
+    pub request_send: Option<Duration>,
+    pub server_processing: Option<Duration>,
+    pub content_transfer: Option<Duration>,
+    pub total: Option<Duration>,
+}
+
+/// Leaf-certificate expiry relative to `now_unix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertExpiry {
+    Ok,
+    /// Expires within 14 days. `days` is whole days remaining (0 = today).
+    Expiring {
+        days: i64,
+    },
+    /// Already expired. `days` is whole days since NotAfter.
+    Expired {
+        days: i64,
+    },
+}
+
+/// Warn when the leaf is expired or expires within 14 days.
+pub fn cert_expiry(not_after_unix: i64, now_unix: i64) -> CertExpiry {
+    const WINDOW: i64 = 14 * 24 * 60 * 60;
+    if not_after_unix < now_unix {
+        let late = now_unix.saturating_sub(not_after_unix);
+        CertExpiry::Expired {
+            days: late / 86_400,
+        }
+    } else if not_after_unix - now_unix <= WINDOW {
+        CertExpiry::Expiring {
+            days: (not_after_unix - now_unix) / 86_400,
+        }
+    } else {
+        CertExpiry::Ok
+    }
+}
+
 /// Statistics and information collected during an HTTP request.
 ///
 /// This struct contains timing information for each phase of the request,
@@ -142,7 +193,7 @@ pub struct HttpStat {
     pub tcp_connect: Option<Duration>,
     /// Kernel TCP statistics sampled right after `connect(2)`. Provides the
     /// baseline RTT, MSS and initial cwnd before any application data flows.
-    /// Linux + macOS only — None on other platforms.
+    /// None when this platform cannot sample a TCP connection.
     pub tcp_info_post_connect: Option<TcpInfo>,
     /// Kernel TCP statistics sampled after the response body has been fully
     /// received. The diff against `tcp_info_post_connect` reveals retransmits
@@ -170,6 +221,31 @@ pub struct HttpStat {
     /// Parsed `Strict-Transport-Security` policy (RFC 6797).
     pub hsts: Option<Hsts>,
     pub total: Option<Duration>,
+    /// TCP connect to the proxy. Present only when a proxy was used.
+    /// `tcp_connect` stays the sum of this and `proxy_handshake`.
+    pub proxy_connect: Option<Duration>,
+    /// TLS-to-proxy plus CONNECT, or the SOCKS5 / HTTP CONNECT handshake.
+    pub proxy_handshake: Option<Duration>,
+    /// CPU time spent decompressing. Not part of `total` (network wall time
+    /// until the body is consumed). Streaming decode can overlap
+    /// `content_transfer` and is not subtracted from it.
+    pub decompress: Option<Duration>,
+    /// Redirect hops that were followed. The fields above are the last hop.
+    pub redirects: Vec<RedirectHop>,
+    /// Wall clock from the first hop through the last response.
+    pub chain_total: Option<Duration>,
+    /// The address came from the process DNS cache (`-n`), not a live lookup.
+    pub dns_cached: bool,
+    /// Happy Eyeballs candidates, in the order they were raced. Empty when
+    /// there was only one address.
+    pub candidates: Vec<String>,
+    pub quic_info_post_connect: Option<QuicInfo>,
+    pub quic_info_final: Option<QuicInfo>,
+    /// Leaf certificate NotAfter as a unix timestamp. Drives the expiry warning.
+    pub cert_not_after_unix: Option<i64>,
+    pub trailers: Option<HeaderMap<HeaderValue>>,
+    /// Path written by the streaming `-o` sink.
+    pub output_saved: Option<String>,
     pub addr: Option<String>,
     pub grpc_status: Option<String>,
     pub status: Option<StatusCode>,
@@ -678,16 +754,23 @@ impl HttpStat {
         } else {
             ((s.dns_lookup, self.dns_lookup), ("", None))
         };
-        let phases_vec: Vec<(&str, Option<Duration>)> = vec![
-            dns_a,
-            dns_b,
-            (s.tcp_connect, self.tcp_connect),
+        let connect_phase = if self.proxy_connect.is_some() || self.proxy_handshake.is_some() {
+            vec![
+                (s.proxy_connect, self.proxy_connect),
+                (s.proxy_handshake, self.proxy_handshake),
+            ]
+        } else {
+            vec![(s.tcp_connect, self.tcp_connect)]
+        };
+        let mut phases_vec: Vec<(&str, Option<Duration>)> = vec![dns_a, dns_b];
+        phases_vec.extend(connect_phase);
+        phases_vec.extend([
             (s.tls_handshake, self.tls_handshake),
             (s.quic_connect, self.quic_connect),
             (s.request_send, self.request_send),
             (s.server_processing_short, self.server_processing),
             (s.content_transfer_short, self.content_transfer),
-        ];
+        ]);
         let phases: &[(&str, Option<Duration>)] = &phases_vec;
 
         let total_ns = total.as_nanos() as f64;
@@ -724,6 +807,10 @@ impl HttpStat {
                 LightCyan.paint(bar),
                 LightCyan.paint(format_duration(*dur))
             )?;
+
+            if *name == s.server_processing_short {
+                self.fmt_waterfall_server_timing(f, start_col, end_col, *dur)?;
+            }
         }
 
         writeln!(f)?;
@@ -736,6 +823,65 @@ impl HttpStat {
             LightCyan.paint(format_duration(total))
         )?;
         writeln!(f)
+    }
+
+    /// Nest Server-Timing bars inside the Server Processing span so they
+    /// don't add a second copy of that time to the waterfall.
+    fn fmt_waterfall_server_timing(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        start_col: usize,
+        end_col: usize,
+        phase: Duration,
+    ) -> fmt::Result {
+        let Some(entries) = &self.server_timing else {
+            return Ok(());
+        };
+        if entries.is_empty() || end_col <= start_col {
+            return Ok(());
+        }
+        let sum: Duration = entries.iter().filter_map(|e| e.duration).sum();
+        let scale = if sum > phase { sum } else { phase };
+        let scale_ns = (scale.as_nanos() as f64).max(1.0);
+        let span = end_col - start_col;
+        let mut cum = 0u128;
+        for entry in entries {
+            let dur_ns = entry.duration.map(|d| d.as_nanos()).unwrap_or(0);
+            let local_start = ((cum as f64 / scale_ns) * span as f64).round() as usize;
+            let mut local_end = (((cum + dur_ns) as f64 / scale_ns) * span as f64).round() as usize;
+            if dur_ns > 0 && local_end <= local_start {
+                local_end = local_start + 1;
+            }
+            let local_start = local_start.min(span);
+            let local_end = local_end.min(span);
+            let bar: String = (0..50)
+                .map(|i| {
+                    if i < start_col || i >= end_col {
+                        ' '
+                    } else {
+                        let local = i - start_col;
+                        if local >= local_start && local < local_end {
+                            '▓'
+                        } else {
+                            '░'
+                        }
+                    }
+                })
+                .collect();
+            let label = format!("  {}", entry.name);
+            writeln!(
+                f,
+                " {:<15} [{}]  {}",
+                label,
+                LightCyan.paint(bar),
+                entry
+                    .duration
+                    .map(format_duration)
+                    .unwrap_or_else(|| "-".into())
+            )?;
+            cum += dur_ns;
+        }
+        Ok(())
     }
 
     pub fn to_json(&self) -> Value {
@@ -764,6 +910,18 @@ impl HttpStat {
             dur_us(self.time_to_first_100k),
         );
         timing.insert("total_us".into(), dur_us(self.total));
+        if self.proxy_connect.is_some() {
+            timing.insert("proxy_connect_us".into(), dur_us(self.proxy_connect));
+        }
+        if self.proxy_handshake.is_some() {
+            timing.insert("proxy_handshake_us".into(), dur_us(self.proxy_handshake));
+        }
+        if self.decompress.is_some() {
+            timing.insert("decompress_us".into(), dur_us(self.decompress));
+        }
+        if self.chain_total.is_some() {
+            timing.insert("chain_total_us".into(), dur_us(self.chain_total));
+        }
         obj.insert("timing".into(), Value::Object(timing));
 
         // Throughput block — populated whenever a body was received with a
@@ -826,6 +984,71 @@ impl HttpStat {
                 block.insert("delta".into(), Value::Object(d));
             }
             obj.insert("tcp_info".into(), Value::Object(block));
+        }
+
+        if self.quic_info_post_connect.is_some() || self.quic_info_final.is_some() {
+            let quic_json = |info: Option<&QuicInfo>| -> Value {
+                let Some(info) = info else {
+                    return Value::Null;
+                };
+                json!({
+                    "rtt_us": info.rtt.as_micros() as u64,
+                    "cwnd": info.cwnd,
+                    "lost_packets": info.lost_packets,
+                    "sent_packets": info.sent_packets,
+                })
+            };
+            let mut block = Map::new();
+            block.insert(
+                "post_connect".into(),
+                quic_json(self.quic_info_post_connect.as_ref()),
+            );
+            block.insert("final".into(), quic_json(self.quic_info_final.as_ref()));
+            if let Some(delta) = QuicInfoDelta::compute(
+                self.quic_info_post_connect.as_ref(),
+                self.quic_info_final.as_ref(),
+            ) {
+                block.insert(
+                    "delta".into(),
+                    json!({
+                        "lost_during": delta.lost_during,
+                        "rtt_final_us": delta.rtt_final.as_micros() as u64,
+                        "cwnd_final": delta.cwnd_final,
+                    }),
+                );
+            }
+            obj.insert("quic_info".into(), Value::Object(block));
+        }
+
+        if !self.redirects.is_empty() {
+            let arr: Vec<Value> = self
+                .redirects
+                .iter()
+                .map(|hop| {
+                    json!({
+                        "url": hop.url,
+                        "status": hop.status,
+                        "dns_lookup_us": dur_us(hop.dns_lookup),
+                        "dns_connect_us": dur_us(hop.dns_connect),
+                        "tcp_connect_us": dur_us(hop.tcp_connect),
+                        "tls_handshake_us": dur_us(hop.tls_handshake),
+                        "quic_connect_us": dur_us(hop.quic_connect),
+                        "proxy_connect_us": dur_us(hop.proxy_connect),
+                        "proxy_handshake_us": dur_us(hop.proxy_handshake),
+                        "request_send_us": dur_us(hop.request_send),
+                        "server_processing_us": dur_us(hop.server_processing),
+                        "content_transfer_us": dur_us(hop.content_transfer),
+                        "total_us": dur_us(hop.total),
+                    })
+                })
+                .collect();
+            obj.insert("redirects".into(), Value::Array(arr));
+        }
+        if self.candidates.len() > 1 {
+            obj.insert("candidates".into(), json!(self.candidates));
+        }
+        if self.dns_cached {
+            obj.insert("dns_cached".into(), json!(true));
         }
 
         // Server-Timing entries (RFC 8673)
@@ -937,6 +1160,9 @@ impl HttpStat {
                     .as_deref()
                     .map_or(Value::Null, |s| json!(s)),
             );
+            if let Some(ts) = self.cert_not_after_unix {
+                tls.insert("not_after_unix".into(), json!(ts));
+            }
             tls.insert(
                 "domains".into(),
                 self.cert_domains.as_ref().map_or(Value::Null, |d| json!(d)),
@@ -965,11 +1191,32 @@ impl HttpStat {
             obj.insert("headers".into(), Value::Object(hdr_map));
         }
 
+        if let Some(trailers) = &self.trailers {
+            let mut hdr_map = Map::new();
+            for key in trailers.keys() {
+                let mut values: Vec<Value> = trailers
+                    .get_all(key)
+                    .iter()
+                    .map(|value| json!(value.to_str().unwrap_or_default()))
+                    .collect();
+                let v = if values.len() == 1 {
+                    values.remove(0)
+                } else {
+                    Value::Array(values)
+                };
+                hdr_map.insert(key.to_string(), v);
+            }
+            obj.insert("trailers".into(), Value::Object(hdr_map));
+        }
+
         // Body
         obj.insert(
             "body_size".into(),
             self.body_size.map_or(Value::Null, |s| json!(s)),
         );
+        if let Some(path) = &self.output_saved {
+            obj.insert("saved_to".into(), json!(path));
+        }
 
         // Error
         obj.insert(
@@ -992,6 +1239,9 @@ impl fmt::Display for HttpStat {
                 LightYellow.paint(s.resolved_to)
             };
             let mut text = format!("{} {}", label, LightCyan.paint(addr));
+            if self.dns_cached {
+                text = format!("{text} {}", s.dns_cached);
+            }
             if self.silent {
                 if let Some(status) = &self.status {
                     let alpn = self.alpn.as_deref().unwrap_or(ALPN_HTTP1);
@@ -1029,6 +1279,14 @@ impl fmt::Display for HttpStat {
         }
         if self.silent {
             return Ok(());
+        }
+        if self.candidates.len() > 1 {
+            writeln!(
+                f,
+                "{}: {}",
+                s.candidates,
+                LightCyan.paint(self.candidates.join(", "))
+            )?;
         }
         if self.verbose {
             for (key, value) in self.request_headers.iter() {
@@ -1096,12 +1354,36 @@ impl fmt::Display for HttpStat {
                 s.not_before,
                 LightCyan.paint(self.cert_not_before.as_deref().unwrap_or_default())
             )?;
-            writeln!(
+            write!(
                 f,
                 "{}: {}",
                 s.not_after,
                 LightCyan.paint(self.cert_not_after.as_deref().unwrap_or_default())
             )?;
+            if let Some(ts) = self.cert_not_after_unix {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                match cert_expiry(ts, now) {
+                    CertExpiry::Expiring { days } => {
+                        write!(
+                            f,
+                            " {}",
+                            LightYellow.paint(format!("{} {days}d", s.cert_expiring))
+                        )?;
+                    }
+                    CertExpiry::Expired { days } => {
+                        write!(
+                            f,
+                            " {}",
+                            LightRed.paint(format!("{} {days}d", s.cert_expired))
+                        )?;
+                    }
+                    CertExpiry::Ok => {}
+                }
+            }
+            writeln!(f)?;
             if self.verbose {
                 writeln!(
                     f,
@@ -1214,6 +1496,45 @@ impl fmt::Display for HttpStat {
                     };
                     writeln!(f, "{painted}")?;
                 }
+            }
+            writeln!(f)?;
+        }
+
+        if (self.verbose || self.show_tcp_info)
+            && (self.quic_info_post_connect.is_some() || self.quic_info_final.is_some())
+        {
+            writeln!(f, "{}", LightGreen.paint(s.quic_heading))?;
+            let render = |label: &str, info: &QuicInfo| {
+                format!(
+                    "  {:<14} rtt {}  cwnd {}  lost {}  sent {}",
+                    label,
+                    format_duration(info.rtt),
+                    info.cwnd,
+                    info.lost_packets,
+                    info.sent_packets,
+                )
+            };
+            if let Some(info) = &self.quic_info_post_connect {
+                writeln!(
+                    f,
+                    "{}",
+                    LightCyan.paint(render(s.tcp_post_connect_row, info))
+                )?;
+            }
+            if let Some(info) = &self.quic_info_final {
+                writeln!(f, "{}", LightCyan.paint(render(s.tcp_final_row, info)))?;
+            }
+            if let Some(delta) = QuicInfoDelta::compute(
+                self.quic_info_post_connect.as_ref(),
+                self.quic_info_final.as_ref(),
+            ) {
+                let label = format!("  {} {} {}", s.tcp_during, delta.lost_during, s.quic_lost);
+                let painted = if delta.lost_during == 0 {
+                    LightCyan.paint(label)
+                } else {
+                    LightYellow.paint(label)
+                };
+                writeln!(f, "{painted}")?;
             }
             writeln!(f)?;
         }
@@ -1425,6 +1746,21 @@ impl fmt::Display for HttpStat {
             writeln!(f)?;
         }
 
+        if !self.redirects.is_empty() {
+            writeln!(f, "{}", LightGreen.paint(s.redirects_heading))?;
+            for (i, hop) in self.redirects.iter().enumerate() {
+                writeln!(
+                    f,
+                    "  {} {} {} {}",
+                    i + 1,
+                    hop.status,
+                    hop.url,
+                    LightCyan.paint(format_duration(hop.total.unwrap_or_default()))
+                )?;
+            }
+            writeln!(f)?;
+        }
+
         if self.waterfall {
             self.fmt_waterfall(f)?;
         } else {
@@ -1450,7 +1786,20 @@ impl fmt::Display for HttpStat {
                     duration: value,
                 });
             }
-            if let Some(value) = self.tcp_connect {
+            if self.proxy_connect.is_some() || self.proxy_handshake.is_some() {
+                if let Some(value) = self.proxy_connect {
+                    timelines.push(Timeline {
+                        name: s.proxy_connect.to_string(),
+                        duration: value,
+                    });
+                }
+                if let Some(value) = self.proxy_handshake {
+                    timelines.push(Timeline {
+                        name: s.proxy_handshake.to_string(),
+                        duration: value,
+                    });
+                }
+            } else if let Some(value) = self.tcp_connect {
                 timelines.push(Timeline {
                     name: s.tcp_connect.to_string(),
                     duration: value,
@@ -1534,6 +1883,23 @@ impl fmt::Display for HttpStat {
             )?;
         }
 
+        if let Some(decompress) = self.decompress {
+            writeln!(
+                f,
+                " {}: {}",
+                s.decompress,
+                LightCyan.paint(format_duration(decompress))
+            )?;
+        }
+        if let Some(chain) = self.chain_total {
+            writeln!(
+                f,
+                " {}: {}",
+                s.chain_total,
+                LightCyan.paint(format_duration(chain))
+            )?;
+        }
+
         if let Some(body) = &self.body {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();
             let mut body = std::str::from_utf8(body.as_ref())
@@ -1583,6 +1949,16 @@ impl fmt::Display for HttpStat {
                 writeln!(f, "{} {}", LightCyan.paint(text), save_tips)?;
                 self.fmt_throughput(f)?;
             }
+        } else if let Some(path) = &self.output_saved {
+            let text = format!(
+                "{}: {}  {}: {}",
+                s.body_size,
+                ByteSize(self.body_size.unwrap_or(0) as u64),
+                s.saved_to,
+                path
+            );
+            writeln!(f, "{}", LightCyan.paint(text))?;
+            self.fmt_throughput(f)?;
         }
 
         Ok(())
@@ -1756,6 +2132,37 @@ impl fmt::Display for BenchmarkSummary {
                 )?;
             }
             writeln!(f)?;
+        }
+
+        let mut rates: Vec<f64> = self
+            .stats
+            .iter()
+            .filter_map(|s| s.throughput_bps())
+            .collect();
+        if !rates.is_empty() {
+            rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let sum: f64 = rates.iter().sum();
+            let avg = sum / rates.len() as f64;
+            let at = |p: f64| {
+                let idx = ((p * rates.len() as f64).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(rates.len() - 1);
+                rates[idx]
+            };
+            writeln!(
+                f,
+                "  {} {} {}  {} {}  {} {}  p50 {}  p95 {}  p99 {}",
+                LightCyan.paint(strs.throughput),
+                LightCyan.paint(strs.min),
+                LightCyan.paint(format_throughput(rates[0])),
+                LightCyan.paint(strs.max),
+                LightCyan.paint(format_throughput(rates[rates.len() - 1])),
+                LightCyan.paint(strs.avg),
+                LightCyan.paint(format_throughput(avg)),
+                LightCyan.paint(format_throughput(at(0.5))),
+                LightCyan.paint(format_throughput(at(0.95))),
+                LightCyan.paint(format_throughput(at(0.99))),
+            )?;
         }
 
         writeln!(f)?;
@@ -2112,6 +2519,25 @@ mod tests {
     }
 
     // ---- to_json ----
+    #[test]
+    fn cert_expiry_window() {
+        let now = 1_700_000_000;
+        assert_eq!(cert_expiry(now + 30 * 86_400, now), CertExpiry::Ok);
+        assert_eq!(
+            cert_expiry(now + 3 * 86_400, now),
+            CertExpiry::Expiring { days: 3 }
+        );
+        assert_eq!(
+            cert_expiry(now + 14 * 86_400, now),
+            CertExpiry::Expiring { days: 14 }
+        );
+        assert_eq!(
+            cert_expiry(now - 2 * 86_400, now),
+            CertExpiry::Expired { days: 2 }
+        );
+        assert_eq!(cert_expiry(now, now), CertExpiry::Expiring { days: 0 });
+    }
+
     #[test]
     fn to_json_blocks_are_conditional() {
         let with_body = HttpStat {

@@ -19,6 +19,8 @@ use crate::{
     dns_resolve, finish_with_error, tcp_connect, tls_handshake, Error, HttpRequest, HttpStat,
     ALPN_HTTP2,
 };
+use bytes::{Bytes, BytesMut};
+use http::header::{HeaderMap, HeaderValue};
 use http::uri::Uri;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
@@ -104,19 +106,26 @@ impl Service<Uri> for CustomHttpConnector {
         let stat = Arc::clone(&self.stat);
         let fut = async move {
             let mut stat = stat.lock().await;
-            let (addr, host) = dns_resolve(&http_req, &mut stat).await?;
+            let resolved = dns_resolve(&http_req, &mut stat).await?;
             // gRPC uses tonic's high-level client; we can't reliably sample
             // post-transfer TCP_INFO, so drop the probe. The post-connect
             // baseline is already populated by tcp_connect.
-            let (tcp_stream, _tcp_probe) =
-                tcp_connect(addr, http_req.tcp_timeout, http_req.bind_addr, &mut stat).await?;
+            let (tcp_stream, _tcp_probe, winner) = tcp_connect(
+                resolved.addrs,
+                http_req.tcp_timeout,
+                http_req.bind_addr,
+                &mut stat,
+            )
+            .await?;
+            http_req.note_dns_winner(&resolved.cache_host, resolved.cache_port, winner);
             // grpcs:// = gRPC over TLS: run the rustls handshake (honoring
             // --skip-verify and mTLS) with h2 as the only ALPN offer, since
             // gRPC requires HTTP/2.
             if http_req.uri.scheme_str() == Some("grpcs") {
                 let mut tls_req = http_req.clone();
                 tls_req.alpn_protocols = vec![ALPN_HTTP2.to_string()];
-                let (tls_stream, _) = tls_handshake(host, tcp_stream, &tls_req, &mut stat).await?;
+                let (tls_stream, _) =
+                    tls_handshake(resolved.host, tcp_stream, &tls_req, &mut stat).await?;
                 Ok(TokioIo::new(GrpcStream::Tls(Box::new(tls_stream))))
             } else {
                 Ok(TokioIo::new(GrpcStream::Plain(tcp_stream)))
@@ -159,7 +168,112 @@ fn endpoint_uri(uri: &Uri) -> Uri {
     Uri::from_parts(parts).unwrap_or_else(|_| uri.clone())
 }
 
+fn is_health_path(path: &str) -> bool {
+    path.is_empty() || path == "/" || path.contains("grpc.health.v1.Health/Check")
+}
+
+fn header_value(map: &HeaderMap, name: &str) -> Option<String> {
+    map.get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Concatenate uncompressed gRPC length-prefixed messages. A compressed flag
+/// or a truncated frame leaves the body as it arrived.
+fn unframe_grpc(bytes: &[u8]) -> Option<Bytes> {
+    if bytes.is_empty() {
+        return Some(Bytes::new());
+    }
+    let mut i = 0;
+    let mut out = BytesMut::new();
+    while i < bytes.len() {
+        if i + 5 > bytes.len() {
+            return None;
+        }
+        let flag = bytes[i];
+        let len =
+            u32::from_be_bytes([bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4]]) as usize;
+        i += 5;
+        if i + len > bytes.len() {
+            return None;
+        }
+        if flag != 0 {
+            return None;
+        }
+        out.extend_from_slice(&bytes[i..i + len]);
+        i += len;
+    }
+    Some(out.freeze())
+}
+
+fn apply_grpc_status(stat: &mut HttpStat) {
+    stat.grpc_status = stat
+        .trailers
+        .as_ref()
+        .and_then(|h| header_value(h, "grpc-status"))
+        .or_else(|| {
+            stat.headers
+                .as_ref()
+                .and_then(|h| header_value(h, "grpc-status"))
+        });
+}
+
+/// Raw unary RPC. The scheme is rewritten before `request()` so this does not
+/// recurse. Cleartext `grpc://` uses h2c prior knowledge; `--http2 http://`
+/// is unchanged.
+async fn raw_unary(mut http_req: HttpRequest) -> HttpStat {
+    let cleartext = http_req.uri.scheme_str() == Some("grpc");
+    let mut parts = http_req.uri.clone().into_parts();
+    parts.scheme = Some(if cleartext {
+        http::uri::Scheme::HTTP
+    } else {
+        http::uri::Scheme::HTTPS
+    });
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    }
+    http_req.uri = Uri::from_parts(parts).unwrap_or(http_req.uri);
+    http_req.alpn_protocols = vec![ALPN_HTTP2.to_string()];
+    http_req.method = Some("POST".to_string());
+    http_req.h2_prior_knowledge = cleartext;
+
+    let payload = http_req.body.clone().unwrap_or_default();
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    http_req.body = Some(Bytes::from(frame));
+
+    let mut headers = http_req.headers.take().unwrap_or_default();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc"),
+    );
+    headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+    http_req.headers = Some(headers);
+
+    // Boxed so the grpc:// → request() → raw_unary cycle stays a finite future.
+    // The scheme was rewritten above, so this call takes the HTTP path.
+    let mut stat = Box::pin(crate::request::request(http_req)).await;
+    stat.is_grpc = true;
+    if let Some(body) = stat.body.clone() {
+        if let Some(unframed) = unframe_grpc(&body) {
+            stat.body_size = Some(unframed.len());
+            stat.body = Some(unframed);
+        }
+    }
+    apply_grpc_status(&mut stat);
+    stat
+}
+
 pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
+    if !is_health_path(http_req.uri.path()) {
+        return raw_unary(http_req).await;
+    }
+    health_request(http_req).await
+}
+
+async fn health_request(http_req: HttpRequest) -> HttpStat {
     let start = Instant::now();
     let stat = Arc::new(Mutex::new(HttpStat {
         is_grpc: true,
@@ -208,6 +322,10 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
     let (meta, message, _) = resp.into_parts();
     if let Some(grpc_status) = meta.get("grpc-status") {
         stat.grpc_status = Some(grpc_status.to_str().unwrap_or_default().to_string());
+    }
+    // tonic omits grpc-status on a successful Check. Success requires "0".
+    if stat.grpc_status.is_none() {
+        stat.grpc_status = Some("0".to_string());
     }
     stat.headers = Some(meta.into_headers());
     stat.body = Some(format!("{message:?}").into());

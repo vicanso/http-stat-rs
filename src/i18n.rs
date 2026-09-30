@@ -152,6 +152,18 @@ pub struct Strings {
     pub min: &'static str,
     pub max: &'static str,
     pub avg: &'static str,
+
+    pub proxy_connect: &'static str,
+    pub proxy_handshake: &'static str,
+    pub decompress: &'static str,
+    pub chain_total: &'static str,
+    pub redirects_heading: &'static str,
+    pub cert_expiring: &'static str,
+    pub cert_expired: &'static str,
+    pub dns_cached: &'static str,
+    pub quic_heading: &'static str,
+    pub candidates: &'static str,
+    pub quic_lost: &'static str,
 }
 
 pub const EN: Strings = Strings {
@@ -220,6 +232,18 @@ pub const EN: Strings = Strings {
     min: "min",
     max: "max",
     avg: "avg",
+
+    proxy_connect: "Proxy Connect",
+    proxy_handshake: "Proxy Handshake",
+    decompress: "Decompress",
+    chain_total: "Chain Total",
+    redirects_heading: "Redirects:",
+    cert_expiring: "expires in",
+    cert_expired: "expired",
+    dns_cached: "(cached)",
+    quic_heading: "QUIC:",
+    candidates: "Candidates",
+    quic_lost: "lost",
 };
 
 pub const ZH: Strings = Strings {
@@ -288,6 +312,18 @@ pub const ZH: Strings = Strings {
     min: "最小",
     max: "最大",
     avg: "均值",
+
+    proxy_connect: "代理连接",
+    proxy_handshake: "代理握手",
+    decompress: "解压",
+    chain_total: "链路总耗时",
+    redirects_heading: "重定向：",
+    cert_expiring: "即将到期",
+    cert_expired: "已过期",
+    dns_cached: "(缓存)",
+    quic_heading: "QUIC：",
+    candidates: "候选地址",
+    quic_lost: "丢包",
 };
 
 #[cfg(test)]

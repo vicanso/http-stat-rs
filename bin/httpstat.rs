@@ -16,15 +16,19 @@
 
 use bytes::Bytes;
 use clap::Parser;
+use futures::stream::{FuturesUnordered, StreamExt};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::StatusCode;
 use http::Uri;
 use http_stat::{
-    connect, format_duration, request, BenchmarkSummary, ConnectTo, HttpRequest, HttpStat, Lang,
-    ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3,
+    connect, format_duration, proxy_bypassed, request, AltSvcCache, BenchmarkSummary, ConnectTo,
+    CookieJar, DnsCache, HttpConnection, HttpRequest, HttpStat, Lang, RedirectHop, ALPN_HTTP1,
+    ALPN_HTTP2, ALPN_HTTP3,
 };
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::fs;
 
 #[cfg(target_env = "musl")]
@@ -66,6 +70,13 @@ struct Args {
     #[arg(short = 'L', help = "follow 30x redirects")]
     follow_redirect: bool,
 
+    /// Maximum redirects to follow with -L. Zero does not follow.
+    #[arg(
+        long = "max-redirs",
+        help = "max redirects to follow with -L (default 10); 0 does not follow"
+    )]
+    max_redirs: Option<usize>,
+
     /// HTTP method to use (default GET)
     #[arg(short = 'X', help = "HTTP method to use (default GET)")]
     method: Option<String>,
@@ -74,7 +85,7 @@ struct Args {
     #[arg(
         short = 'd',
         long = "data",
-        help = "the body of a POST or PUT request; from file use @filename, from stdin use @-"
+        help = "request body; without -X this implies POST; from file use @filename, from stdin use @-"
     )]
     data: Option<String>,
 
@@ -144,7 +155,7 @@ struct Args {
     /// without needing the full --verbose dump. Linux + macOS only.
     #[arg(
         long = "tcp-info",
-        help = "show kernel TCP_INFO stats (RTT, cwnd, retransmits); Linux + macOS"
+        help = "show kernel TCP_INFO stats (RTT, cwnd, retransmits); Linux, macOS, and Windows"
     )]
     tcp_info: bool,
 
@@ -170,7 +181,7 @@ struct Args {
     /// response body and any followed redirects (like curl --max-time).
     #[arg(
         long = "max-time",
-        help = "overall time limit for the whole operation incl. body and redirects, e.g. 30s"
+        help = "overall time limit for the whole operation, including body, redirects, retries, and Alt-Svc, e.g. 30s"
     )]
     max_time: Option<String>,
 
@@ -210,9 +221,17 @@ struct Args {
     #[arg(
         short = 'K',
         long = "reuse",
-        help = "reuse connection in benchmark mode (requires -n), test warm request performance"
+        help = "reuse one connection across -n requests (HTTP/3 included); -c also reuses"
     )]
     reuse: bool,
+
+    /// How many requests may be in flight on one multiplexed connection.
+    #[arg(
+        short = 'c',
+        long = "concurrency",
+        help = "in-flight requests on one HTTP/2 or HTTP/3 connection; if -n is omitted, -c N runs N requests"
+    )]
+    concurrency: Option<usize>,
 
     /// Cookie
     #[arg(
@@ -335,6 +354,9 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
     cfg_bool!(http3);
     cfg_bool!(json);
     cfg_bool!(alt_svc);
+    cfg_bool!(waterfall);
+    cfg_bool!(tcp_info);
+    cfg_bool!(reuse);
     // Optional strings: config fills in when CLI left them None
     cfg_opt_str!(dns_servers);
     cfg_opt_str!(timeout);
@@ -344,6 +366,20 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
     cfg_opt_str!(max_filesize);
     cfg_opt_str!(cookie);
     cfg_opt_str!(output);
+    cfg_opt_str!(proxy);
+    cfg_opt_str!(bind);
+    cfg_opt_str!(lang);
+    macro_rules! cfg_opt_usize {
+        ($field:ident) => {
+            if args.$field.is_none() {
+                if let Some(n) = cfg.get(stringify!($field)).and_then(|v| v.as_u64()) {
+                    args.$field = Some(n as usize);
+                }
+            }
+        };
+    }
+    cfg_opt_usize!(concurrency);
+    cfg_opt_usize!(max_redirs);
     // Numeric: retry count
     if args.retry.is_none() {
         if let Some(n) = cfg.get("retry").and_then(|v| v.as_u64()) {
@@ -371,33 +407,49 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
             }
         }
     }
+    if let Some(arr) = cfg.get("connect_to").and_then(|v| v.as_array()) {
+        let defaults: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect();
+        if !defaults.is_empty() {
+            let mut merged = defaults;
+            merged.append(&mut args.connect_to);
+            args.connect_to = merged;
+        }
+    }
 }
 
-fn collect_cookies(stat: &HttpStat, existing: &str) -> String {
-    let mut cookies = std::collections::HashMap::new();
-    // Parse existing cookies
-    for pair in existing.split(';') {
-        let pair = pair.trim();
-        if let Some((name, value)) = pair.split_once('=') {
-            cookies.insert(name.trim().to_string(), value.trim().to_string());
+fn with_jar<T>(jar: &Mutex<CookieJar>, f: impl FnOnce(&mut CookieJar) -> T) -> T {
+    let mut guard = jar.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
+}
+
+fn apply_jar(req: &mut HttpRequest, jar: &mut CookieJar) {
+    if let Some(headers) = req.headers.as_mut() {
+        headers.remove(http::header::COOKIE);
+    }
+    let Some(value) = jar.header_for(&req.uri) else {
+        return;
+    };
+    let Ok(header) = HeaderValue::from_str(&value) else {
+        return;
+    };
+    req.headers
+        .get_or_insert_with(HeaderMap::new)
+        .insert(http::header::COOKIE, header);
+}
+
+fn store_response_cookies(jar: &mut CookieJar, uri: &Uri, stat: &HttpStat) {
+    let Some(headers) = &stat.headers else {
+        return;
+    };
+    for value in headers.get_all(http::header::SET_COOKIE) {
+        if let Ok(raw) = value.to_str() {
+            jar.store_set_cookie(uri, raw);
         }
     }
-    // Collect Set-Cookie from response
-    if let Some(headers) = &stat.headers {
-        for value in headers.get_all(http::header::SET_COOKIE).iter() {
-            let value = value.to_str().unwrap_or_default();
-            // Only take name=value part (before first ';')
-            let cookie_part = value.split(';').next().unwrap_or_default().trim();
-            if let Some((name, val)) = cookie_part.split_once('=') {
-                cookies.insert(name.trim().to_string(), val.trim().to_string());
-            }
-        }
-    }
-    cookies
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// Decide whether a redirect with `status` should rewrite the request to GET
@@ -413,56 +465,206 @@ fn redirect_downgrades_to_get(status: StatusCode, method: &str) -> bool {
     }
 }
 
-/// Resolve a redirect `Location` against the request's current URI, covering
-/// the common RFC 3986 reference forms: absolute URLs, scheme-relative
-/// (`//host/path`), absolute-path (`/path`), and relative-path references.
+/// RFC 3986 §5.2.4. An empty input stays empty so an absolute URL with no
+/// path is left alone; a reference that collapses to nothing becomes `/`.
+fn remove_dot_segments(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let mut input = path.to_string();
+    let mut output = String::new();
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest.to_string();
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest.to_string();
+        } else if let Some(rest) = input.strip_prefix("/./") {
+            input = format!("/{rest}");
+        } else if input == "/." {
+            input = "/".to_string();
+        } else if let Some(rest) = input.strip_prefix("/../") {
+            input = format!("/{rest}");
+            remove_last_segment(&mut output);
+        } else if input == "/.." {
+            input = "/".to_string();
+            remove_last_segment(&mut output);
+        } else if input == "." || input == ".." {
+            input.clear();
+        } else {
+            let (seg, rest) = split_first_segment(&input);
+            output.push_str(seg);
+            input = rest.to_string();
+        }
+    }
+    if output.is_empty() {
+        "/".to_string()
+    } else {
+        output
+    }
+}
+
+fn remove_last_segment(output: &mut String) {
+    match output.rfind('/') {
+        Some(i) => output.truncate(i),
+        None => output.clear(),
+    }
+}
+
+/// First path segment, including a leading `/`, up to but not including the
+/// next `/`.
+fn split_first_segment(input: &str) -> (&str, &str) {
+    let start_rest = usize::from(input.starts_with('/'));
+    let rest = &input[start_rest..];
+    match rest.find('/') {
+        Some(i) => {
+            let end = start_rest + i;
+            (&input[..end], &input[end..])
+        }
+        None => (input, ""),
+    }
+}
+
+fn normalize_absolute(uri: Uri) -> Option<Uri> {
+    let path = uri.path();
+    if !path.contains('.') {
+        return Some(uri);
+    }
+    let normalized = remove_dot_segments(path);
+    if normalized == path {
+        return Some(uri);
+    }
+    let query = uri.query().map(str::to_string);
+    let mut parts = uri.into_parts();
+    let pq = match query {
+        Some(q) => format!("{normalized}?{q}"),
+        None => normalized,
+    };
+    parts.path_and_query = Some(pq.parse().ok()?);
+    Uri::from_parts(parts).ok()
+}
+
+/// Resolve a redirect `Location` against the request's current URI.
+/// Covers absolute URLs, scheme-relative (`//host/path`), absolute-path, and
+/// relative-path references. Dot segments are removed (RFC 3986 §5.2.4), the
+/// query is preserved, and any fragment is dropped.
 /// Returns `None` for an empty location or when the base lacks scheme/authority.
 fn resolve_redirect(base: &Uri, location: &str) -> Option<Uri> {
     let location = location.trim();
     if location.is_empty() {
         return None;
     }
-    // Already absolute (has both scheme and authority).
+    let location = location
+        .split_once('#')
+        .map(|(head, _)| head)
+        .unwrap_or(location);
+    if location.is_empty() {
+        return None;
+    }
     if let Ok(uri) = location.parse::<Uri>() {
         if uri.scheme().is_some() && uri.authority().is_some() {
-            return Some(uri);
+            return normalize_absolute(uri);
         }
     }
+    let (path_ref, query) = match location.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (location, None),
+    };
     let scheme = base.scheme_str()?;
     let authority = base.authority()?.as_str();
-    if let Some(rest) = location.strip_prefix("//") {
-        // Scheme-relative: //host/path
-        format!("{scheme}://{rest}").parse().ok()
-    } else if location.starts_with('/') {
-        // Absolute path on the same authority.
-        format!("{scheme}://{authority}{location}").parse().ok()
-    } else {
-        // Relative path: resolve against the base path's directory.
-        let base_path = base.path();
-        let dir = match base_path.rfind('/') {
-            Some(i) => &base_path[..=i],
-            None => "/",
+    if let Some(rest) = path_ref.strip_prefix("//") {
+        let absolute = match query {
+            Some(q) => format!("{scheme}://{rest}?{q}"),
+            None => format!("{scheme}://{rest}"),
         };
-        format!("{scheme}://{authority}{dir}{location}")
-            .parse()
-            .ok()
+        return absolute.parse::<Uri>().ok().and_then(normalize_absolute);
+    }
+    let merged = if path_ref.starts_with('/') {
+        remove_dot_segments(path_ref)
+    } else {
+        let base_path = base.path();
+        let dir = if base_path.is_empty() {
+            "/"
+        } else {
+            match base_path.rfind('/') {
+                Some(i) => &base_path[..=i],
+                None => "/",
+            }
+        };
+        remove_dot_segments(&format!("{dir}{path_ref}"))
+    };
+    let path = if merged.is_empty() {
+        "/"
+    } else {
+        merged.as_str()
+    };
+    let full = match query {
+        Some(q) => format!("{scheme}://{authority}{path}?{q}"),
+        None => format!("{scheme}://{authority}{path}"),
+    };
+    full.parse().ok()
+}
+
+fn is_redirect_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn method_uri_key(req: &HttpRequest) -> String {
+    format!(
+        "{} {}",
+        req.method.as_deref().unwrap_or("GET").to_ascii_uppercase(),
+        req.uri
+    )
+}
+
+fn redirect_hop(url: &str, stat: &HttpStat) -> RedirectHop {
+    RedirectHop {
+        url: url.to_string(),
+        status: stat.status.map(|s| s.as_u16()).unwrap_or(0),
+        dns_lookup: stat.dns_lookup,
+        dns_connect: stat.dns_connect,
+        tcp_connect: stat.tcp_connect,
+        tls_handshake: stat.tls_handshake,
+        quic_connect: stat.quic_connect,
+        proxy_connect: stat.proxy_connect,
+        proxy_handshake: stat.proxy_handshake,
+        request_send: stat.request_send,
+        server_processing: stat.server_processing,
+        content_transfer: stat.content_transfer,
+        total: stat.total,
     }
 }
 
-async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
+async fn do_request(
+    mut req: HttpRequest,
+    follow_redirect: bool,
+    max_redirs: usize,
+    jar: &Mutex<CookieJar>,
+) -> HttpStat {
+    let chain_start = Instant::now();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(method_uri_key(&req));
+    with_jar(jar, |j| apply_jar(&mut req, j));
     let mut stat = request(req.clone()).await;
-    if follow_redirect {
-        for _ in 0..10 {
-            let status = stat.status.unwrap_or(StatusCode::OK);
-            if ![
-                StatusCode::MOVED_PERMANENTLY,
-                StatusCode::FOUND,
-                StatusCode::SEE_OTHER,
-                StatusCode::TEMPORARY_REDIRECT,
-                StatusCode::PERMANENT_REDIRECT,
-            ]
-            .contains(&status)
-            {
+    with_jar(jar, |j| store_response_cookies(j, &req.uri, &stat));
+
+    let mut hops = Vec::new();
+    if follow_redirect && max_redirs > 0 {
+        let mut followed = 0usize;
+        while let Some(status) = stat.status {
+            if !is_redirect_status(status) {
+                break;
+            }
+            if followed >= max_redirs {
+                eprintln!(
+                    "httpstat: stopped after {max_redirs} redirect(s); increase --max-redirs to follow further"
+                );
                 break;
             }
             let location = stat
@@ -476,10 +678,6 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
                 break;
             };
 
-            // Method/body rewrite per RFC 9110 (see redirect_downgrades_to_get).
-            // When downgrading to GET we must also drop the request body and any
-            // body-describing headers the user supplied, so we don't send a
-            // stale Content-Length / Content-Type with a now-empty GET.
             let current_method = req.method.as_deref().unwrap_or("GET");
             if redirect_downgrades_to_get(status, current_method) {
                 req.method = Some("GET".to_string());
@@ -491,9 +689,6 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
                 }
             }
 
-            // Drop credentials when the redirect crosses to a different host, so
-            // an Authorization header isn't leaked to a third party (curl strips
-            // it too unless --location-trusted is given).
             let same_host = req
                 .uri
                 .host()
@@ -503,38 +698,30 @@ async fn do_request(mut req: HttpRequest, follow_redirect: bool) -> HttpStat {
                 if let Some(h) = req.headers.as_mut() {
                     h.remove(http::header::AUTHORIZATION);
                 }
-                // A --resolve pin belongs to the original host only; keeping
-                // it would silently connect the new host to the pinned IP
-                // with the wrong SNI/Host. Fall back to real DNS instead.
                 req.resolve = None;
             }
 
-            // Carry cookies across the redirect (this hop's Set-Cookie merged
-            // into the forwarded Cookie header). Cookies are host-scoped
-            // credentials just like Authorization: on a cross-host redirect
-            // drop them instead of leaking the session to a third party.
-            if same_host {
-                let existing_cookie = req
-                    .headers
-                    .as_ref()
-                    .and_then(|h| h.get(http::header::COOKIE))
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default()
-                    .to_string();
-                let merged = collect_cookies(&stat, &existing_cookie);
-                if !merged.is_empty() {
-                    if let Ok(value) = merged.parse::<HeaderValue>() {
-                        let header_map = req.headers.get_or_insert_with(HeaderMap::new);
-                        header_map.insert(http::header::COOKIE, value);
-                    }
-                }
-            } else if let Some(h) = req.headers.as_mut() {
-                h.remove(http::header::COOKIE);
+            let hop_url = req.uri.to_string();
+            req.uri = new_uri;
+            if !seen.insert(method_uri_key(&req)) {
+                stat.error = Some(format!(
+                    "redirect loop detected for {} {}",
+                    req.method.as_deref().unwrap_or("GET"),
+                    req.uri
+                ));
+                break;
             }
 
-            req.uri = new_uri;
+            hops.push(redirect_hop(&hop_url, &stat));
+            with_jar(jar, |j| apply_jar(&mut req, j));
             stat = request(req.clone()).await;
+            with_jar(jar, |j| store_response_cookies(j, &req.uri, &stat));
+            followed += 1;
         }
+    }
+    if !hops.is_empty() {
+        stat.redirects = hops;
+        stat.chain_total = Some(chain_start.elapsed());
     }
     stat
 }
@@ -587,15 +774,42 @@ fn benchmark_to_json(stats: &[HttpStat], connect_stat: Option<&HttpStat>) -> ser
             "quic_connect": stat_obj(&calc(|s| s.quic_connect)),
             "server_processing": stat_obj(&calc(|s| s.server_processing)),
             "content_transfer": stat_obj(&calc(|s| s.content_transfer)),
+            "request_send": stat_obj(&calc(|s| s.request_send)),
             "total": stat_obj(&calc(|s| s.total)),
         },
     });
+
+    let mut rates: Vec<f64> = stats.iter().filter_map(|s| s.throughput_bps()).collect();
+    rates.sort_by(|a, b| a.total_cmp(b));
+    obj["throughput"] = if rates.is_empty() {
+        serde_json::Value::Null
+    } else {
+        let sum: f64 = rates.iter().sum();
+        let avg = sum / rates.len() as f64;
+        let at = |pct: f64| -> f64 {
+            let idx = ((pct * rates.len() as f64).ceil() as usize)
+                .saturating_sub(1)
+                .min(rates.len() - 1);
+            rates[idx]
+        };
+        serde_json::json!({
+            "bps_total": {
+                "min": rates[0],
+                "max": rates[rates.len() - 1],
+                "avg": avg,
+                "p50": at(0.5),
+                "p95": at(0.95),
+                "p99": at(0.99),
+            }
+        })
+    };
 
     if let Some(cs) = connect_stat {
         obj["cold_connect"] = serde_json::json!({
             "dns_lookup_us": dur_us(cs.dns_lookup),
             "tcp_connect_us": dur_us(cs.tcp_connect),
             "tls_handshake_us": dur_us(cs.tls_handshake),
+            "quic_connect_us": dur_us(cs.quic_connect),
             "total_us": dur_us(cs.total),
         });
     }
@@ -711,22 +925,82 @@ fn backoff_delay(n: usize) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// One wall-clock budget for a logical request, including retries, backoff,
+/// and an Alt-Svc upgrade. `limit` is the original `--max-time`.
+#[derive(Clone, Copy)]
+struct TimeBudget {
+    deadline: Instant,
+    limit: std::time::Duration,
+}
+
+fn fresh_budget(max_time: Option<std::time::Duration>) -> Option<TimeBudget> {
+    max_time.map(|limit| TimeBudget {
+        deadline: Instant::now() + limit,
+        limit,
+    })
+}
+
+fn budget_expired(budget: Option<TimeBudget>) -> Option<HttpStat> {
+    let budget = budget?;
+    if Instant::now() >= budget.deadline {
+        Some(max_time_error_stat(budget.limit))
+    } else {
+        None
+    }
+}
+
+/// Sleep `delay`, but not past `budget`. Returns true when the deadline won
+/// and the caller should surface a `--max-time` timeout.
+async fn sleep_within_budget(delay: std::time::Duration, budget: Option<TimeBudget>) -> bool {
+    let Some(budget) = budget else {
+        tokio::time::sleep(delay).await;
+        return false;
+    };
+    let now = Instant::now();
+    if now >= budget.deadline {
+        return true;
+    }
+    let left = budget.deadline.saturating_duration_since(now);
+    if delay >= left {
+        tokio::time::sleep(left).await;
+        true
+    } else {
+        tokio::time::sleep(delay).await;
+        false
+    }
+}
+
 /// Run an operation with up to `retries` retries on transient failure. `make`
-/// builds a fresh operation future per attempt. Between attempts it waits
-/// `retry_delay` (fixed) or an exponential backoff, logging each retry to
-/// stderr so it never pollutes stdout / JSON output.
+/// builds a fresh operation future per attempt. `budget`, when set, covers
+/// every attempt and the backoff between them.
 async fn run_with_retry<F, Fut>(
-    make: F,
+    mut make: F,
     retries: usize,
     retry_delay: Option<std::time::Duration>,
+    budget: Option<TimeBudget>,
 ) -> HttpStat
 where
-    F: Fn() -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = HttpStat>,
 {
     let mut attempt = 0usize;
     loop {
-        let stat = make().await;
+        if let Some(stat) = budget_expired(budget) {
+            return stat;
+        }
+        let fut = make();
+        let stat = if let Some(budget) = budget {
+            let left = budget.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return max_time_error_stat(budget.limit);
+            }
+            match tokio::time::timeout(left, fut).await {
+                Ok(stat) => stat,
+                Err(_) => return max_time_error_stat(budget.limit),
+            }
+        } else {
+            fut.await
+        };
         if attempt >= retries || !is_retryable(&stat) {
             return stat;
         }
@@ -742,7 +1016,10 @@ where
             retries + 1,
             format_duration(delay)
         );
-        tokio::time::sleep(delay).await;
+        if sleep_within_budget(delay, budget).await {
+            let limit = budget.map(|b| b.limit).unwrap_or(delay);
+            return max_time_error_stat(limit);
+        }
         attempt += 1;
     }
 }
@@ -757,12 +1034,34 @@ fn parse_alt_authority(authority: &str) -> Option<(String, u16)> {
 }
 
 /// Find an advertised HTTP/3 endpoint in a response's `Alt-Svc` list, if any.
+#[cfg_attr(not(test), allow(dead_code))]
 fn h3_endpoint(stat: &HttpStat) -> Option<(String, u16)> {
     stat.alt_svc
         .as_ref()?
         .iter()
         .find(|e| e.protocol == "h3")
         .and_then(|e| parse_alt_authority(&e.authority))
+}
+
+/// HTTP/3 advertisement plus `ma`. `ma=0` is skipped. A missing `ma` uses the
+/// RFC 7838 default of 24 hours so the on-disk cache can still expire.
+fn h3_advertisement(stat: &HttpStat) -> Option<(String, u16, u64)> {
+    let entry = stat.alt_svc.as_ref()?.iter().find(|e| e.protocol == "h3")?;
+    let (host, port) = parse_alt_authority(&entry.authority)?;
+    let max_age = match entry.max_age {
+        Some(0) => return None,
+        Some(ma) => ma,
+        None => 24 * 60 * 60,
+    };
+    Some((host, port, max_age))
+}
+
+fn alt_svc_cleared(stat: &HttpStat) -> bool {
+    stat.alt_svc.as_ref().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|e| e.protocol == "h3" && e.max_age == Some(0))
+    })
 }
 
 /// Format an Alt-Svc endpoint for display (`:443`, `host:443`, `[::1]:443`).
@@ -801,28 +1100,87 @@ fn apply_alt_endpoint(req: &mut HttpRequest, alt_host: &str, alt_port: u16) {
 /// Per-invocation options shared by the single-request and `--resolve` paths.
 struct RunOpts {
     follow_redirect: bool,
+    max_redirs: usize,
     max_time: Option<std::time::Duration>,
     retries: usize,
     retry_delay: Option<std::time::Duration>,
     alt_svc: bool,
+    alt_cache: Option<Arc<Mutex<AltSvcCache>>>,
+    jar: Arc<Mutex<CookieJar>>,
+    concurrency: usize,
 }
 
-/// Run one request through retry + max-time, then optionally upgrade to HTTP/3
-/// when `--alt-svc` is set and the response advertised an h3 endpoint. On a
-/// failed upgrade the original result is kept (with a note on stderr).
-async fn run_request(req: HttpRequest, opts: &RunOpts) -> HttpStat {
-    let forced_h3 = req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3);
+fn remember_advertised_alt(opts: &RunOpts, origin_host: &str, origin_port: u16, stat: &HttpStat) {
+    let Some(cache) = &opts.alt_cache else {
+        return;
+    };
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if alt_svc_cleared(stat) {
+        cache.invalidate(origin_host, origin_port);
+        return;
+    }
+    if let Some((host, port, max_age)) = h3_advertisement(stat) {
+        cache.put(origin_host, origin_port, &host, port, max_age);
+    }
+}
+
+fn invalidate_alt(opts: &RunOpts, origin_host: &str, origin_port: u16) {
+    if let Some(cache) = &opts.alt_cache {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate(origin_host, origin_port);
+    }
+}
+
+fn cached_alt(opts: &RunOpts, origin_host: &str, origin_port: u16) -> Option<(String, u16)> {
+    let cache = opts.alt_cache.as_ref()?;
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(origin_host, origin_port)
+}
+
+/// Run one request through retry + one shared `--max-time` budget, then
+/// optionally upgrade to HTTP/3. The upgrade uses the same deadline.
+async fn run_request(mut req: HttpRequest, opts: &RunOpts) -> HttpStat {
+    let origin_host = req.uri.host().unwrap_or("").to_string();
+    let origin_port = req.get_port();
+    let mut forced_h3 = req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3);
+    if opts.alt_svc && !forced_h3 {
+        if let Some((host, port)) = cached_alt(opts, &origin_host, origin_port) {
+            apply_alt_endpoint(&mut req, &host, port);
+            forced_h3 = true;
+        }
+    }
+
+    let budget = fresh_budget(opts.max_time);
     let stat = run_with_retry(
-        || with_max_time(do_request(req.clone(), opts.follow_redirect), opts.max_time),
+        || {
+            with_max_time(
+                do_request(
+                    req.clone(),
+                    opts.follow_redirect,
+                    opts.max_redirs,
+                    &opts.jar,
+                ),
+                opts.max_time,
+            )
+        },
         opts.retries,
         opts.retry_delay,
+        budget,
     )
     .await;
+    remember_advertised_alt(opts, &origin_host, origin_port, &stat);
 
+    if forced_h3 && stat.error.is_some() {
+        invalidate_alt(opts, &origin_host, origin_port);
+    }
     if !opts.alt_svc || forced_h3 {
         return stat;
     }
-    let Some((host, port)) = h3_endpoint(&stat) else {
+    let Some((host, port, _)) = h3_advertisement(&stat) else {
         return stat;
     };
 
@@ -831,12 +1189,18 @@ async fn run_request(req: HttpRequest, opts: &RunOpts) -> HttpStat {
     let h3_stat = run_with_retry(
         || {
             with_max_time(
-                do_request(h3_req.clone(), opts.follow_redirect),
+                do_request(
+                    h3_req.clone(),
+                    opts.follow_redirect,
+                    opts.max_redirs,
+                    &opts.jar,
+                ),
                 opts.max_time,
             )
         },
         opts.retries,
         opts.retry_delay,
+        budget,
     )
     .await;
 
@@ -852,8 +1216,229 @@ async fn run_request(req: HttpRequest, opts: &RunOpts) -> HttpStat {
             fmt_alt_endpoint(&host, port),
             h3_stat.error.as_deref().unwrap_or("unknown")
         );
+        invalidate_alt(opts, &origin_host, origin_port);
         stat
     }
+}
+
+fn stamp_reused(stat: &mut HttpStat, connect: &HttpStat) {
+    stat.addr.clone_from(&connect.addr);
+    stat.alpn.clone_from(&connect.alpn);
+    stat.tls_resumed = connect.tls_resumed;
+    stat.tls_early_data_accepted = connect.tls_early_data_accepted;
+    stat.dns_cached = connect.dns_cached;
+}
+
+async fn indexed_multiplex(
+    index: usize,
+    shared: Arc<Mutex<HttpConnection>>,
+    req: HttpRequest,
+    max_time: Option<std::time::Duration>,
+    retries: usize,
+    retry_delay: Option<std::time::Duration>,
+    budget: Option<TimeBudget>,
+) -> (usize, HttpStat) {
+    let stat = run_with_retry(
+        || {
+            let shared = Arc::clone(&shared);
+            let req = req.clone();
+            async move {
+                let worker = {
+                    let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.worker()
+                };
+                match worker {
+                    Some(worker) => with_max_time(worker.send(&req), max_time).await,
+                    None => HttpStat {
+                        error: Some("http connection cannot multiplex".into()),
+                        ..Default::default()
+                    },
+                }
+            }
+        },
+        retries,
+        retry_delay,
+        budget,
+    )
+    .await;
+    (index, stat)
+}
+
+/// One uncounted request so `-K` / `-c` can open HTTP/3 directly when Alt-Svc
+/// (or the on-disk cache) already names an endpoint.
+async fn learn_alt_svc_for_reuse(req: &mut HttpRequest, opts: &RunOpts) {
+    if !opts.alt_svc || req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3) {
+        return;
+    }
+    let origin_host = req.uri.host().unwrap_or("").to_string();
+    let origin_port = req.get_port();
+    if let Some((host, port)) = cached_alt(opts, &origin_host, origin_port) {
+        apply_alt_endpoint(req, &host, port);
+        return;
+    }
+    eprintln!(
+        "alt-svc: probing {} once to learn an HTTP/3 endpoint (not counted)",
+        req.uri
+    );
+    let _probe = run_request(req.clone(), opts).await;
+    if let Some((host, port)) = cached_alt(opts, &origin_host, origin_port) {
+        apply_alt_endpoint(req, &host, port);
+    }
+}
+
+fn print_cold_connect(connect_stat: &HttpStat, lang: Lang) {
+    let mut parts = vec![];
+    if let Some(d) = connect_stat.dns_lookup {
+        parts.push(format!("DNS {}", format_duration(d)));
+    }
+    if let Some(d) = connect_stat.tcp_connect {
+        parts.push(format!("TCP {}", format_duration(d)));
+    }
+    if let Some(d) = connect_stat.tls_handshake {
+        parts.push(format!("TLS {}", format_duration(d)));
+    }
+    if let Some(d) = connect_stat.quic_connect {
+        parts.push(format!("QUIC {}", format_duration(d)));
+    }
+    println!(
+        "  {}: {} ({})",
+        lang.strings().cold_connect,
+        format_duration(connect_stat.total.unwrap_or_default()),
+        parts.join(" + ")
+    );
+}
+
+fn print_benchmark(
+    stats: Vec<HttpStat>,
+    connect_stat: Option<&HttpStat>,
+    lang: Lang,
+    json_output: bool,
+) {
+    if json_output {
+        let json_val = benchmark_to_json(&stats, connect_stat);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_val).unwrap_or_default()
+        );
+    } else {
+        let summary = BenchmarkSummary { stats, lang };
+        println!("{summary}");
+        if let Some(connect_stat) = connect_stat {
+            print_cold_connect(connect_stat, lang);
+        }
+    }
+}
+
+async fn sequential_reused(
+    conn: HttpConnection,
+    req: &HttpRequest,
+    count: usize,
+    opts: &RunOpts,
+    connect_stat: &HttpStat,
+    lang: Lang,
+    json_output: bool,
+) -> (Vec<HttpStat>, i32) {
+    let shared = Arc::new(tokio::sync::Mutex::new(conn));
+    let width = count.to_string().len();
+    let mut stats = Vec::with_capacity(count);
+    let mut exit_code = 0i32;
+    for i in 0..count {
+        let budget = fresh_budget(opts.max_time);
+        let mut stat = run_with_retry(
+            {
+                let shared = Arc::clone(&shared);
+                let req = req.clone();
+                let max_time = opts.max_time;
+                move || {
+                    let shared = Arc::clone(&shared);
+                    let req = req.clone();
+                    async move {
+                        let mut guard = shared.lock().await;
+                        with_max_time(guard.send(&req), max_time).await
+                    }
+                }
+            },
+            opts.retries,
+            opts.retry_delay,
+            budget,
+        )
+        .await;
+        stamp_reused(&mut stat, connect_stat);
+        stat.silent = true;
+        stat.lang = lang;
+        stat.body = None;
+        if !json_output {
+            print!("[{:>width$}/{count}] {stat}", i + 1);
+        }
+        if exit_code == 0 {
+            exit_code = stat.exit_code();
+        }
+        stats.push(stat);
+    }
+    (stats, exit_code)
+}
+
+async fn concurrent_reused(
+    conn: HttpConnection,
+    req: &HttpRequest,
+    count: usize,
+    opts: &RunOpts,
+    connect_stat: &HttpStat,
+    lang: Lang,
+    json_output: bool,
+) -> (Vec<HttpStat>, i32) {
+    let shared = Arc::new(Mutex::new(conn));
+    let mut pending = FuturesUnordered::new();
+    let mut next = 0usize;
+    while next < count && pending.len() < opts.concurrency {
+        let budget = fresh_budget(opts.max_time);
+        pending.push(indexed_multiplex(
+            next,
+            Arc::clone(&shared),
+            req.clone(),
+            opts.max_time,
+            opts.retries,
+            opts.retry_delay,
+            budget,
+        ));
+        next += 1;
+    }
+    let width = count.to_string().len();
+    let mut slots = Vec::with_capacity(count);
+    slots.resize_with(count, || None);
+    while let Some((idx, mut stat)) = pending.next().await {
+        stamp_reused(&mut stat, connect_stat);
+        stat.silent = true;
+        stat.lang = lang;
+        stat.body = None;
+        if !json_output {
+            print!("[{:>width$}/{count}] {stat}", idx + 1);
+        }
+        slots[idx] = Some(stat);
+        if next < count {
+            let budget = fresh_budget(opts.max_time);
+            pending.push(indexed_multiplex(
+                next,
+                Arc::clone(&shared),
+                req.clone(),
+                opts.max_time,
+                opts.retries,
+                opts.retry_delay,
+                budget,
+            ));
+            next += 1;
+        }
+    }
+    let mut exit_code = 0i32;
+    let mut stats = Vec::with_capacity(count);
+    for slot in slots {
+        let stat = slot.unwrap_or_default();
+        if exit_code == 0 {
+            exit_code = stat.exit_code();
+        }
+        stats.push(stat);
+    }
+    (stats, exit_code)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -934,27 +1519,29 @@ async fn main() {
         .as_deref()
         .map(|v| parse_dur("retry-delay", v));
     let follow_redirect = args.follow_redirect;
-    let run_opts = RunOpts {
-        follow_redirect,
-        max_time,
-        retries,
-        retry_delay,
-        alt_svc: args.alt_svc,
-    };
+    let max_redirs = args.max_redirs.unwrap_or(10);
+    let jar = Arc::new(Mutex::new(CookieJar::new()));
 
-    // Parse headers if provided
+    // Parse headers if provided. Repeated names are kept (`append`), and a
+    // missing colon or an illegal name/value is a usage error.
     if !args.headers.is_empty() {
         let mut header_map = HeaderMap::new();
-        for header in args.headers {
-            if let Some((name, value)) = header.split_once(':') {
-                let name = name.trim();
-                let value = value.trim();
-                if let Ok(header_name) = name.parse::<HeaderName>() {
-                    if let Ok(header_value) = value.parse::<HeaderValue>() {
-                        header_map.insert(header_name, header_value);
-                    }
-                }
-            }
+        for header in &args.headers {
+            let Some((name, value)) = header.split_once(':') else {
+                eprintln!("httpstat: invalid header '{header}': missing ':'");
+                std::process::exit(1);
+            };
+            let name = name.trim();
+            let value = value.trim();
+            let Ok(header_name) = name.parse::<HeaderName>() else {
+                eprintln!("httpstat: invalid header name '{name}'");
+                std::process::exit(1);
+            };
+            let Ok(header_value) = value.parse::<HeaderValue>() else {
+                eprintln!("httpstat: invalid header value for '{name}'");
+                std::process::exit(1);
+            };
+            header_map.append(header_name, header_value);
         }
         req.headers = Some(header_map);
     }
@@ -969,7 +1556,22 @@ async fn main() {
         }
     }
 
-    // Parse cookie
+    // Cookies live in the jar so Domain/Path/Secure/Expires are honored on -L.
+    // A Cookie header from -H is absorbed first; -b then overrides the same names.
+    if let Some(host) = req.uri.host().map(str::to_string) {
+        if let Some(headers) = req.headers.as_mut() {
+            if let Some(existing) = headers
+                .get(http::header::COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+            {
+                headers.remove(http::header::COOKIE);
+                jar.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .load_cookie_header(&host, &existing);
+            }
+        }
+    }
     if let Some(cookie) = args.cookie {
         let cookie_value = if let Some(file_path) = cookie.strip_prefix('@') {
             match fs::read_to_string(file_path).await {
@@ -982,13 +1584,22 @@ async fn main() {
         } else {
             cookie
         };
-        if let Ok(value) = cookie_value.parse::<HeaderValue>() {
-            let header_map = req.headers.get_or_insert_with(HeaderMap::new);
-            header_map.insert(http::header::COOKIE, value);
+        if cookie_value.parse::<HeaderValue>().is_err() {
+            eprintln!("httpstat: invalid cookie header");
+            std::process::exit(1);
+        }
+        if let Some(host) = req.uri.host() {
+            jar.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .load_cookie_header(host, &cookie_value);
         }
     }
 
-    req.method = args.method;
+    if args.method.is_none() && args.data.is_some() {
+        req.method = Some("POST".to_string());
+    } else {
+        req.method = args.method.clone();
+    }
 
     if let Some(data) = args.data {
         if let Some(file_path) = data.strip_prefix('@') {
@@ -1046,6 +1657,13 @@ async fn main() {
         })
     });
     req.proxy = proxy;
+    if req.proxy.is_some() {
+        if let Some(host) = req.uri.host() {
+            if proxy_bypassed(host, req.get_port()) {
+                req.proxy = None;
+            }
+        }
+    }
 
     // Load client certificate and key for mTLS
     match (args.cert, args.key) {
@@ -1086,7 +1704,37 @@ async fn main() {
         req.alpn_protocols = vec![ALPN_HTTP3.to_string()];
     }
     let output = args.output;
-    let count = args.count.unwrap_or(1).max(1);
+    let count_explicit = args.count.is_some();
+    let concurrency = args.concurrency.unwrap_or(1).max(1);
+    let mut count = args.count.unwrap_or(1).max(1);
+    if !count_explicit && concurrency > 1 {
+        count = concurrency;
+    }
+    let reuse_conn = count > 1 && (args.reuse || concurrency > 1);
+    if count > 1 {
+        req.tls_session_store = Some(http_stat::new_tls_session_store(count.max(8)));
+        req.dns_cache = Some(Arc::new(DnsCache::new()));
+        req.discard_body = true;
+    }
+    if output.is_some() && args.jq.is_none() && !args.pretty && count == 1 && concurrency == 1 {
+        req.output_path = output.as_ref().map(PathBuf::from);
+    }
+    let alt_cache = if args.alt_svc {
+        Some(Arc::new(Mutex::new(AltSvcCache::load())))
+    } else {
+        None
+    };
+    let run_opts = RunOpts {
+        follow_redirect,
+        max_redirs,
+        max_time,
+        retries,
+        retry_delay,
+        alt_svc: args.alt_svc,
+        alt_cache,
+        jar,
+        concurrency,
+    };
     let include_headers: Option<Vec<String>> = if args.include_header.is_empty() {
         None
     } else {
@@ -1114,12 +1762,21 @@ async fn main() {
         let ips = resolve.split(',').collect::<Vec<&str>>();
         let mut futs = vec![];
         for ip in ips {
-            let mut req = req.clone();
-            let Ok(ip) = ip.parse::<IpAddr>() else {
+            let ip = ip.trim();
+            if ip.is_empty() {
                 continue;
+            }
+            let Ok(ip) = ip.parse::<IpAddr>() else {
+                eprintln!("httpstat: invalid --resolve IP '{ip}'");
+                std::process::exit(1);
             };
+            let mut req = req.clone();
             req.resolve = Some(ip);
             futs.push(run_request(req, &run_opts));
+        }
+        if futs.is_empty() {
+            eprintln!("httpstat: --resolve produced no addresses");
+            std::process::exit(1);
         }
         let mut stats_list = futures::future::join_all(futs).await;
         // error request last
@@ -1159,54 +1816,42 @@ async fn main() {
                 }
             }
         }
-    } else if count > 1 && args.reuse {
-        // Benchmark with connection reuse
+    } else if reuse_conn {
+        learn_alt_svc_for_reuse(&mut req, &run_opts).await;
         let (connect_stat, conn) = connect(&req).await;
-        if let Some(mut conn) = conn {
-            let width = count.to_string().len();
-            let mut stats = Vec::with_capacity(count);
-            for i in 0..count {
-                let mut stat = with_max_time(conn.send(&req), max_time).await;
-                stat.addr.clone_from(&connect_stat.addr);
-                stat.alpn.clone_from(&connect_stat.alpn);
-                stat.silent = true;
-                stat.lang = lang;
-                if !json_output {
-                    print!("[{:>width$}/{count}] {stat}", i + 1);
-                }
-                if exit_code == 0 {
-                    exit_code = stat.exit_code();
-                }
-                stat.body = None;
-                stats.push(stat);
-            }
-            if json_output {
-                let json_val = benchmark_to_json(&stats, Some(&connect_stat));
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json_val).unwrap_or_default()
-                );
+        if let Some(conn) = conn {
+            let (stats, code) = if concurrency > 1 && conn.multiplexes() {
+                concurrent_reused(
+                    conn,
+                    &req,
+                    count,
+                    &run_opts,
+                    &connect_stat,
+                    lang,
+                    json_output,
+                )
+                .await
             } else {
-                let summary = BenchmarkSummary { stats, lang };
-                println!("{summary}");
-                // Show cold connect cost
-                let mut parts = vec![];
-                if let Some(d) = connect_stat.dns_lookup {
-                    parts.push(format!("DNS {}", format_duration(d)));
+                if concurrency > 1 {
+                    eprintln!(
+                        "httpstat: HTTP/1.1 cannot multiplex; running -c {concurrency} sequentially"
+                    );
                 }
-                if let Some(d) = connect_stat.tcp_connect {
-                    parts.push(format!("TCP {}", format_duration(d)));
-                }
-                if let Some(d) = connect_stat.tls_handshake {
-                    parts.push(format!("TLS {}", format_duration(d)));
-                }
-                println!(
-                    "  {}: {} ({})",
-                    lang.strings().cold_connect,
-                    format_duration(connect_stat.total.unwrap_or_default()),
-                    parts.join(" + ")
-                );
+                sequential_reused(
+                    conn,
+                    &req,
+                    count,
+                    &run_opts,
+                    &connect_stat,
+                    lang,
+                    json_output,
+                )
+                .await
+            };
+            if exit_code == 0 {
+                exit_code = code;
             }
+            print_benchmark(stats, Some(&connect_stat), lang, json_output);
         } else {
             if json_output {
                 println!(
@@ -1219,38 +1864,24 @@ async fn main() {
             exit_code = connect_stat.exit_code();
         }
     } else if count > 1 {
-        // Benchmark mode (new connection each time). Share a single TLS session
-        // store across iterations so runs 2..N can perform a resumed handshake
-        // (and attempt 0-RTT) — making the speedup visible in the per-request
-        // tls_handshake column and in the reported handshake kind.
+        // Each iteration is a new connection, but it still goes through retry
+        // and Alt-Svc. The shared TLS session store and DNS cache live on `req`.
         let width = count.to_string().len();
-        let session_store = http_stat::new_tls_session_store(count.max(8));
         let mut stats = Vec::with_capacity(count);
         for i in 0..count {
-            let mut req = req.clone();
-            req.tls_session_store = Some(Arc::clone(&session_store));
-            let mut stat = with_max_time(do_request(req, args.follow_redirect), max_time).await;
+            let mut stat = run_request(req.clone(), &run_opts).await;
             stat.silent = true;
             stat.lang = lang;
+            stat.body = None;
             if !json_output {
                 print!("[{:>width$}/{count}] {stat}", i + 1);
             }
             if exit_code == 0 {
                 exit_code = stat.exit_code();
             }
-            stat.body = None;
             stats.push(stat);
         }
-        if json_output {
-            let json_val = benchmark_to_json(&stats, None);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json_val).unwrap_or_default()
-            );
-        } else {
-            let summary = BenchmarkSummary { stats, lang };
-            println!("{summary}");
-        }
+        print_benchmark(stats, None, lang, json_output);
     } else {
         let mut stat = run_request(req, &run_opts).await;
         if json_output {
@@ -1288,42 +1919,6 @@ mod tests {
 
     fn cfg_map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         v.as_object().unwrap().clone()
-    }
-
-    // ---- collect_cookies ----
-    #[test]
-    fn collect_cookies_merges_set_cookie_and_existing() {
-        let mut headers = HeaderMap::new();
-        headers.append(
-            http::header::SET_COOKIE,
-            HeaderValue::from_static("a=1; Path=/; HttpOnly"),
-        );
-        headers.append(http::header::SET_COOKIE, HeaderValue::from_static("b=2"));
-        let stat = HttpStat {
-            headers: Some(headers),
-            ..Default::default()
-        };
-        let merged = collect_cookies(&stat, "c=3");
-        // HashMap ordering is unspecified, so compare as a set
-        let set: std::collections::HashSet<&str> = merged.split("; ").collect();
-        assert_eq!(set.len(), 3);
-        assert!(set.contains("a=1"));
-        assert!(set.contains("b=2"));
-        assert!(set.contains("c=3"));
-    }
-
-    #[test]
-    fn collect_cookies_response_overrides_existing() {
-        let mut headers = HeaderMap::new();
-        headers.append(
-            http::header::SET_COOKIE,
-            HeaderValue::from_static("session=new"),
-        );
-        let stat = HttpStat {
-            headers: Some(headers),
-            ..Default::default()
-        };
-        assert_eq!(collect_cookies(&stat, "session=old"), "session=new");
     }
 
     // ---- apply_config ----
@@ -1364,6 +1959,32 @@ mod tests {
             args.headers,
             vec!["X-Config: 0".to_string(), "X-Cli: 1".to_string()]
         );
+    }
+
+    #[test]
+    fn apply_config_accepts_new_keys() {
+        let mut args = Args::parse_from(["httpstat", "http://example.com"]);
+        let map = cfg_map(serde_json::json!({
+            "proxy": "http://proxy.example:8080",
+            "bind": "127.0.0.1",
+            "connect_to": ["a:1:b:2"],
+            "waterfall": true,
+            "tcp_info": true,
+            "lang": "zh",
+            "reuse": true,
+            "concurrency": 4,
+            "max_redirs": 3
+        }));
+        apply_config(&mut args, &map);
+        assert_eq!(args.proxy.as_deref(), Some("http://proxy.example:8080"));
+        assert_eq!(args.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(args.connect_to, vec!["a:1:b:2".to_string()]);
+        assert!(args.waterfall);
+        assert!(args.tcp_info);
+        assert_eq!(args.lang.as_deref(), Some("zh"));
+        assert!(args.reuse);
+        assert_eq!(args.concurrency, Some(4));
+        assert_eq!(args.max_redirs, Some(3));
     }
 
     // ---- redirect_downgrades_to_get ----
@@ -1426,6 +2047,31 @@ mod tests {
         );
         // empty location is rejected
         assert!(resolve_redirect(&base, "").is_none());
+        // dot segments are removed; the query stays and the fragment is dropped
+        assert_eq!(
+            resolve_redirect(&base, "../c").unwrap().to_string(),
+            "http://example.com/c"
+        );
+        assert_eq!(
+            resolve_redirect(&base, "./c").unwrap().to_string(),
+            "http://example.com/a/c"
+        );
+        assert_eq!(
+            resolve_redirect(&base, "/a/./b/../c").unwrap().to_string(),
+            "http://example.com/a/c"
+        );
+        assert_eq!(
+            resolve_redirect(&base, "/a/./b/../c?q=1#frag")
+                .unwrap()
+                .to_string(),
+            "http://example.com/a/c?q=1"
+        );
+        assert_eq!(
+            resolve_redirect(&base, "https://other.com/a/./b/../c?q=1#f")
+                .unwrap()
+                .to_string(),
+            "https://other.com/a/c?q=1"
+        );
     }
 
     // ---- --max-time handling ----
@@ -1561,7 +2207,7 @@ mod tests {
                 }
             }
         };
-        let stat = run_with_retry(make, 5, Some(std::time::Duration::from_millis(1))).await;
+        let stat = run_with_retry(make, 5, Some(std::time::Duration::from_millis(1)), None).await;
         assert_eq!(stat.exit_code(), 0);
         assert_eq!(calls.load(Ordering::SeqCst), 3); // 2 failures + 1 success
     }
@@ -1579,7 +2225,7 @@ mod tests {
                 }
             }
         };
-        let stat = run_with_retry(make, 2, Some(std::time::Duration::from_millis(1))).await;
+        let stat = run_with_retry(make, 2, Some(std::time::Duration::from_millis(1)), None).await;
         assert_eq!(stat.exit_code(), 7); // 502 → 5xx exit code
         assert_eq!(calls.load(Ordering::SeqCst), 3); // initial + 2 retries
     }
@@ -1597,9 +2243,104 @@ mod tests {
                 }
             }
         };
-        let stat = run_with_retry(make, 5, Some(std::time::Duration::from_millis(1))).await;
+        let stat = run_with_retry(make, 5, Some(std::time::Duration::from_millis(1)), None).await;
         assert_eq!(stat.exit_code(), 6); // 404 → no retry
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn max_time_budget_covers_retry_backoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let make = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                HttpStat {
+                    status: Some(StatusCode::BAD_GATEWAY),
+                    ..Default::default()
+                }
+            }
+        };
+        let start = std::time::Instant::now();
+        let budget = TimeBudget {
+            deadline: start + std::time::Duration::from_millis(30),
+            limit: std::time::Duration::from_millis(30),
+        };
+        let stat = run_with_retry(
+            make,
+            5,
+            Some(std::time::Duration::from_secs(30)),
+            Some(budget),
+        )
+        .await;
+        assert_eq!(stat.exit_code(), 5);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn benchmark_json_includes_request_send_and_throughput() {
+        let stat = HttpStat {
+            request_send: Some(std::time::Duration::from_micros(100)),
+            content_transfer: Some(std::time::Duration::from_millis(100)),
+            wire_body_size: Some(100_000),
+            total: Some(std::time::Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let v = benchmark_to_json(&[stat.clone(), stat.clone()], None);
+        assert!(v["timing"]["request_send"]["p50_us"].as_u64().is_some());
+        let bps = &v["throughput"]["bps_total"];
+        for key in ["min", "max", "avg", "p50", "p95", "p99"] {
+            assert!(bps[key].as_f64().is_some(), "{key}");
+        }
+        let connect = HttpStat {
+            quic_connect: Some(std::time::Duration::from_micros(50)),
+            total: Some(std::time::Duration::from_micros(80)),
+            ..Default::default()
+        };
+        let with_cold = benchmark_to_json(&[stat.clone(), stat], Some(&connect));
+        assert_eq!(
+            with_cold["cold_connect"]["quic_connect_us"].as_u64(),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn h3_advertisement_skips_zero_max_age() {
+        let stat = HttpStat {
+            alt_svc: Some(vec![http_stat::AltSvc {
+                protocol: "h3".into(),
+                authority: ":443".into(),
+                max_age: Some(0),
+            }]),
+            ..Default::default()
+        };
+        assert!(h3_advertisement(&stat).is_none());
+        assert!(alt_svc_cleared(&stat));
+        let kept = HttpStat {
+            alt_svc: Some(vec![http_stat::AltSvc {
+                protocol: "h3".into(),
+                authority: "alt.example:8443".into(),
+                max_age: Some(60),
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            h3_advertisement(&kept),
+            Some(("alt.example".to_string(), 8443, 60))
+        );
+        let missing_ma = HttpStat {
+            alt_svc: Some(vec![http_stat::AltSvc {
+                protocol: "h3".into(),
+                authority: ":443".into(),
+                max_age: None,
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            h3_advertisement(&missing_ma),
+            Some((String::new(), 443, 24 * 60 * 60))
+        );
     }
 
     // ---- Alt-Svc auto-upgrade ----

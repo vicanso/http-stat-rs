@@ -15,6 +15,7 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
+use super::dns_cache::DnsCache;
 use super::error::{Error, Result};
 use super::stats::{HttpStat, ALPN_HTTP1, ALPN_HTTP2};
 use bytes::Bytes;
@@ -25,7 +26,8 @@ use http::Uri;
 use http::{HeaderMap, Method};
 use http_body_util::Full;
 use rustls::client::{ClientSessionMemoryCache, ClientSessionStore};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,6 +151,18 @@ pub struct HttpRequest {
     /// handshake and attempt 0-RTT. Intended for the `-n` benchmark loop:
     /// install one cache before the loop and clone it onto every request.
     pub tls_session_store: Option<Arc<dyn ClientSessionStore>>,
+    /// Process DNS cache. Installed only for repeated runs (`-n`); a one-shot
+    /// request leaves this empty and always resolves for real.
+    pub dns_cache: Option<Arc<DnsCache>>,
+    /// Count the body and drop it. Benchmark mode sets this so repeats do not
+    /// retain every response.
+    pub discard_body: bool,
+    /// Stream the decoded body to this file. Set only when the caller does not
+    /// need the bytes in memory (`--jq` / `--pretty` leave it empty).
+    pub output_path: Option<PathBuf>,
+    /// Speak HTTP/2 on cleartext TCP (h2c prior knowledge). Set only for a
+    /// raw `grpc://` unary call. `--http2` on `http://` stays HTTP/1.1.
+    pub h2_prior_knowledge: bool,
 }
 
 impl HttpRequest {
@@ -213,6 +227,26 @@ impl HttpRequest {
             builder = builder.header("User-Agent", format!("httpstat.rs/{VERSION}"));
         }
         builder
+    }
+
+    /// Move `winner` to the front of a cached DNS answer, using the same key
+    /// `dns_resolve` stored.
+    pub(crate) fn note_dns_winner(&self, cache_host: &str, cache_port: u16, winner: SocketAddr) {
+        let Some(cache) = &self.dns_cache else {
+            return;
+        };
+        let servers = self
+            .dns_servers
+            .as_ref()
+            .map(|s| s.join(","))
+            .unwrap_or_default();
+        cache.prefer(
+            cache_host,
+            cache_port,
+            &servers,
+            self.ip_version.unwrap_or(0),
+            winner,
+        );
     }
 }
 
