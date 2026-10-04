@@ -11,6 +11,7 @@ A pure Rust CLI tool (`httpstat`) that visualizes HTTP request statistics (timin
 - **Build release**: `cargo build --release` (or `make release`)
 - **Run dev**: `cargo run --bin httpstat -- <url>` (or `make dev`)
 - **Run tests**: `cargo test` (or `make test`)
+- **Agent skill**: `skills/httpstat/SKILL.md` tells AI agents how to use the binary. Update it when a flag it shows or the JSON output changes; `JSON_SCHEMA.md` stays the full reference.
 - **End-to-end tests**: `tests/e2e.rs` runs the built binary against local servers from `tests/support` (HTTP/1.1, HTTP/2, HTTP/3, CONNECT and SOCKS5 proxies, DoH/DoT, gRPC). They need no network: the servers listen on 127.0.0.1 and their throwaway CA reaches the binary through `SSL_CERT_FILE`. Run one area with `cargo test --test e2e grpc`.
 - **Lint**: `make lint` (runs `typos` + `cargo clippy --all-targets --all -- --deny=warnings`)
 - **Check outdated deps**: `cargo outdated`

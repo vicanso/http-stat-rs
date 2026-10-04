@@ -59,6 +59,16 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+// ---- CLI ----
+
+#[test]
+fn help_points_scripts_at_json_output() {
+    let run = httpstat(&["--help"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(run.stdout.contains("add --json"), "{}", run.stdout);
+    assert!(run.stdout.contains("JSON_SCHEMA.md"), "{}", run.stdout);
+}
+
 // ---- HTTP ----
 
 #[test]

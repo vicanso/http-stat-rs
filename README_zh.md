@@ -289,6 +289,22 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
       --exclude-header <HEADER>    隐藏指定响应头（可重复，不区分大小写）
   -h, --help                       显示帮助信息
   -V, --version                    显示版本信息
+
+脚本和 AI 使用时请加 --json。输出格式和退出码见
+https://github.com/vicanso/http-stat-rs/blob/main/JSON_SCHEMA.md
+```
+
+## 配合 AI 使用
+
+[`skills/httpstat`](./skills/httpstat/SKILL.md) 是一份 skill，告诉 AI 编程助手什么时候该用 `httpstat`、怎么用 `--json` 运行、怎么读各阶段耗时和退出码。装一次之后，遇到"这个接口为什么慢""这张证书什么时候过期"这类问题，助手会自己用它。
+
+```bash
+# 用 skills 命令行安装，对所有项目生效（去掉 -g 则只装到当前项目）
+npx skills add vicanso/http-stat-rs --skill httpstat -g
+
+# 或者手动复制，以 Claude Code 为例
+git clone --depth 1 https://github.com/vicanso/http-stat-rs
+cp -r http-stat-rs/skills/httpstat ~/.claude/skills/
 ```
 
 ## 配置文件（`~/.httpstatrc`）

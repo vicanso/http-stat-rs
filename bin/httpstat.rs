@@ -37,7 +37,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// HTTP statistics tool
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    after_help = "For scripts and AI agents: add --json. The output format and exit codes are documented in\nhttps://github.com/vicanso/http-stat-rs/blob/main/JSON_SCHEMA.md"
+)]
 struct Args {
     /// URL to request (optional, can be provided as the last argument)
     #[arg(short, long)]

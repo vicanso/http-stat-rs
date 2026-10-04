@@ -291,6 +291,22 @@ Options:
       --exclude-header <HEADER>    hide these response headers (repeatable, case-insensitive)
   -h, --help                       Print help
   -V, --version                    Print version
+
+For scripts and AI agents: add --json. The output format and exit codes are documented in
+https://github.com/vicanso/http-stat-rs/blob/main/JSON_SCHEMA.md
+```
+
+## Use with AI Agents
+
+[`skills/httpstat`](./skills/httpstat/SKILL.md) is a skill that teaches an AI coding agent when to reach for `httpstat`, how to run it with `--json`, and how to read the timings and exit codes. Install it once and the agent picks it up for questions like "why is this endpoint slow?" or "when does this certificate expire?".
+
+```bash
+# With the skills CLI, for every project (drop -g to install into the current one)
+npx skills add vicanso/http-stat-rs --skill httpstat -g
+
+# Or copy it by hand, e.g. for Claude Code
+git clone --depth 1 https://github.com/vicanso/http-stat-rs
+cp -r http-stat-rs/skills/httpstat ~/.claude/skills/
 ```
 
 ## Config File (`~/.httpstatrc`)
