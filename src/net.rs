@@ -194,6 +194,9 @@ fn finish_lookup(
     valid_until: Instant,
 ) -> Result<Resolved> {
     if ips.is_empty() {
+        // No address means the lookup did not complete: leaving the phase
+        // unset is what makes `exit_code()` report a DNS failure.
+        stat.dns_lookup = None;
         return Err(Error::Common {
             category: "http".to_string(),
             message: "dns lookup failed".to_string(),
@@ -474,9 +477,25 @@ async fn resolve_secure(
     dns_start: Instant,
 ) -> Result<Resolved> {
     let work = async {
-        let tcp = match dns.ip {
-            Some(ip) => TcpStream::connect((ip, dns.port)).await,
-            None => TcpStream::connect((dns.host.as_str(), dns.port)).await,
+        // `--connect-to` naming the resolver pins the address to dial, as it
+        // does for the origin: the certificate is still checked against
+        // `dns.host`.
+        let pinned = req
+            .connect_to
+            .iter()
+            .filter_map(|s| ConnectTo::parse(s))
+            .find(|ct| ct.names(&dns.host, dns.port));
+        let tcp = match (pinned, dns.ip) {
+            (Some(ct), _) => {
+                let host = if ct.dst_host.is_empty() {
+                    dns.host.as_str()
+                } else {
+                    ct.dst_host.as_str()
+                };
+                TcpStream::connect((host, ct.dst_port.unwrap_or(dns.port))).await
+            }
+            (None, Some(ip)) => TcpStream::connect((ip, dns.port)).await,
+            (None, None) => TcpStream::connect((dns.host.as_str(), dns.port)).await,
         }
         .map_err(|e| Error::Io { source: e })?;
         let alpn = if dns.dot {
@@ -486,7 +505,7 @@ async fn resolve_secure(
             // else.
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         };
-        let tls = tls_connect_stream(&dns.host, tcp, alpn, false, None).await?;
+        let tls = tls_connect_stream(&dns.host, tcp, alpn, req.skip_verify, None).await?;
         let connect_at = dns_start.elapsed();
         let mut transport = if dns.dot {
             SecureTransport::Dot(tls)
@@ -509,20 +528,38 @@ async fn resolve_secure(
             Some(6) => vec![QTYPE_AAAA],
             _ => vec![QTYPE_A, QTYPE_AAAA],
         };
+        let queries: Vec<Vec<u8>> = qtypes
+            .into_iter()
+            .enumerate()
+            .map(|(i, qtype)| encode_query((i as u16) + 1, &lookup_host, qtype))
+            .collect();
+        let mut answers = Vec::with_capacity(queries.len());
+        match &mut transport {
+            // HTTP/2 multiplexes, so every record type is asked for at once
+            // and the lookup costs one round trip.
+            SecureTransport::Doh2(sender) => {
+                let exchanges = queries.iter().map(|query| {
+                    let mut sender = sender.clone();
+                    let (authority, path) = (&authority, &dns.path);
+                    async move { doh2_exchange(&mut sender, authority, path, query).await }
+                });
+                answers = futures::future::join_all(exchanges).await;
+            }
+            SecureTransport::Doh1(tls) => {
+                for query in &queries {
+                    answers.push(doh_exchange(tls, &authority, &dns.path, query).await);
+                }
+            }
+            SecureTransport::Dot(tls) => {
+                for query in &queries {
+                    answers.push(dot_exchange(tls, query).await);
+                }
+            }
+        }
         let mut records = Vec::new();
         let mut any_ok = false;
         let mut last_err: Option<Error> = None;
-        for (i, qtype) in qtypes.into_iter().enumerate() {
-            let query = encode_query((i as u16) + 1, &lookup_host, qtype);
-            let result = match &mut transport {
-                SecureTransport::Dot(tls) => dot_exchange(tls, &query).await,
-                SecureTransport::Doh1(tls) => {
-                    doh_exchange(tls, &authority, &dns.path, &query).await
-                }
-                SecureTransport::Doh2(sender) => {
-                    doh2_exchange(sender, &authority, &dns.path, &query).await
-                }
-            };
+        for result in answers {
             match result {
                 Ok(msg) => match parse_records(&msg) {
                     Ok(recs) => {
@@ -553,12 +590,6 @@ async fn resolve_secure(
         .map_err(|e| Error::Timeout { source: e })??;
     stat.dns_connect = Some(connect_at);
     stat.dns_lookup = Some(dns_start.elapsed());
-    if records.is_empty() {
-        return Err(Error::Common {
-            category: "http".to_string(),
-            message: "dns lookup failed".to_string(),
-        });
-    }
     let min_ttl = records.iter().map(|r| r.ttl).min().unwrap_or(1).max(1);
     let ips = records.into_iter().map(|r| r.addr).collect();
     let until = Instant::now() + Duration::from_secs(min_ttl as u64);

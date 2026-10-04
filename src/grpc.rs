@@ -15,6 +15,7 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
+use crate::decompress::{decompress_capped, read_decoded};
 use crate::proxy::percent_decode;
 use crate::{HttpRequest, HttpStat, ALPN_HTTP2};
 use bytes::{Bytes, BytesMut};
@@ -22,6 +23,8 @@ use http::header::{HeaderMap, HeaderValue};
 use http::uri::{PathAndQuery, Uri};
 
 const HEALTH_CHECK_PATH: &str = "/grpc.health.v1.Health/Check";
+/// Message encodings `--compressed` offers the server, in `grpc-accept-encoding`.
+const ACCEPTED_ENCODINGS: &str = "gzip,deflate,zstd";
 
 fn is_health_path(path: &str) -> bool {
     path.is_empty() || path == "/" || path.contains("grpc.health.v1.Health/Check")
@@ -33,9 +36,22 @@ fn header_value(map: &HeaderMap, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Concatenate uncompressed gRPC length-prefixed messages. A compressed flag
-/// or a truncated frame leaves the body as it arrived.
-fn unframe_grpc(bytes: &[u8]) -> Option<Bytes> {
+/// Decompress one message with the response's `grpc-encoding`, to at most
+/// `max` bytes.
+fn decompress_message(encoding: &str, data: &[u8], max: Option<usize>) -> Option<Bytes> {
+    match encoding {
+        "gzip" | "zstd" => decompress_capped(encoding, &Bytes::copy_from_slice(data), max).ok(),
+        // gRPC's `deflate` is the zlib format.
+        "deflate" => read_decoded(flate2::read::ZlibDecoder::new(data), max, encoding).ok(),
+        _ => None,
+    }
+}
+
+/// Concatenate gRPC length-prefixed messages, decompressing those flagged
+/// as compressed with `encoding`. A truncated frame, or a compressed one
+/// that cannot be decoded or passes `max` bytes, leaves the body as it
+/// arrived.
+fn unframe_grpc(bytes: &[u8], encoding: Option<&str>, max: Option<usize>) -> Option<Bytes> {
     if bytes.is_empty() {
         return Some(Bytes::new());
     }
@@ -52,10 +68,15 @@ fn unframe_grpc(bytes: &[u8]) -> Option<Bytes> {
         if i + len > bytes.len() {
             return None;
         }
-        if flag != 0 {
+        let message = &bytes[i..i + len];
+        match flag {
+            0 => out.extend_from_slice(message),
+            1 => out.extend_from_slice(&decompress_message(encoding?, message, max)?),
+            _ => return None,
+        }
+        if max.is_some_and(|max| out.len() > max) {
             return None;
         }
-        out.extend_from_slice(&bytes[i..i + len]);
         i += len;
     }
     Some(out.freeze())
@@ -86,14 +107,15 @@ pub(crate) fn is_grpc(http_req: &HttpRequest) -> bool {
     matches!(http_req.uri.scheme_str(), Some("grpc" | "grpcs"))
 }
 
-/// The `service` query parameter of a health check URL, or `""` for the
-/// server as a whole.
-fn health_service(query: Option<&str>) -> &str {
+/// The `service` query parameter of a health check URL, percent-decoded,
+/// or `""` for the server as a whole.
+fn health_service(query: Option<&str>) -> String {
     query
         .into_iter()
         .flat_map(|q| q.split('&'))
         .find_map(|pair| pair.strip_prefix("service="))
-        .unwrap_or("")
+        .map(percent_decode)
+        .unwrap_or_default()
 }
 
 /// A `grpc.health.v1.HealthCheckRequest`: `service` is field 1. Proto3
@@ -126,14 +148,12 @@ pub(crate) fn prepare(mut http_req: HttpRequest) -> (HttpRequest, GrpcCall) {
     });
     match call {
         GrpcCall::HealthCheck => {
-            http_req.body = Some(health_check_request(health_service(http_req.uri.query())));
+            http_req.body = Some(health_check_request(&health_service(http_req.uri.query())));
             parts.path_and_query = Some(PathAndQuery::from_static(HEALTH_CHECK_PATH));
             // The verdict is in the response message, so it has to stay in
             // memory.
             http_req.discard_body = false;
             http_req.output_path = None;
-            // The check dials the target directly.
-            http_req.proxy = None;
         }
         GrpcCall::Unary => {
             if parts.path_and_query.is_none() {
@@ -154,6 +174,14 @@ pub(crate) fn prepare(mut http_req: HttpRequest) -> (HttpRequest, GrpcCall) {
     http_req.body = Some(Bytes::from(frame));
 
     let mut headers = http_req.headers.take().unwrap_or_default();
+    // gRPC compresses per message, not at the HTTP level: `--compressed`
+    // (an `Accept-Encoding` header) asks for that instead.
+    if headers.remove(http::header::ACCEPT_ENCODING).is_some() {
+        headers.insert(
+            "grpc-accept-encoding",
+            HeaderValue::from_static(ACCEPTED_ENCODINGS),
+        );
+    }
     headers.insert(
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/grpc"),
@@ -164,10 +192,19 @@ pub(crate) fn prepare(mut http_req: HttpRequest) -> (HttpRequest, GrpcCall) {
 }
 
 /// Read the gRPC outcome out of the HTTP/2 response to a prepared request.
-pub(crate) fn finish(mut stat: HttpStat, call: &GrpcCall) -> HttpStat {
+/// `max_body_size` bounds what compressed messages may decode to.
+pub(crate) fn finish(
+    mut stat: HttpStat,
+    call: &GrpcCall,
+    max_body_size: Option<usize>,
+) -> HttpStat {
     stat.is_grpc = true;
+    let encoding = stat
+        .headers
+        .as_ref()
+        .and_then(|h| header_value(h, "grpc-encoding"));
     if let Some(body) = stat.body.clone() {
-        if let Some(unframed) = unframe_grpc(&body) {
+        if let Some(unframed) = unframe_grpc(&body, encoding.as_deref(), max_body_size) {
             stat.body_size = Some(unframed.len());
             stat.body = Some(unframed);
         }
@@ -181,10 +218,11 @@ pub(crate) fn finish(mut stat: HttpStat, call: &GrpcCall) -> HttpStat {
 
 pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
     let (http_req, call) = prepare(http_req);
+    let max_body_size = http_req.max_body_size;
     // Boxed so the grpc:// → request() → grpc_request cycle stays a finite
     // future. `prepare` rewrote the scheme, so this call takes the HTTP path.
     let stat = Box::pin(crate::request::request(http_req)).await;
-    finish(stat, &call)
+    finish(stat, &call, max_body_size)
 }
 
 fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
@@ -413,6 +451,10 @@ mod tests {
         assert_eq!(health_service(Some("service=pkg.Svc")), "pkg.Svc");
         assert_eq!(health_service(Some("a=1&service=pkg.Svc&b=2")), "pkg.Svc");
         assert_eq!(health_service(Some("myservice=x")), "");
+        assert_eq!(
+            health_service(Some("service=my%2Epkg.Svc%20v2")),
+            "my.pkg.Svc v2"
+        );
     }
 
     #[test]
@@ -435,6 +477,12 @@ mod tests {
         req.body = Some(Bytes::from_static(b"ignored"));
         req.discard_body = true;
         req.proxy = Some("http://proxy.local:8080".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br, zstd"),
+        );
+        req.headers = Some(headers);
         let (wire, call) = prepare(req);
         assert!(matches!(call, GrpcCall::HealthCheck));
         assert_eq!(
@@ -444,7 +492,15 @@ mod tests {
         assert_eq!(wire.method.as_deref(), Some("POST"));
         assert!(wire.h2_prior_knowledge);
         assert!(!wire.discard_body);
-        assert!(wire.proxy.is_none());
+        // A health check goes through the proxy like any other call.
+        assert_eq!(wire.proxy.as_deref(), Some("http://proxy.local:8080"));
+        // --compressed becomes per-message compression.
+        let headers = wire.headers.as_ref().unwrap();
+        assert!(headers.get(http::header::ACCEPT_ENCODING).is_none());
+        assert_eq!(
+            headers.get("grpc-accept-encoding").unwrap(),
+            ACCEPTED_ENCODINGS
+        );
         // 5-byte gRPC frame header, then the HealthCheckRequest.
         let mut expected = vec![0, 0, 0, 0, 9, 0x0a, 7];
         expected.extend_from_slice(b"pkg.Svc");
@@ -461,6 +517,12 @@ mod tests {
         assert_eq!(wire.uri.to_string(), "https://svc.local/pkg.Svc/Method");
         assert!(!wire.h2_prior_knowledge);
         assert!(wire.discard_body);
+        assert!(wire
+            .headers
+            .as_ref()
+            .unwrap()
+            .get("grpc-accept-encoding")
+            .is_none());
         assert_eq!(wire.alpn_protocols, [ALPN_HTTP2]);
         assert_eq!(
             wire.body.as_deref(),
@@ -486,6 +548,7 @@ mod tests {
         let serving = finish(
             response(&[0, 0, 0, 0, 2, 0x08, 0x01]),
             &GrpcCall::HealthCheck,
+            None,
         );
         assert!(serving.is_success());
         assert!(serving.body_is_text);
@@ -500,14 +563,80 @@ mod tests {
         let down = finish(
             response(&[0, 0, 0, 0, 2, 0x08, 0x02]),
             &GrpcCall::HealthCheck,
+            None,
         );
         assert_eq!(down.error.as_deref(), Some("service not serving"));
 
         // A raw unary call keeps the message bytes and its trailers.
-        let unary = finish(response(&[0, 0, 0, 0, 2, 0x08, 0x01]), &GrpcCall::Unary);
+        let unary = finish(
+            response(&[0, 0, 0, 0, 2, 0x08, 0x01]),
+            &GrpcCall::Unary,
+            None,
+        );
         assert!(unary.is_success());
         assert!(!unary.body_is_text);
         assert_eq!(unary.body.as_deref(), Some([0x08, 0x01].as_slice()));
         assert!(unary.trailers.is_some());
+    }
+
+    fn frame(flag: u8, message: &[u8]) -> Vec<u8> {
+        let mut frame = vec![flag];
+        frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        frame.extend_from_slice(message);
+        frame
+    }
+
+    #[test]
+    fn unframe_joins_plain_messages() {
+        assert_eq!(
+            unframe_grpc(&[], None, None).as_deref(),
+            Some([].as_slice())
+        );
+        let mut body = frame(0, b"one");
+        body.extend(frame(0, b"two"));
+        assert_eq!(
+            unframe_grpc(&body, None, None).as_deref(),
+            Some(b"onetwo".as_slice())
+        );
+        // A frame cut short leaves the body alone.
+        assert_eq!(unframe_grpc(&body[..body.len() - 1], None, None), None);
+    }
+
+    #[test]
+    fn unframe_decompresses_flagged_messages() {
+        use std::io::Write;
+        let message = b"a compressed gRPC message, a compressed gRPC message";
+
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(message).unwrap();
+        let gzip = gzip.finish().unwrap();
+
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zlib.write_all(message).unwrap();
+        let zlib = zlib.finish().unwrap();
+
+        let zstd = zstd::encode_all(message.as_slice(), 0).unwrap();
+
+        for (encoding, compressed) in [("gzip", gzip), ("deflate", zlib), ("zstd", zstd)] {
+            // A compressed message followed by a plain one.
+            let mut body = frame(1, &compressed);
+            body.extend(frame(0, b"!"));
+            let mut expected = message.to_vec();
+            expected.push(b'!');
+            assert_eq!(
+                unframe_grpc(&body, Some(encoding), None).as_deref(),
+                Some(expected.as_slice()),
+                "{encoding}"
+            );
+            // Without a usable `grpc-encoding` the body is left alone.
+            assert_eq!(unframe_grpc(&body, None, None), None, "{encoding}");
+            assert_eq!(
+                unframe_grpc(&body, Some("snappy"), None),
+                None,
+                "{encoding}"
+            );
+        }
+        // The flag is set but the bytes are not what the encoding says.
+        assert_eq!(unframe_grpc(&frame(1, b"plain"), Some("gzip"), None), None);
     }
 }

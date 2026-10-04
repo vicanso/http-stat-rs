@@ -1934,11 +1934,11 @@ impl fmt::Display for HttpStat {
             )?;
         }
 
-        if let Some(body) = &self.body {
+        if let Some(raw) = &self.body {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();
-            let mut body = std::str::from_utf8(body.as_ref())
-                .unwrap_or_default()
-                .to_string();
+            let utf8 = std::str::from_utf8(raw.as_ref());
+            let is_utf8 = utf8.is_ok();
+            let mut body = utf8.unwrap_or_default().to_string();
             if let Some(filter) = &self.jq_filter {
                 // On an unsupported filter or non-JSON body, show the reason in
                 // place of the body rather than silently dumping the full body.
@@ -1967,10 +1967,16 @@ impl fmt::Display for HttpStat {
                 } else {
                     writeln!(f, "{body}")?;
                 }
+            } else if raw.is_empty() {
+                // Nothing to save.
+                let text = format!("{}: {}", s.body_size, ByteSize(0));
+                writeln!(f, "{}", LightCyan.paint(text))?;
             } else {
+                // A body that is not UTF-8 is saved as it was received.
+                let saved: &[u8] = if is_utf8 { body.as_bytes() } else { raw };
                 let mut save_tips = "".to_string();
                 if let Ok(mut file) = NamedTempFile::new() {
-                    if let Ok(()) = file.write_all(body.as_bytes()) {
+                    if let Ok(()) = file.write_all(saved) {
                         save_tips = format!("{}: {}", s.saved_to, file.path().display());
                         let _ = file.keep();
                     }

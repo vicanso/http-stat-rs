@@ -40,6 +40,14 @@ use tokio_rustls::TlsAcceptor;
 
 /// Body served at `/`.
 pub const HELLO: &str = "hello from the test server\n";
+/// Decoded size of the body at `/bomb`, which is a few kilobytes of gzip.
+pub const BOMB_SIZE: usize = 8 * 1024 * 1024;
+/// How long `/slow-upload` waits before it reads the request body.
+pub const UPLOAD_DELAY: Duration = Duration::from_millis(400);
+/// How long `/slow-dns` takes to answer one query.
+pub const DNS_DELAY: Duration = Duration::from_millis(500);
+/// Body served at `/binary`: not valid UTF-8.
+pub const BINARY: &[u8] = &[0xff, 0xfe, 0x00, 0x01, 0x80, 0x7f];
 /// Hostnames under this suffix resolve to 127.0.0.1 on the test resolvers.
 pub const RESOLVABLE: &str = "origin.test";
 
@@ -141,7 +149,7 @@ impl Run {
     }
 }
 
-fn run(args: &[&str], trust_test_ca: bool) -> Run {
+fn run(args: &[&str], trust_test_ca: bool, env: &[(&str, &str)]) -> Run {
     let home = scratch_dir().join("home");
     std::fs::create_dir_all(&home).expect("home dir");
     let mut command = Command::new(env!("CARGO_BIN_EXE_httpstat"));
@@ -164,6 +172,7 @@ fn run(args: &[&str], trust_test_ca: bool) -> Run {
     if trust_test_ca {
         command.env("SSL_CERT_FILE", &ca().ca_file);
     }
+    command.envs(env.iter().copied());
     let mut child = command.spawn().expect("spawn httpstat");
     // A hung request must fail the test, not the whole CI job.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -187,13 +196,18 @@ fn run(args: &[&str], trust_test_ca: bool) -> Run {
 
 /// Run the binary with the test CA as its only trust anchor.
 pub fn httpstat(args: &[&str]) -> Run {
-    run(args, true)
+    run(args, true, &[])
+}
+
+/// Like [`httpstat`], with extra environment variables.
+pub fn httpstat_env(args: &[&str], env: &[(&str, &str)]) -> Run {
+    run(args, true, env)
 }
 
 /// Run the binary with the platform trust store, which does not know the
 /// test CA.
 pub fn httpstat_untrusting(args: &[&str]) -> Run {
-    run(args, false)
+    run(args, false, &[])
 }
 
 fn bind() -> (TcpListener, SocketAddr) {
@@ -256,6 +270,11 @@ async fn handle(request: Request<Incoming>) -> Result<Response<Body>, Infallible
         .headers()
         .get(http::header::CONTENT_TYPE)
         .is_some_and(|v| v == "application/dns-message");
+    if path == "/slow-upload" {
+        // Leave the body in the socket for a while: the client's upload
+        // stalls once the kernel buffers are full.
+        tokio::time::sleep(UPLOAD_DELAY).await;
+    }
     let body = request
         .into_body()
         .collect()
@@ -271,6 +290,42 @@ async fn handle(request: Request<Incoming>) -> Result<Response<Body>, Infallible
                 .headers_mut()
                 .insert(http::header::LOCATION, HeaderValue::from_static("/"));
             response
+        }
+        (_, "/binary") => respond(StatusCode::OK, "application/octet-stream", full(BINARY)),
+        (_, "/empty") => respond(StatusCode::OK, "application/octet-stream", full("")),
+        (_, "/redirect-unicode") => {
+            // A `Location` whose host is raw UTF-8, on this server's port.
+            let port = seen_host.rsplit(':').next().unwrap_or_default();
+            let location = format!("http://bücher.test:{port}/");
+            let mut response = respond(StatusCode::FOUND, "text/plain", full(""));
+            response.headers_mut().insert(
+                http::header::LOCATION,
+                HeaderValue::from_bytes(location.as_bytes()).expect("location"),
+            );
+            response
+        }
+        (_, "/slow-upload") => respond(StatusCode::OK, "text/plain", full(body.len().to_string())),
+        (_, "/bomb") => {
+            static BOMB: OnceLock<Vec<u8>> = OnceLock::new();
+            let bomb = BOMB.get_or_init(|| gzip(&vec![0u8; BOMB_SIZE]));
+            let mut response = respond(
+                StatusCode::OK,
+                "application/octet-stream",
+                full(bomb.clone()),
+            );
+            response.headers_mut().insert(
+                http::header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+            response
+        }
+        ("POST", "/slow-dns") if is_dns_message => {
+            tokio::time::sleep(DNS_DELAY).await;
+            respond(
+                StatusCode::OK,
+                "application/dns-message",
+                full(dns_answer(&body)),
+            )
         }
         (_, "/gzip") => {
             let mut response = respond(StatusCode::OK, "text/plain", full(gzip(HELLO.as_bytes())));
@@ -594,6 +649,8 @@ pub struct Grpc<'a> {
     pub serving: bool,
     /// Named services and whether each one is SERVING.
     pub services: &'a [(&'a str, bool)],
+    /// Compress responses with gzip for clients that accept it.
+    pub gzip: bool,
 }
 
 impl Default for Grpc<'_> {
@@ -603,6 +660,7 @@ impl Default for Grpc<'_> {
             health: true,
             serving: true,
             services: &[],
+            gzip: false,
         }
     }
 }
@@ -627,7 +685,7 @@ impl Grpc<'_> {
                 .iter()
                 .map(|(name, serving)| (name.to_string(), status(*serving))),
         );
-        let (tls, health) = (self.tls, self.health);
+        let (tls, health, gzip) = (self.tls, self.health, self.gzip);
         runtime().spawn(async move {
             let mut server = Server::builder();
             if tls {
@@ -638,9 +696,12 @@ impl Grpc<'_> {
             }
             let incoming = TcpIncoming::from(listener);
             let served = if health {
-                let (reporter, service) = tonic_health::server::health_reporter();
+                let (reporter, mut service) = tonic_health::server::health_reporter();
                 for (name, status) in statuses {
                     reporter.set_service_status(name, status).await;
+                }
+                if gzip {
+                    service = service.send_compressed(tonic::codec::CompressionEncoding::Gzip);
                 }
                 server
                     .add_service(service)

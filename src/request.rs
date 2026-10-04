@@ -15,7 +15,7 @@
 // HTTP/1.1, HTTP/2, and HTTP/3 request execution.
 
 use super::body_io::{BodyPump, DrainedBody};
-use super::decompress::decompress;
+use super::decompress::decompress_capped;
 use super::error::{Error, Result};
 use super::finish_with_error;
 use super::grpc::{self, grpc_request};
@@ -110,6 +110,94 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 /// are compiled once rather than once per transport.
 pub(crate) type OriginIo = Box<dyn Io>;
 
+/// When a request was last written to the transport.
+///
+/// HTTP/1.1 only. hyper stops polling a body of known length as soon as it
+/// has every byte, so [`TrackedBody`] never sees an upload end there; and
+/// nothing but the request is written while the response is awaited, so the
+/// last write is the end of the request. HTTP/2 also writes SETTINGS and
+/// WINDOW_UPDATE frames in that window, which is why it keeps using the body.
+#[derive(Clone, Default)]
+struct WriteClock(Arc<std::sync::Mutex<Option<Instant>>>);
+
+impl WriteClock {
+    /// Wrap `io` so that its writes are timed.
+    fn track(io: OriginIo) -> (OriginIo, Self) {
+        let written = Self::default();
+        let io = ClockedIo {
+            io,
+            written: written.clone(),
+        };
+        (Box::new(io), written)
+    }
+
+    fn mark(&self) {
+        if let Ok(mut last) = self.0.lock() {
+            *last = Some(Instant::now());
+        }
+    }
+
+    fn last(&self) -> Option<Instant> {
+        self.0.lock().ok().and_then(|last| *last)
+    }
+}
+
+struct ClockedIo {
+    io: OriginIo,
+    written: WriteClock,
+}
+
+impl AsyncRead for ClockedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ClockedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.io).poll_write(cx, buf);
+        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
+            this.written.mark();
+        }
+        written
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
+            this.written.mark();
+        }
+        written
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    // Not marked: hyper flushes on every turn of its loop, written or not.
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
 /// Request body that records the `Instant` at which hyper finished consuming it.
 pub(crate) struct TrackedBody {
     data: Option<Bytes>,
@@ -171,13 +259,15 @@ fn build_tracked_request(
     Ok((request, done))
 }
 
+/// Split the wait for the response headers into Request Send and Server
+/// Processing at `sent_at`, when the request had left.
 fn record_send_split(
     stat: &mut HttpStat,
     send_start: Instant,
     response_at: Instant,
-    done: &Arc<OnceLock<Instant>>,
+    sent_at: Option<Instant>,
 ) {
-    match done.get().copied() {
+    match sent_at {
         Some(done_at) if done_at >= send_start && done_at <= response_at => {
             stat.request_send = Some(done_at.duration_since(send_start));
             stat.server_processing = Some(response_at.duration_since(done_at));
@@ -265,7 +355,12 @@ async fn drain_incoming(
 /// In-memory decode runs after `total` is recorded. Streaming decode already
 /// stored its CPU time on `drained` and is not subtracted from
 /// `content_transfer`.
-fn finalize_body(stat: &mut HttpStat, drained: DrainedBody, encoding: &str) {
+fn finalize_body(
+    stat: &mut HttpStat,
+    drained: DrainedBody,
+    encoding: &str,
+    max_body_size: Option<usize>,
+) {
     stat.wire_body_size = Some(drained.wire_len);
     stat.time_to_first_100k = drained.first_100k;
     if stat.output_saved.is_none() {
@@ -287,7 +382,7 @@ fn finalize_body(stat: &mut HttpStat, drained: DrainedBody, encoding: &str) {
                 stat.body = Some(bytes);
             } else {
                 let t0 = Instant::now();
-                match decompress(enc, &bytes) {
+                match decompress_capped(enc, &bytes, max_body_size) {
                     Ok(data) => {
                         stat.decompress = Some(t0.elapsed());
                         stat.body_size = Some(data.len());
@@ -330,12 +425,12 @@ fn ensure_crypto_provider() {
 
 async fn send_http1_request(
     req: Request<TrackedBody>,
-    done: Arc<OnceLock<Instant>>,
     stream: OriginIo,
     request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
+    let (stream, written) = WriteClock::track(stream);
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
         hyper::client::conn::http1::handshake(TokioIo::new(stream)),
@@ -358,7 +453,7 @@ async fn send_http1_request(
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
-    record_send_split(stat, send_start, Instant::now(), &done);
+    record_send_split(stat, send_start, Instant::now(), written.last());
     Ok(resp)
 }
 
@@ -396,7 +491,7 @@ async fn send_http2_request(
     .await
     .map_err(|e| Error::Timeout { source: e })?
     .map_err(|e| Error::Hyper { source: e })?;
-    record_send_split(stat, send_start, Instant::now(), &done);
+    record_send_split(stat, send_start, Instant::now(), done.get().copied());
     Ok(resp)
 }
 
@@ -523,7 +618,12 @@ async fn tcp_via_proxy(http_req: &HttpRequest, stat: &mut HttpStat) -> Result<Tc
         let handshake_start = Instant::now();
         // `https://` proxy is TLS to the proxy, then CONNECT. Plain HTTP to
         // an `http://` proxy stays a forward request (absolute URI, no tunnel).
-        let is_http_forward = !proxy.tls && !is_https && matches!(proxy.kind, ProxyKind::Http);
+        // Cleartext HTTP/2 (gRPC over `grpc://`) cannot be forwarded by an
+        // HTTP/1.1 proxy, so it is tunneled with CONNECT like HTTPS.
+        let is_http_forward = !proxy.tls
+            && !is_https
+            && !http_req.h2_prior_knowledge
+            && matches!(proxy.kind, ProxyKind::Http);
         let io: BoxedIo = if proxy.tls {
             let tls = tls_connect_stream(
                 &proxy.host,
@@ -616,7 +716,7 @@ async fn consume_response(
         stat.tcp_info_final = probe.sample();
     }
     stat.total = Some(start.elapsed());
-    finalize_body(&mut stat, drained, &encoding);
+    finalize_body(&mut stat, drained, &encoding, http_req.max_body_size);
     stat
 }
 
@@ -691,7 +791,7 @@ async fn http3_request(http_req: HttpRequest) -> HttpStat {
                 .as_ref()
                 .map(content_encoding)
                 .unwrap_or_default();
-            finalize_body(&mut stat, drained, &encoding);
+            finalize_body(&mut stat, drained, &encoding, http_req.max_body_size);
         }
         Ok(Err(err)) => {
             stat.error = Some(err);
@@ -748,14 +848,13 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
                 Err(e) => return finish_with_error(stat, e, start),
             }
         } else {
-            let (req, done) = match build_tracked_request(&http_req, true) {
+            let (req, _) = match build_tracked_request(&http_req, true) {
                 Ok(r) => r,
                 Err(e) => return finish_with_error(stat, e, start),
             };
             stat.request_headers = req.headers().clone();
             match send_http1_request(
                 req,
-                done,
                 Box::new(tls_stream),
                 http_req.request_timeout,
                 tx,
@@ -787,14 +886,13 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             Err(e) => return finish_with_error(stat, e, start),
         }
     } else {
-        let (req, done) = match build_tracked_request(&http_req, true) {
+        let (req, _) = match build_tracked_request(&http_req, true) {
             Ok(r) => r,
             Err(e) => return finish_with_error(stat, e, start),
         };
         stat.request_headers = req.headers().clone();
         match send_http1_request(
             req,
-            done,
             Box::new(ready.io),
             http_req.request_timeout,
             tx,
@@ -827,7 +925,10 @@ pub async fn request(http_req: HttpRequest) -> HttpStat {
 }
 
 enum ConnectionSender {
-    Http1(hyper::client::conn::http1::SendRequest<TrackedBody>),
+    Http1 {
+        sender: hyper::client::conn::http1::SendRequest<TrackedBody>,
+        written: WriteClock,
+    },
     Http2(hyper::client::conn::http2::SendRequest<TrackedBody>),
     Http3 {
         conn: quinn::Connection,
@@ -883,7 +984,7 @@ impl HttpConnection {
                     send: send.clone(),
                 },
             }),
-            ConnectionSender::Http1(_) => None,
+            ConnectionSender::Http1 { .. } => None,
         }
     }
 }
@@ -895,6 +996,7 @@ async fn establish_http1(
     tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
     start: Instant,
 ) -> (HttpStat, Option<HttpConnection>) {
+    let (stream, written) = WriteClock::track(stream);
     match timeout(
         handshake_timeout,
         hyper::client::conn::http1::handshake(TokioIo::new(stream)),
@@ -910,7 +1012,7 @@ async fn establish_http1(
             (
                 stat,
                 Some(HttpConnection {
-                    sender: ConnectionSender::Http1(sender),
+                    sender: ConnectionSender::Http1 { sender, written },
                     tcp_probe,
                     last_tcp_info,
                     last_quic: None,
@@ -1118,12 +1220,13 @@ async fn exchange_h2(
         Ok(Err(e)) => return finish_with_error(stat, Error::Hyper { source: e }, start),
         Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
     };
-    record_send_split(&mut stat, send_start, Instant::now(), &done);
+    record_send_split(&mut stat, send_start, Instant::now(), done.get().copied());
     consume_response(resp, http_req, stat, start, probe).await
 }
 
 async fn exchange_h1(
     sender: &mut hyper::client::conn::http1::SendRequest<TrackedBody>,
+    written: &WriteClock,
     http_req: &HttpRequest,
     mut stat: HttpStat,
     start: Instant,
@@ -1132,7 +1235,7 @@ async fn exchange_h1(
     if let Err(e) = sender.ready().await {
         return finish_with_error(stat, Error::Hyper { source: e }, start);
     }
-    let (req, done) = match build_tracked_request(http_req, true) {
+    let (req, _) = match build_tracked_request(http_req, true) {
         Ok(r) => r,
         Err(e) => return finish_with_error(stat, e, start),
     };
@@ -1144,7 +1247,7 @@ async fn exchange_h1(
         Ok(Err(e)) => return finish_with_error(stat, Error::Hyper { source: e }, start),
         Err(e) => return finish_with_error(stat, Error::Timeout { source: e }, start),
     };
-    record_send_split(&mut stat, send_start, Instant::now(), &done);
+    record_send_split(&mut stat, send_start, Instant::now(), written.last());
     consume_response(resp, http_req, stat, start, probe).await
 }
 
@@ -1179,7 +1282,7 @@ async fn exchange_h3(
         .as_ref()
         .map(content_encoding)
         .unwrap_or_default();
-    finalize_body(&mut stat, drained, &encoding);
+    finalize_body(&mut stat, drained, &encoding, http_req.max_body_size);
     stat
 }
 
@@ -1188,7 +1291,8 @@ impl HttpConnection {
     pub async fn send(&mut self, http_req: &HttpRequest) -> HttpStat {
         if grpc::is_grpc(http_req) {
             let (http_req, call) = grpc::prepare(http_req.clone());
-            return grpc::finish(self.exchange(&http_req).await, &call);
+            let max = http_req.max_body_size;
+            return grpc::finish(self.exchange(&http_req).await, &call, max);
         }
         self.exchange(http_req).await
     }
@@ -1204,8 +1308,8 @@ impl HttpConnection {
         // request. The duplicate fd stays valid across that await.
         let probe = self.tcp_probe.take();
         let stat = match &mut self.sender {
-            ConnectionSender::Http1(sender) => {
-                exchange_h1(sender, http_req, stat, start, probe.as_ref()).await
+            ConnectionSender::Http1 { sender, written } => {
+                exchange_h1(sender, written, http_req, stat, start, probe.as_ref()).await
             }
             ConnectionSender::Http2(sender) => {
                 exchange_h2(sender, http_req, stat, start, probe.as_ref()).await
@@ -1231,7 +1335,8 @@ impl HttpWorker {
     pub async fn send(self, http_req: &HttpRequest) -> HttpStat {
         if grpc::is_grpc(http_req) {
             let (http_req, call) = grpc::prepare(http_req.clone());
-            return grpc::finish(self.exchange(&http_req).await, &call);
+            let max = http_req.max_body_size;
+            return grpc::finish(self.exchange(&http_req).await, &call, max);
         }
         self.exchange(http_req).await
     }

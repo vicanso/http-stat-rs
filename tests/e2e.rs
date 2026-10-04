@@ -160,12 +160,126 @@ fn redirects_are_followed_only_with_dash_l() {
 }
 
 #[test]
+fn http1_upload_time_is_reported_as_request_send() {
+    let origin = http_server(None);
+
+    // Even a request without a body has a send phase.
+    let stat = httpstat(&["--json", &format!("http://{origin}/")]).json();
+    assert!(is_duration(&stat["timing"]["request_send_us"]));
+
+    // Larger than the loopback socket buffers, so the upload cannot finish
+    // before the server starts reading.
+    let upload = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("upload-{}.bin", std::process::id()));
+    std::fs::write(&upload, vec![0u8; 32 * 1024 * 1024]).expect("upload file");
+    let run = httpstat(&[
+        "--json",
+        "-d",
+        &format!("@{}", upload.display()),
+        &format!("http://{origin}/slow-upload"),
+    ]);
+    let _ = std::fs::remove_file(&upload);
+    let stat = run.json();
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    let request_send = stat["timing"]["request_send_us"].as_u64().unwrap_or(0);
+    let server_processing = stat["timing"]["server_processing_us"].as_u64().unwrap_or(0);
+    let floor = UPLOAD_DELAY.as_micros() as u64 * 3 / 4;
+    assert!(request_send >= floor, "request_send {request_send}us");
+    // The stalled upload is not billed to the server.
+    assert!(
+        server_processing < floor,
+        "server_processing {server_processing}us"
+    );
+}
+
+#[test]
+fn decoded_body_is_capped_by_max_filesize() {
+    let origin = http_server(None);
+    let url = format!("http://{origin}/bomb");
+
+    // Within the default limit the body is decoded in full.
+    let stat = httpstat(&["--json", &url]).json();
+    assert_eq!(stat["status"], 200);
+    assert_eq!(stat["body_size"], BOMB_SIZE);
+
+    // The compressed bytes fit in 1MB; what they decode to does not.
+    let run = httpstat(&["--json", "--max-filesize", "1MB", &url]);
+    assert_ne!(run.code, 0, "{}", run.stdout);
+    assert!(error_of(&run.json()).contains("decompressed body exceeds"));
+
+    // The same holds when the body is streamed to a file.
+    let output = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("bomb-{}.out", std::process::id()));
+    let run = httpstat(&[
+        "--json",
+        "--max-filesize",
+        "1MB",
+        "-o",
+        &output.display().to_string(),
+        &url,
+    ]);
+    let saved = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(&output);
+    assert_ne!(run.code, 0, "{}", run.stdout);
+    assert!(error_of(&run.json()).contains("decompressed body exceeds"));
+    assert!(saved <= 1_000_000, "{saved} bytes were written");
+}
+
+#[test]
+fn redirect_to_a_unicode_host_is_followed() {
+    let origin = http_server(None);
+    let port = origin.port();
+    let run = httpstat(&[
+        "--json",
+        "-L",
+        "--connect-to",
+        &format!("xn--bcher-kva.test:{port}:127.0.0.1:{port}"),
+        &format!("http://{origin}/redirect-unicode"),
+    ]);
+    let stat = run.json();
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    assert_eq!(stat["status"], 200);
+    assert_eq!(stat["redirects"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        stat["headers"]["x-seen-host"],
+        format!("xn--bcher-kva.test:{port}")
+    );
+}
+
+#[test]
 fn compressed_body_is_decoded() {
     let origin = http_server(None);
     let stat = httpstat(&["--json", "--compressed", &format!("http://{origin}/gzip")]).json();
     assert_eq!(stat["status"], 200);
     assert_eq!(stat["headers"]["content-encoding"], "gzip");
     assert_eq!(stat["body_size"], HELLO.len());
+}
+
+/// The path after `saved to: ` in text output, if a body was saved.
+fn saved_path(text: &str) -> Option<String> {
+    text.split_once("saved to: ")
+        .map(|(_, rest)| rest.lines().next().unwrap_or_default().trim().to_string())
+}
+
+#[test]
+fn binary_body_is_saved_to_a_file_as_received() {
+    let origin = http_server(None);
+    let text = strip_ansi(&httpstat(&[&format!("http://{origin}/binary")]).stdout);
+    let path = saved_path(&text).unwrap_or_else(|| panic!("no saved file in:\n{text}"));
+    let saved = std::fs::read(&path).expect("saved body");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(saved, BINARY);
+}
+
+#[test]
+fn empty_body_is_not_saved_to_a_file() {
+    let origin = http_server(None);
+    let text = strip_ansi(&httpstat(&[&format!("http://{origin}/empty")]).stdout);
+    assert!(text.contains("Body size: 0 B"), "{text}");
+    if let Some(path) = saved_path(&text) {
+        let _ = std::fs::remove_file(&path);
+        panic!("an empty body was saved to {path}");
+    }
 }
 
 #[test]
@@ -305,6 +419,26 @@ fn doh_resolver_over_http2() {
 
 #[cfg(feature = "doh")]
 #[test]
+fn doh_queries_run_concurrently_over_http2() {
+    // Each of the A and AAAA queries takes DNS_DELAY to answer.
+    let resolver = http_server(Some(&["h2"]));
+    let origin = http_server(None);
+    let run = fetch_via(
+        &format!("https://127.0.0.1:{}/slow-dns", resolver.port()),
+        origin,
+    );
+    let stat = run.json();
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    let lookup = stat["timing"]["dns_lookup_us"].as_u64().unwrap_or(u64::MAX);
+    let one_at_a_time = 2 * DNS_DELAY.as_micros() as u64;
+    assert!(
+        lookup < one_at_a_time * 9 / 10,
+        "dns lookup took {lookup}us"
+    );
+}
+
+#[cfg(feature = "doh")]
+#[test]
 fn doh_resolver_over_http1() {
     let resolver = http_server(Some(&["http/1.1"]));
     assert_resolved(&format!("https://127.0.0.1:{}/dns-query", resolver.port()));
@@ -353,16 +487,57 @@ fn secure_dns_failures_are_dns_failures() {
     assert_eq!(run.code, 2, "{}", run.stdout);
     assert!(error_of(&run.json()).contains("invalid dns server"));
 
-    // The resolver's certificate is always verified.
-    let run = httpstat_untrusting(&[
-        "--json",
-        "-k",
-        "--dns-servers",
-        &dns_server,
-        &format!("http://www.{RESOLVABLE}:{}/", origin.port()),
-    ]);
+    // The resolver's certificate is verified...
+    let url = format!("http://www.{RESOLVABLE}:{}/", origin.port());
+    let run = httpstat_untrusting(&["--json", "--dns-servers", &dns_server, &url]);
     assert_eq!(run.code, 2, "{}", run.stdout);
     assert!(error_of(&run.json()).contains("certificate"));
+
+    // ...unless -k says otherwise.
+    let run = httpstat_untrusting(&["--json", "-k", "--dns-servers", &dns_server, &url]);
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    assert_eq!(run.json()["status"], 200);
+}
+
+#[cfg(feature = "doh")]
+#[test]
+fn lookup_without_an_address_is_a_dns_failure() {
+    // The test resolver has an A record for the name, but no AAAA.
+    let resolver = http_server(Some(H2_AND_H1));
+    let run = httpstat(&[
+        "--json",
+        "-6",
+        "--dns-servers",
+        &format!("https://127.0.0.1:{}", resolver.port()),
+        &format!("http://www.{RESOLVABLE}:{}/", http_server(None).port()),
+    ]);
+    assert_eq!(run.code, 2, "{}", run.stdout);
+}
+
+#[cfg(feature = "doh")]
+#[test]
+fn connect_to_pins_the_resolver_address() {
+    let resolver = http_server(Some(H2_AND_H1));
+    let origin = http_server(None);
+    // Nothing answers on the port in the URL.
+    let dns_server = format!("https://localhost:{REFUSED_PORT}/dns-query");
+    let url = format!("http://www.{RESOLVABLE}:{}/", origin.port());
+
+    let run = httpstat(&["--json", "--dns-servers", &dns_server, &url]);
+    assert_eq!(run.code, 2, "{}", run.stdout);
+
+    let run = httpstat(&[
+        "--json",
+        "--dns-servers",
+        &dns_server,
+        "--connect-to",
+        &format!("localhost:{REFUSED_PORT}:127.0.0.1:{}", resolver.port()),
+        &url,
+    ]);
+    let stat = run.json();
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    assert_eq!(stat["status"], 200);
+    assert_eq!(stat["addr"], origin.to_string());
 }
 
 // ---- gRPC ----
@@ -472,6 +647,56 @@ fn grpc_health_check_over_a_reused_connection() {
     .start();
     let run = httpstat(&["--json", "-K", "-n", "2", &format!("grpc://{down}")]);
     assert_eq!(run.code, 1, "{}", run.stdout);
+}
+
+#[test]
+fn grpc_goes_through_a_proxy() {
+    // Cleartext gRPC is tunneled with CONNECT, health check included.
+    let proxy = connect_proxy(false);
+    let server = Grpc::default().start();
+    let run = httpstat(&[
+        "--json",
+        "--proxy",
+        &format!("http://{}", proxy.addr),
+        &format!("grpc://{server}"),
+    ]);
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    assert_eq!(proxy.tunnels(), 1);
+
+    // grpcs:// picks its proxy up from HTTPS_PROXY.
+    let proxy = connect_proxy(false);
+    let server = Grpc {
+        tls: true,
+        ..Default::default()
+    }
+    .start();
+    let run = httpstat_env(
+        &["--json", &format!("grpcs://127.0.0.1:{}", server.port())],
+        &[("HTTPS_PROXY", &format!("http://{}", proxy.addr))],
+    );
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    assert_eq!(proxy.tunnels(), 1);
+}
+
+#[test]
+fn grpc_compressed_response_is_decoded() {
+    let server = Grpc {
+        gzip: true,
+        ..Default::default()
+    }
+    .start();
+    let url = format!("grpc://{server}");
+
+    // The server compresses only for a client that accepts it.
+    let run = httpstat(&["--json", &url]);
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    assert!(run.json()["headers"].get("grpc-encoding").is_none());
+
+    let run = httpstat(&["--json", "--compressed", &url]);
+    let stat = run.json();
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    assert_eq!(stat["headers"]["grpc-encoding"], "gzip");
+    assert!(stat["error"].is_null());
 }
 
 #[test]

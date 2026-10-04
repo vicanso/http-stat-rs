@@ -116,6 +116,13 @@ impl ConnectTo {
         let port_ok = self.src_port.is_none() || self.src_port == Some(port);
         host_ok && port_ok
     }
+
+    /// Like [`matches`](Self::matches), but only for an entry that names
+    /// the host: a wildcard entry is meant for the origin alone.
+    #[cfg(feature = "doh")]
+    pub(crate) fn names(&self, host: &str, port: u16) -> bool {
+        !self.src_host.is_empty() && self.matches(host, port)
+    }
 }
 
 // HttpRequest struct to hold request configuration
@@ -464,6 +471,19 @@ mod tests {
             HttpRequest::try_from("http://\u{301}abc.com/"),
             Err(Error::Common { .. })
         ));
+    }
+
+    #[cfg(feature = "doh")]
+    #[test]
+    fn connect_to_names_only_an_explicit_host() {
+        let named = ConnectTo::parse("dns.example:443:10.0.0.1:8443").unwrap();
+        assert!(named.names("dns.example", 443));
+        assert!(!named.names("dns.example", 853));
+        assert!(!named.names("other.example", 443));
+        // A wildcard matches every host, but names none.
+        let wildcard = ConnectTo::parse(":443:10.0.0.1:8443").unwrap();
+        assert!(wildcard.matches("dns.example", 443));
+        assert!(!wildcard.names("dns.example", 443));
     }
 
     // ---- builder ----

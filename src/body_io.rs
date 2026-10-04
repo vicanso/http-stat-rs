@@ -18,6 +18,7 @@
 //! `--jq`, `--pretty`, library consumers). `-o` streams decoded bytes to the
 //! file, and benchmark mode counts bytes and drops them.
 
+use crate::decompress::decoded_too_large;
 use crate::stats::FIRST_CHUNK_BYTES;
 use brotli_decompressor::writer::DecompressorWriter;
 use bytes::{Bytes, BytesMut};
@@ -39,13 +40,38 @@ pub(crate) struct DrainedBody {
     pub saved_to: Option<String>,
 }
 
+/// The output file behind a decoder. The wire bytes are counted as they
+/// arrive; this bounds what they decode to.
+struct CappedFile {
+    file: File,
+    max: Option<usize>,
+    written: usize,
+}
+
+impl Write for CappedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(max) = self.max {
+            if self.written.saturating_add(buf.len()) > max {
+                return Err(std::io::Error::other(decoded_too_large(max)));
+            }
+        }
+        let n = self.file.write(buf)?;
+        self.written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// Concrete file writers so each decoder can run its consuming finish.
 /// `Box<dyn Write>` cannot call `GzDecoder::finish` or `into_inner`.
 enum FileSink {
     Plain(File),
-    Gzip(Box<GzDecoder<File>>),
-    Brotli(Box<DecompressorWriter<File>>),
-    Zstd(Box<ZstdDecoder<'static, File>>),
+    Gzip(Box<GzDecoder<CappedFile>>),
+    Brotli(Box<DecompressorWriter<CappedFile>>),
+    Zstd(Box<ZstdDecoder<'static, CappedFile>>),
 }
 
 impl FileSink {
@@ -111,7 +137,7 @@ impl BodyPump {
         let (sink, decoded_here, saved_to) = if let Some(path) = output {
             let file = File::create(path).map_err(|e| format!("write output error: {e}"))?;
             let saved = path.display().to_string();
-            let writer = file_sink(file, encoding)?;
+            let writer = file_sink(file, encoding, max)?;
             (
                 Sink::File(writer),
                 !encoding_is_identity(encoding),
@@ -217,11 +243,20 @@ fn encoding_is_identity(encoding: &str) -> bool {
     enc.is_empty() || enc.eq_ignore_ascii_case("identity")
 }
 
-fn file_sink(file: File, encoding: &str) -> std::result::Result<FileSink, String> {
+fn file_sink(
+    file: File,
+    encoding: &str,
+    max: Option<usize>,
+) -> std::result::Result<FileSink, String> {
     let enc = encoding.split(',').next().unwrap_or("").trim();
     if encoding_is_identity(enc) {
         return Ok(FileSink::Plain(file));
     }
+    let file = CappedFile {
+        file,
+        max,
+        written: 0,
+    };
     match enc {
         "gzip" | "x-gzip" => Ok(FileSink::Gzip(Box::new(GzDecoder::new(file)))),
         "br" => Ok(FileSink::Brotli(Box::new(DecompressorWriter::new(

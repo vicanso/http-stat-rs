@@ -543,6 +543,16 @@ fn normalize_absolute(uri: Uri) -> Option<Uri> {
     Uri::from_parts(parts).ok()
 }
 
+/// Parse a `Location` value. An absolute URL with a Unicode host is not a
+/// valid `Uri` as it stands: its host is written as Punycode first.
+fn parse_location(location: &str) -> Option<Uri> {
+    let absolute = location.starts_with("http://") || location.starts_with("https://");
+    if absolute && !location.is_ascii() {
+        return HttpRequest::try_from(location).ok().map(|req| req.uri);
+    }
+    location.parse::<Uri>().ok()
+}
+
 /// Resolve a redirect `Location` against the request's current URI.
 /// Covers absolute URLs, scheme-relative (`//host/path`), absolute-path, and
 /// relative-path references. Dot segments are removed (RFC 3986 §5.2.4), the
@@ -560,7 +570,7 @@ fn resolve_redirect(base: &Uri, location: &str) -> Option<Uri> {
     if location.is_empty() {
         return None;
     }
-    if let Ok(uri) = location.parse::<Uri>() {
+    if let Some(uri) = parse_location(location) {
         if uri.scheme().is_some() && uri.authority().is_some() {
             return normalize_absolute(uri);
         }
@@ -576,7 +586,7 @@ fn resolve_redirect(base: &Uri, location: &str) -> Option<Uri> {
             Some(q) => format!("{scheme}://{rest}?{q}"),
             None => format!("{scheme}://{rest}"),
         };
-        return absolute.parse::<Uri>().ok().and_then(normalize_absolute);
+        return parse_location(&absolute).and_then(normalize_absolute);
     }
     let merged = if path_ref.starts_with('/') {
         remove_dot_segments(path_ref)
@@ -671,7 +681,8 @@ async fn do_request(
                 .headers
                 .as_ref()
                 .and_then(|header| header.get(http::header::LOCATION))
-                .and_then(|value| value.to_str().ok())
+                // Not `to_str`: a server may send a Unicode host as raw UTF-8.
+                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
                 .unwrap_or("")
                 .to_string();
             let Some(new_uri) = resolve_redirect(&req.uri, &location) else {
@@ -1641,7 +1652,7 @@ async fn main() {
     // Proxy: CLI flag takes precedence, then env vars
     let proxy = args.proxy.or_else(|| {
         let scheme = req.uri.scheme_str().unwrap_or("http");
-        let from_env = if scheme == "https" {
+        let from_env = if matches!(scheme, "https" | "grpcs") {
             std::env::var("HTTPS_PROXY")
                 .or_else(|_| std::env::var("https_proxy"))
                 .ok()
@@ -2395,6 +2406,26 @@ mod tests {
         assert_eq!(fmt_alt_endpoint("", 443), ":443");
         assert_eq!(fmt_alt_endpoint("h", 8443), "h:8443");
         assert_eq!(fmt_alt_endpoint("::1", 443), "[::1]:443");
+    }
+
+    #[test]
+    fn redirect_to_a_unicode_host_uses_punycode() {
+        let base: Uri = "http://example.com/a/b".parse().unwrap();
+        let target = |location: &str| resolve_redirect(&base, location).map(|u| u.to_string());
+        assert_eq!(
+            target("https://bücher.example/path?q=1").as_deref(),
+            Some("https://xn--bcher-kva.example/path?q=1")
+        );
+        assert_eq!(
+            target("//bücher.example/path").as_deref(),
+            Some("http://xn--bcher-kva.example/path")
+        );
+        // ASCII locations are parsed as before.
+        assert_eq!(
+            target("https://example.org/x").as_deref(),
+            Some("https://example.org/x")
+        );
+        assert_eq!(target("../c").as_deref(), Some("http://example.com/c"));
     }
 
     #[test]

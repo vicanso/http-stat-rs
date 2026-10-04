@@ -9,15 +9,15 @@
 ## 亮点
 
 - **HTTP/1.1、HTTP/2 和 HTTP/3 (QUIC)** — 全面支持现代协议，一个参数即可切换
-- **gRPC** — `grpc://` / `grpcs://` 在路径为空、`/` 或包含 `grpc.health.v1.Health/Check` 时做健康检查；加上 `?service=NAME` 可只检查某一个服务，而不是整个服务端。其他路径是原始 unary：body 是带长度前缀的 protobuf 帧（`-d` 是原始 protobuf，不是 JSON），`grpc-status` 来自 trailer，文本输出里列在 `Trailers：` 下。`grpcs://` 执行真实的 rustls 握手（支持 `-k` 与 mTLS）。两种调用都可以用 `-K` 和 `-c` 复用同一条 HTTP/2 连接
+- **gRPC** — `grpc://` / `grpcs://` 在路径为空、`/` 或包含 `grpc.health.v1.Health/Check` 时做健康检查；加上 `?service=NAME` 可只检查某一个服务，而不是整个服务端。其他路径是原始 unary：body 是带长度前缀的 protobuf 帧（`-d` 是原始 protobuf，不是 JSON），`grpc-status` 来自 trailer，文本输出里列在 `Trailers：` 下。`grpcs://` 执行真实的 rustls 握手（支持 `-k` 与 mTLS）。两种调用都可以用 `-K` 和 `-c` 复用同一条 HTTP/2 连接。`--compressed` 会请求压缩的消息（`gzip`、`deflate`、`zstd`）并解码。代理的用法和 HTTP 一样；明文 `grpc://` 通过 `CONNECT` 隧道转发
 - **请求发送阶段独立计时** — 将请求体上传与服务端处理拆开，POST/PUT 上传慢不再被误判为"服务器慢"
 - **Server-Timing 解析** — 解析 RFC 8673 `Server-Timing` 响应头，把服务端报告的子阶段耗时（CDN edge / origin / worker 等）直接展开在 TTFB 之下
 - **基准测试模式** — `-n 10` 重复 N 次，输出 min/max/avg/p50/p95/p99。每一次仍然遵守 `--retry`、`--max-time` 和 `--alt-svc`。`-K` 复用一条连接，包括 HTTP/3。`-c N` 让 N 个 HTTP/2 或 HTTP/3 请求同时在途（`-c 4 -n 20` 是 20 次请求、每次最多 4 个在途；只写 `-c 4` 则跑 4 次）。HTTP/1.1 不能多路复用，`-c` 会改成串行
 - **多 IP 并发测试** — `--resolve` 同时测试多个 IP，结果按成功/失败排序
 - **透明解压** — `--compressed` 自动解码 `gzip`、`br`、`zstd` 响应
-- **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`；DoH/DoT 预设：`google-doh`、`cloudflare-doh`、`quad9-doh`、`google-dot`、`cloudflare-dot`、`quad9-dot`；其他解析服务器可以直接写 DoH 地址（`https://dns.example.com/dns-query`）或 DoT 地址（`tls://dns.example.com`）
+- **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`；DoH/DoT 预设：`google-doh`、`cloudflare-doh`、`quad9-doh`、`google-dot`、`cloudflare-dot`、`quad9-dot`；其他解析服务器可以直接写 DoH 地址（`https://dns.example.com/dns-query`）或 DoT 地址（`tls://dns.example.com`）。用 `--connect-to` 指明解析服务器的主机名，可以固定连接它时使用的地址
 - **国际化域名** — URL 里的 Unicode 主机名（`https://münchen.de/`）会在请求前转成 Punycode
-- **DoH/DoT 阶段拆分** — 使用 DoH 或 DoT 时，DNS 一列会拆成 `DNS Connect`（到解析服务器的 TCP+TLS 握手）与 `DNS Query`，让你看出"DoH 慢"是慢在连 DNS 服务器还是慢在查询本身
+- **DoH/DoT 阶段拆分** — 使用 DoH 或 DoT 时，DNS 一列会拆成 `DNS Connect`（到解析服务器的 TCP+TLS 握手）与 `DNS Query`，让你看出"DoH 慢"是慢在连 DNS 服务器还是慢在查询本身。走 HTTP/2 时 A 和 AAAA 两个查询会同时发出
 - **内核 TCP 统计** — Linux、macOS 和 Windows 会在连接建立后和读完响应体后再采样一次。`--verbose` 或 `--tcp-info` 展示 RTT、MSS、cwnd 以及本次请求期间的重传，用来区分丢包、TCP 慢启动和应用层延迟。Windows 上的重传计数是字节（`BytesRetrans`），不是报文段。经 HTTP/SOCKS 代理时，采样的是客户端到代理的 socket，不是到源站。
 - **下载吞吐 + 慢启动拆分** — 响应体大于 1 MiB 时，会在 `Body size` 旁加一行 `Throughput: X MB/s`；`--verbose` 下进一步拆成"首 100 KB"与"后续"两段速率，可以把"TCP 慢启动主导"和"服务器流式推得慢"两类问题区分开。
 - **中英双语输出** — `--lang en|zh` 显式指定显示语言；不指定时自动读取 `LC_ALL` / `LC_MESSAGES` / `LANG`（`zh*` 走中文），无匹配则回退英文。JSON 输出始终保持英文键，避免影响下游脚本。
@@ -25,7 +25,7 @@
 - **TLS 证书检查** — verbose 模式展示完整证书链、密码套件、SAN 域名及有效期
 - **TLS 握手诊断** — 每次 HTTPS 请求都会报告握手类型（`Full` / `Resumed`）、服务器是否进行 OCSP stapling，以及在 `-n` 基准测试模式下后续请求是否接受了 0-RTT 早期数据
 - **Cookie 支持** — `-b 'k=v'` 或 `-b @file`。`Set-Cookie` 会按 `Domain`、`Path`、`Secure`、`Max-Age`、`Expires` 保存，只有匹配下一跳的 cookie 才会发出去
-- **符合规范的重定向** — `-L` 最多跟随 `--max-redirs` 跳（默认 10；`0` 不跟随）。相对 `Location` 会解析并去掉点分段。方法按 RFC 9110 降级（303 → GET，301/302 的 POST → GET，307/308 保持不变）。跨主机时丢掉 `Authorization` 和 `--resolve`。每一跳的耗时都会保留，另有墙钟 `chain_total`；`total` 仍是最后一跳。方法+URL 重复视为循环（非零退出）。到达上限时向 stderr 提示，并返回最后一次重定向响应
+- **符合规范的重定向** — `-L` 最多跟随 `--max-redirs` 跳（默认 10；`0` 不跟随）。相对 `Location` 会解析并去掉点分段；Unicode 主机名会转成 Punycode。方法按 RFC 9110 降级（303 → GET，301/302 的 POST → GET，307/308 保持不变）。跨主机时丢掉 `Authorization` 和 `--resolve`。每一跳的耗时都会保留，另有墙钟 `chain_total`；`total` 仍是最后一跳。方法+URL 重复视为循环（非零退出）。到达上限时向 stderr 提示，并返回最后一次重定向响应
 - **ALPN 协议协商展示** — 每次响应明确显示客户端与服务端最终协商出的协议版本（`HTTP/1.1`、`H2`、`H3`），清楚知道实际使用了哪个版本
 - **Alt-Svc 自动升级** — `--alt-svc` 在响应广告 `h3`（RFC 7838）时用 HTTP/3 再试一次。成功的端点记在 `~/.httpstat/alt-svc.json`（`ma=0` 不写入；省略 `ma` 按 24 小时）。`-K` / `-c` 在基准测试前先做一次不计入次数的探测。升级失败会丢掉缓存并保留原始结果。`--http3` 遇到未被绕过的代理会直接拒绝
 - **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段（支持 `.a.b`、`.[0]`、`.[]`）；遇到不支持的语法或非 JSON 响应体会明确报错，而不是静默输出完整 body
@@ -34,13 +34,13 @@
 - **curl 风格操作** — 熟悉的参数（`-H`、`-X`、`-d`、`-L`、`-k`、`-o`、`-4`/`-6`），无缝上手
 - **Waterfall 图表** — `--waterfall` 将每个阶段渲染为横向进度条，瓶颈一目了然（类似 Chrome DevTools Network 面板）
 - **`--connect-to`** — 在 TCP 层将 `HOST1:PORT1` 重定向到 `HOST2:PORT2`，TLS SNI 和 `Host` 头保持不变，与 curl 的 `--connect-to` 一致
-- **代理支持** — `--proxy` 支持 HTTP、HTTPS 和 SOCKS5，包括 userinfo（`user:pass@host`）。同时读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`，并跳过 `NO_PROXY` / `no_proxy` 里列出的源站。`-k` 同时作用于代理证书和源站证书
+- **代理支持** — `--proxy` 支持 HTTP、HTTPS 和 SOCKS5，包括 userinfo（`user:pass@host`）。同时读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`，并跳过 `NO_PROXY` / `no_proxy` 里列出的源站。`-k` 同时作用于源站、代理和 DoH/DoT 解析服务器的证书
 - **源 IP 绑定** — `--bind <IP>` 将出站连接绑定到指定本地地址，多网卡环境、策略路由或验证特定网卡可达性时不可或缺
 - **mTLS（双向 TLS）** — `--cert`/`--key` 发送客户端证书，适用于零信任网络和服务网格
 - **配置文件** — `~/.httpstatrc` 设置持久化默认值（DNS、超时、请求头等），CLI 参数始终优先
 - **细粒度超时** — `--timeout` 作用于每个阶段，包括等待响应头与响应体传输，服务器只连接不应答也无法把进程吊死；`--connect-timeout` 仅限制连接阶段（DNS + TCP + TLS/QUIC）；`--max-time` 是整次操作的墙钟预算，包括响应体、重定向、重试、退避和 Alt-Svc 升级
 - **自动重试** — `--retry N` 对瞬时失败（超时、连接错误、HTTP 408/429/500/502/503/504）按指数退避重试，或用 `--retry-delay` 指定固定间隔；适合不稳定的 CI 门禁
-- **响应体大小上限** — `--max-filesize` 在超限时直接中止传输（默认 1GB，`0` 表示不限）。单次请求且没有 `--jq` / `--pretty` 时，`-o` 把解码后的响应体流式写到磁盘；否则仍在内存中缓冲。解压耗时单独报告，不并进内容传输
+- **响应体大小上限** — `--max-filesize` 在超限时直接中止传输（默认 1GB，`0` 表示不限）。压缩的响应体解压后也不能超过这个上限。单次请求且没有 `--jq` / `--pretty` 时，`-o` 把解码后的响应体流式写到磁盘；否则仍在内存中缓冲。解压耗时单独报告，不并进内容传输
 - **语义化退出码** — DNS、TCP、TLS、超时、4xx、5xx 各有独立退出码，脚本判断更便捷
 - **极小体积** — release 构建采用 LTO + `opt-level=z` + strip，通常 < 5 MB
 - **真正的零系统依赖** — 静态链接，不依赖 libcurl、OpenSSL 或 libc（musl 构建），可直接放入 `scratch` 或 `alpine` Docker 镜像用于生产环境排查
@@ -163,6 +163,9 @@ httpstat --dns-servers=google-dot https://example.com
 # 其他 DoH 或 DoT 解析服务器
 httpstat --dns-servers=https://dns.example.com/dns-query https://example.com
 httpstat --dns-servers=tls://dns.example.com https://example.com
+
+# 用固定地址连接该解析服务器，不再解析它的域名
+httpstat --dns-servers=https://dns.example.com/dns-query --connect-to dns.example.com:443:192.0.2.1:443 https://example.com
 
 # JSON 响应格式化输出
 httpstat --pretty https://httpbin.org/get

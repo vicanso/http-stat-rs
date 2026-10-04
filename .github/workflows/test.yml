@@ -7,7 +7,8 @@ on:
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
   CARGO_TERM_COLOR: always
-  # Keep in sync with publish.yml: the musl build below uses the same image.
+  # Keep in sync with publish.yml: the release builds below use the same
+  # toolchain and musl image.
   RUST_TOOLCHAIN: 1.98.1
 
 jobs:
@@ -74,6 +75,25 @@ jobs:
 
   # The release builds from publish.yml, so that a tag is not the first time
   # they run.
+  macos-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: |
+          rustup update
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+      - name: release
+        run: |
+          cargo build --release --target=aarch64-apple-darwin
+          cargo build --release --target=x86_64-apple-darwin
+          ls -lh target/*/release/httpstat
+          target/aarch64-apple-darwin/release/httpstat --version
+
   linux-musl:
     runs-on: ${{ matrix.runner }}
     strategy:
