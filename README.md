@@ -94,12 +94,14 @@ Every HTTP request goes through up to six sequential phases. httpstat measures e
 |---|---|
 | DNS Lookup | Time to resolve the hostname to an IP address |
 | TCP Connect | Time for the 3-way TCP handshake |
-| TLS Handshake | Time to negotiate the TLS session (HTTPS/HTTP2/HTTP3 only) |
+| TLS Handshake | Time to negotiate the TLS session (HTTPS only) |
 | Request Send | Time to write request headers and body to the transport — matters for POST/PUT uploads |
 | Server Processing | Time from the last request byte sent to the first response byte received — pure server latency |
 | Content Transfer | Time to download the complete response body |
 
 > For HTTP/3, **QUIC Connect** replaces both TCP Connect and TLS Handshake (QUIC combines transport and crypto in a single handshake).
+
+> With DoH or DoT, **DNS Lookup** is shown as **DNS Connect** (TCP + TLS to the resolver) and **DNS Query**.
 
 If the server emits a `Server-Timing` response header, httpstat parses it and displays the server-reported sub-phases right above the timeline — useful for splitting a slow Server Processing into CDN edge / origin / worker components without leaving the terminal.
 
@@ -115,6 +117,9 @@ httpstat --http3 --compressed https://cloudflare-quic.com/
 # Auto-upgrade to HTTP/3 when the server advertises it via Alt-Svc
 httpstat --alt-svc https://cloudflare.com
 
+# International domain name — the host is sent as Punycode
+httpstat https://münchen.de/
+
 # Test multiple IPs concurrently in silent mode
 httpstat --resolve=183.240.99.169,2409:8c54:870:310:0:ff:b0ed:40ac -s https://www.baidu.com/
 
@@ -129,6 +134,12 @@ httpstat grpc://localhost:50051
 
 # gRPC health check for one service
 httpstat 'grpc://localhost:50051/?service=my.pkg.Service'
+
+# gRPC raw unary call — -d is the protobuf message
+httpstat -d @request.bin grpcs://api.example.com/my.pkg.Service/Method
+
+# gRPC over one reused connection
+httpstat -n 10 -K grpc://localhost:50051
 
 # Verbose mode — full cert chain + request headers
 httpstat -v https://github.com

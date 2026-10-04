@@ -92,12 +92,14 @@ cargo install http-stat
 |---|---|
 | DNS 解析 | 将域名解析为 IP 地址所花费的时间 |
 | TCP 连接 | 完成三次握手建立 TCP 连接的时间 |
-| TLS 握手 | 协商 TLS 会话的时间（仅 HTTPS/HTTP2/HTTP3） |
+| TLS 握手 | 协商 TLS 会话的时间（仅 HTTPS） |
 | 请求发送 | 将请求头与请求体写入传输层的时间——POST/PUT 上传大 body 时尤其重要 |
 | 服务端处理 | 从发出最后一个请求字节到收到第一个响应字节的时间——纯服务器延迟 |
 | 内容传输 | 下载完整响应正文的时间 |
 
 > HTTP/3 中，**QUIC 连接**阶段取代了 TCP 连接和 TLS 握手（QUIC 将传输层与加密握手合并为一步完成）。
+
+> 使用 DoH 或 DoT 时，**DNS 解析**会显示为 **DNS 连接**（到解析服务器的 TCP + TLS）和 **DNS 查询**两个阶段。
 
 如果服务器返回了 `Server-Timing` 响应头，httpstat 会自动解析并在时间线之上展示服务端报告的子阶段耗时——可以在终端里直接把一段慢 "服务端处理" 拆成 CDN edge / origin / worker 等具体来源。
 
@@ -113,6 +115,9 @@ httpstat --http3 --compressed https://cloudflare-quic.com/
 # 当服务器通过 Alt-Svc 广告 HTTP/3 时自动升级
 httpstat --alt-svc https://cloudflare.com
 
+# 国际化域名 — 主机名会以 Punycode 形式发出
+httpstat https://münchen.de/
+
 # 多 IP 并发测试，静默模式
 httpstat --resolve=183.240.99.169,2409:8c54:870:310:0:ff:b0ed:40ac -s https://www.baidu.com/
 
@@ -127,6 +132,12 @@ httpstat grpc://localhost:50051
 
 # 只检查某一个 gRPC 服务
 httpstat 'grpc://localhost:50051/?service=my.pkg.Service'
+
+# gRPC 原始 unary 调用 — -d 是 protobuf 消息
+httpstat -d @request.bin grpcs://api.example.com/my.pkg.Service/Method
+
+# 在同一条连接上复用 gRPC 请求
+httpstat -n 10 -K grpc://localhost:50051
 
 # 详细模式 — 展示完整证书链和请求头
 httpstat -v https://github.com
