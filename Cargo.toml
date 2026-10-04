@@ -25,7 +25,9 @@ default = ["doh"]
 # (`--dns-servers=cloudflare-doh`, `--dns-servers=cloudflare-dot`, etc.).
 # Default-on so the `httpstat` binary ships with full DoH/DoT support;
 # library consumers can drop it via `default-features = false`.
-doh = ["hickory-resolver/https-ring", "hickory-resolver/tls-ring"]
+# The DoH/DoT exchange is implemented in `src/net.rs`, so this does not
+# enable hickory's own TLS/HTTPS transports.
+doh = []
 
 [dependencies]
 brotli-decompressor = "6.0.1"
@@ -40,7 +42,6 @@ heck = "0.5.0"
 hickory-resolver = { version = "0.26.3", default-features = false, features = [
     "system-config",
     "tokio",
-    "webpki-roots",
 ] }
 http = "1.5.0"
 http-body = "1.1.0"
@@ -67,15 +68,10 @@ time = { version = "0.3.55", default-features = false, features = [
     "parsing",
     "local-offset",
 ] }
-tokio = { version = "1.53.1", features = ["rt", "net", "fs"] }
+tokio = { version = "1.53.2", features = ["rt", "net", "fs"] }
 tokio-rustls = { version = "0.26.6", features = [
     "ring",
 ], default-features = false }
-tonic = { version = "0.14.6", features = [
-    "transport",
-], default-features = false }
-tonic-health = "0.14.6"
-tower-service = "0.3.3"
 unicode-truncate = "3.0.0"
 x509-parser = "0.18.1"
 zstd = { version = "0.14.0", default-features = false }
@@ -101,9 +97,6 @@ incremental = false
 opt-level = 3
 
 [profile.release.package.zstd]
-opt-level = 3
-
-[profile.release.package.rustls]
 opt-level = 3
 
 [profile.release.package.httparse]

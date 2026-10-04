@@ -101,6 +101,15 @@ impl AsyncWrite for BoxedIo {
     }
 }
 
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+/// The stream hyper drives: cleartext, or TLS to the origin. Erased to one
+/// type so the HTTP/1.1 and HTTP/2 client stacks are compiled once rather
+/// than once per transport.
+type OriginIo = Box<dyn Io>;
+
 /// Request body that records the `Instant` at which hyper finished consuming it.
 pub(crate) struct TrackedBody {
     data: Option<Bytes>,
@@ -319,17 +328,14 @@ fn ensure_crypto_provider() {
     });
 }
 
-async fn send_http1_request<S>(
+async fn send_http1_request(
     req: Request<TrackedBody>,
     done: Arc<OnceLock<Instant>>,
-    stream: S,
+    stream: OriginIo,
     request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
-) -> Result<Response<Incoming>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
         hyper::client::conn::http1::handshake(TokioIo::new(stream)),
@@ -356,17 +362,14 @@ where
     Ok(resp)
 }
 
-async fn send_http2_request<S>(
+async fn send_http2_request(
     req: Request<TrackedBody>,
     done: Arc<OnceLock<Instant>>,
-    stream: S,
+    stream: OriginIo,
     request_timeout: Option<Duration>,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
-) -> Result<Response<Incoming>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
         request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
@@ -734,7 +737,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             match send_http2_request(
                 req,
                 done,
-                tls_stream,
+                Box::new(tls_stream),
                 http_req.request_timeout,
                 tx,
                 &mut stat,
@@ -753,7 +756,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             match send_http1_request(
                 req,
                 done,
-                tls_stream,
+                Box::new(tls_stream),
                 http_req.request_timeout,
                 tx,
                 &mut stat,
@@ -770,7 +773,15 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             Err(e) => return finish_with_error(stat, e, start),
         };
         stat.request_headers = req.headers().clone();
-        match send_http2_request(req, done, ready.io, http_req.request_timeout, tx, &mut stat).await
+        match send_http2_request(
+            req,
+            done,
+            Box::new(ready.io),
+            http_req.request_timeout,
+            tx,
+            &mut stat,
+        )
+        .await
         {
             Ok(resp) => resp,
             Err(e) => return finish_with_error(stat, e, start),
@@ -781,7 +792,15 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             Err(e) => return finish_with_error(stat, e, start),
         };
         stat.request_headers = req.headers().clone();
-        match send_http1_request(req, done, ready.io, http_req.request_timeout, tx, &mut stat).await
+        match send_http1_request(
+            req,
+            done,
+            Box::new(ready.io),
+            http_req.request_timeout,
+            tx,
+            &mut stat,
+        )
+        .await
         {
             Ok(resp) => resp,
             Err(e) => return finish_with_error(stat, e, start),
@@ -869,16 +888,13 @@ impl HttpConnection {
     }
 }
 
-async fn establish_http1<S>(
-    stream: S,
+async fn establish_http1(
+    stream: OriginIo,
     handshake_timeout: Duration,
     mut stat: HttpStat,
     tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
     start: Instant,
-) -> (HttpStat, Option<HttpConnection>)
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> (HttpStat, Option<HttpConnection>) {
     match timeout(
         handshake_timeout,
         hyper::client::conn::http1::handshake(TokioIo::new(stream)),
@@ -913,16 +929,13 @@ where
     }
 }
 
-async fn establish_http2<S>(
-    stream: S,
+async fn establish_http2(
+    stream: OriginIo,
     handshake_timeout: Duration,
     mut stat: HttpStat,
     tcp_probe: Option<crate::tcp_info::TcpInfoProbe>,
     start: Instant,
-) -> (HttpStat, Option<HttpConnection>)
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> (HttpStat, Option<HttpConnection>) {
     match timeout(
         handshake_timeout,
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
@@ -1034,14 +1047,42 @@ pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection
                 Err(e) => return (finish_with_error(stat, e, start), None),
             };
         if is_h2 {
-            establish_http2(tls_stream, handshake_timeout, stat, ready.probe, start).await
+            establish_http2(
+                Box::new(tls_stream),
+                handshake_timeout,
+                stat,
+                ready.probe,
+                start,
+            )
+            .await
         } else {
-            establish_http1(tls_stream, handshake_timeout, stat, ready.probe, start).await
+            establish_http1(
+                Box::new(tls_stream),
+                handshake_timeout,
+                stat,
+                ready.probe,
+                start,
+            )
+            .await
         }
     } else if http_req.h2_prior_knowledge {
-        establish_http2(ready.io, handshake_timeout, stat, ready.probe, start).await
+        establish_http2(
+            Box::new(ready.io),
+            handshake_timeout,
+            stat,
+            ready.probe,
+            start,
+        )
+        .await
     } else {
-        establish_http1(ready.io, handshake_timeout, stat, ready.probe, start).await
+        establish_http1(
+            Box::new(ready.io),
+            handshake_timeout,
+            stat,
+            ready.probe,
+            start,
+        )
+        .await
     }
 }
 

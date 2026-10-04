@@ -24,7 +24,6 @@ pub use dns_cache::DnsCache;
 pub use error::{Error, Result};
 pub use http_request::*;
 pub use i18n::Lang;
-pub(crate) use net::*;
 pub use proxy::proxy_bypassed;
 pub use quic_info::{QuicInfo, QuicInfoDelta};
 pub use request::*;

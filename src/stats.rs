@@ -610,6 +610,16 @@ fn apply_jq_filter(body: &str, filter: &str) -> Result<String, String> {
 }
 
 impl HttpStat {
+    /// Protocol shown next to the status. Cleartext HTTP/2 negotiates no
+    /// ALPN, so fall back to the version the response arrived on.
+    fn protocol_label(&self) -> &str {
+        match (self.alpn.as_deref(), self.version.as_deref()) {
+            (Some(alpn), _) => alpn,
+            (None, Some("HTTP/2.0")) => ALPN_HTTP2,
+            _ => ALPN_HTTP1,
+        }
+    }
+
     /// Returns a semantic exit code based on the error type:
     /// - 0: Success
     /// - 1: General/unknown error
@@ -1244,7 +1254,7 @@ impl fmt::Display for HttpStat {
             }
             if self.silent {
                 if let Some(status) = &self.status {
-                    let alpn = self.alpn.as_deref().unwrap_or(ALPN_HTTP1);
+                    let alpn = self.protocol_label();
                     let status_code = status.as_u16();
                     let status = if status_code < 400 {
                         LightGreen.paint(status.to_string())
@@ -1301,7 +1311,7 @@ impl fmt::Display for HttpStat {
         }
 
         if let Some(status) = &self.status {
-            let alpn = self.alpn.as_deref().unwrap_or(ALPN_HTTP1);
+            let alpn = self.protocol_label();
             let status_code = status.as_u16();
             let status = if status_code < 400 {
                 LightGreen.paint(status.to_string())
@@ -2448,6 +2458,24 @@ mod tests {
         };
         assert!(!bad.is_success());
         assert_eq!(bad.exit_code(), 1);
+    }
+
+    #[test]
+    fn protocol_label_falls_back_to_response_version() {
+        let label = |alpn: Option<&str>, version: Option<&str>| {
+            HttpStat {
+                alpn: alpn.map(String::from),
+                version: version.map(String::from),
+                ..Default::default()
+            }
+            .protocol_label()
+            .to_string()
+        };
+        assert_eq!(label(Some("h3"), Some("HTTP/3.0")), "h3");
+        // h2c prior knowledge: no ALPN, HTTP/2 on the wire.
+        assert_eq!(label(None, Some("HTTP/2.0")), "h2");
+        assert_eq!(label(None, Some("HTTP/1.1")), "http/1.1");
+        assert_eq!(label(None, None), "http/1.1");
     }
 
     // ---- throughput / dns_query ----

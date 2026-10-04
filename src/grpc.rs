@@ -15,158 +15,12 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
-use crate::{
-    dns_resolve, finish_with_error, tcp_connect, tls_handshake, Error, HttpRequest, HttpStat,
-    ALPN_HTTP2,
-};
+use crate::{HttpRequest, HttpStat, ALPN_HTTP2};
 use bytes::{Bytes, BytesMut};
 use http::header::{HeaderMap, HeaderValue};
-use http::uri::Uri;
-use hyper_util::rt::TokioIo;
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio_rustls::client::TlsStream;
-use tonic_health::pb::health_client::HealthClient;
-use tonic_health::{pb::HealthCheckRequest, ServingStatus};
-use tower_service::Service;
+use http::uri::{PathAndQuery, Uri};
 
-// Version information from Cargo.toml
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Transport handed to tonic: plain TCP for `grpc://`, rustls-wrapped TCP
-/// for `grpcs://`.
-pub(crate) enum GrpcStream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
-}
-
-impl AsyncRead for GrpcStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            GrpcStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for GrpcStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            GrpcStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            GrpcStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            GrpcStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            GrpcStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
-
-struct CustomHttpConnector {
-    http_req: HttpRequest,
-    stat: Arc<Mutex<HttpStat>>,
-}
-
-impl Service<Uri> for CustomHttpConnector {
-    type Response = TokioIo<GrpcStream>;
-    type Error = Error;
-    type Future = ConnectorConnecting;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: Uri) -> Self::Future {
-        let http_req = self.http_req.clone();
-        let stat = Arc::clone(&self.stat);
-        let fut = async move {
-            let mut stat = stat.lock().await;
-            let resolved = dns_resolve(&http_req, &mut stat).await?;
-            // gRPC uses tonic's high-level client; we can't reliably sample
-            // post-transfer TCP_INFO, so drop the probe. The post-connect
-            // baseline is already populated by tcp_connect.
-            let (tcp_stream, _tcp_probe, winner) = tcp_connect(
-                resolved.addrs,
-                http_req.tcp_timeout,
-                http_req.bind_addr,
-                &mut stat,
-            )
-            .await?;
-            http_req.note_dns_winner(&resolved.cache_host, resolved.cache_port, winner);
-            // grpcs:// = gRPC over TLS: run the rustls handshake (honoring
-            // --skip-verify and mTLS) with h2 as the only ALPN offer, since
-            // gRPC requires HTTP/2.
-            if http_req.uri.scheme_str() == Some("grpcs") {
-                let mut tls_req = http_req.clone();
-                tls_req.alpn_protocols = vec![ALPN_HTTP2.to_string()];
-                let (tls_stream, _) =
-                    tls_handshake(resolved.host, tcp_stream, &tls_req, &mut stat).await?;
-                Ok(TokioIo::new(GrpcStream::Tls(Box::new(tls_stream))))
-            } else {
-                Ok(TokioIo::new(GrpcStream::Plain(tcp_stream)))
-            }
-        };
-        ConnectorConnecting {
-            inner: Box::pin(fut),
-        }
-    }
-}
-
-type ConnectResult = Result<TokioIo<GrpcStream>, Error>;
-
-pub(crate) struct ConnectorConnecting {
-    inner: Pin<Box<dyn Future<Output = ConnectResult> + Send>>,
-}
-
-impl Future for ConnectorConnecting {
-    type Output = ConnectResult;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().inner.as_mut().poll(cx)
-    }
-}
-
-/// The `:scheme` pseudo-header tonic sends comes from the endpoint URI.
-/// `grpc`/`grpcs` are not valid HTTP schemes and strict servers reset the
-/// stream with PROTOCOL_ERROR, so normalize to `http`/`https` here; the
-/// connector keeps looking at the original request URI for TLS routing.
-fn endpoint_uri(uri: &Uri) -> Uri {
-    let mut parts = uri.clone().into_parts();
-    parts.scheme = Some(if uri.scheme_str() == Some("grpcs") {
-        http::uri::Scheme::HTTPS
-    } else {
-        http::uri::Scheme::HTTP
-    });
-    if parts.path_and_query.is_none() {
-        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
-    }
-    Uri::from_parts(parts).unwrap_or_else(|_| uri.clone())
-}
+const HEALTH_CHECK_PATH: &str = "/grpc.health.v1.Health/Check";
 
 fn is_health_path(path: &str) -> bool {
     path.is_empty() || path == "/" || path.contains("grpc.health.v1.Health/Check")
@@ -206,16 +60,17 @@ fn unframe_grpc(bytes: &[u8]) -> Option<Bytes> {
     Some(out.freeze())
 }
 
-fn apply_grpc_status(stat: &mut HttpStat) {
-    stat.grpc_status = stat
-        .trailers
+/// A gRPC trailer such as `grpc-status`. A Trailers-Only response carries
+/// it in the headers instead.
+fn grpc_trailer(stat: &HttpStat, name: &str) -> Option<String> {
+    stat.trailers
         .as_ref()
-        .and_then(|h| header_value(h, "grpc-status"))
-        .or_else(|| {
-            stat.headers
-                .as_ref()
-                .and_then(|h| header_value(h, "grpc-status"))
-        });
+        .and_then(|h| header_value(h, name))
+        .or_else(|| stat.headers.as_ref().and_then(|h| header_value(h, name)))
+}
+
+fn apply_grpc_status(stat: &mut HttpStat) {
+    stat.grpc_status = grpc_trailer(stat, "grpc-status");
 }
 
 /// Raw unary RPC. The scheme is rewritten before `request()` so this does not
@@ -273,62 +128,223 @@ pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
     health_request(http_req).await
 }
 
-async fn health_request(http_req: HttpRequest) -> HttpStat {
-    let start = Instant::now();
-    let stat = Arc::new(Mutex::new(HttpStat {
-        is_grpc: true,
-        ..Default::default()
-    }));
-    let endpoint = tonic::transport::Endpoint::from(endpoint_uri(&http_req.uri));
-    let endpoint = match endpoint.user_agent(format!("httpstat.rs/{VERSION}")) {
-        Ok(endpoint) => endpoint,
-        Err(e) => {
-            let stat = stat.lock().await;
-            return finish_with_error(stat.clone(), e, start);
+fn read_varint(buf: &mut &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = buf.split_first()?;
+        *buf = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
         }
-    };
+    }
+    None
+}
 
-    let conn = match endpoint
-        .connect_with_connector(CustomHttpConnector {
-            http_req,
-            stat: Arc::clone(&stat),
-        })
-        .await
-    {
-        Ok(conn) => conn,
-        Err(e) => {
-            let stat = stat.lock().await;
-            return finish_with_error(stat.clone(), e, start);
+/// `status` (field 1) of a `grpc.health.v1.HealthCheckResponse`. Proto3
+/// omits a zero value, so an empty message is `UNKNOWN`. `None` when the
+/// bytes are not a protobuf message.
+fn health_status(mut msg: &[u8]) -> Option<u64> {
+    let mut status = 0;
+    while !msg.is_empty() {
+        let key = read_varint(&mut msg)?;
+        let field = key >> 3;
+        if field == 0 {
+            return None;
         }
-    };
-    let mut client = HealthClient::new(conn);
-    let server_processing_start = Instant::now();
-    let resp = match client.check(HealthCheckRequest::default()).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            let stat = stat.lock().await;
-            return finish_with_error(stat.clone(), e, start);
+        match key & 7 {
+            0 => {
+                let value = read_varint(&mut msg)?;
+                if field == 1 {
+                    status = value;
+                }
+            }
+            1 => msg = msg.get(8..)?,
+            2 => {
+                let len = usize::try_from(read_varint(&mut msg)?).ok()?;
+                msg = msg.get(len..)?;
+            }
+            5 => msg = msg.get(4..)?,
+            _ => return None,
         }
-    };
+    }
+    Some(status)
+}
 
-    let mut stat = {
-        let mut guard = stat.lock().await;
-        guard.server_processing = Some(server_processing_start.elapsed());
-        guard.clone()
+/// `grpc.health.v1.HealthCheckResponse.ServingStatus.SERVING`.
+const SERVING: u64 = 1;
+
+fn serving_status_name(status: u64) -> String {
+    match status {
+        0 => "Unknown".to_string(),
+        SERVING => "Serving".to_string(),
+        2 => "NotServing".to_string(),
+        3 => "ServiceUnknown".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn grpc_code_name(code: &str) -> Option<&'static str> {
+    const NAMES: [&str; 17] = [
+        "OK",
+        "CANCELLED",
+        "UNKNOWN",
+        "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED",
+        "NOT_FOUND",
+        "ALREADY_EXISTS",
+        "PERMISSION_DENIED",
+        "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION",
+        "ABORTED",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DATA_LOSS",
+        "UNAUTHENTICATED",
+    ];
+    NAMES.get(code.parse::<usize>().ok()?).copied()
+}
+
+/// Why a health check RPC that got an HTTP response still failed, or `None`
+/// when `grpc-status` is `0`.
+fn health_rpc_error(stat: &HttpStat) -> Option<String> {
+    let Some(code) = stat.grpc_status.as_deref() else {
+        let status = stat.status.map(|s| s.as_u16()).unwrap_or_default();
+        return Some(format!("grpc-status missing (HTTP {status})"));
     };
-    if resp.get_ref().status() != ServingStatus::Serving.into() {
-        return finish_with_error(stat, "service not serving", start);
+    if code == "0" {
+        return None;
     }
-    let (meta, message, _) = resp.into_parts();
-    if let Some(grpc_status) = meta.get("grpc-status") {
-        stat.grpc_status = Some(grpc_status.to_str().unwrap_or_default().to_string());
+    let mut error = format!("grpc-status {code}");
+    if let Some(name) = grpc_code_name(code) {
+        error.push_str(&format!(" ({name})"));
     }
-    // tonic omits grpc-status on a successful Check. Success requires "0".
-    if stat.grpc_status.is_none() {
-        stat.grpc_status = Some("0".to_string());
+    if let Some(message) = grpc_trailer(stat, "grpc-message").filter(|m| !m.is_empty()) {
+        error.push_str(&format!(": {message}"));
     }
-    stat.headers = Some(meta.into_headers());
-    stat.body = Some(format!("{message:?}").into());
-    stat.total = Some(start.elapsed());
+    Some(error)
+}
+
+/// `grpc.health.v1.Health/Check` for the server as a whole. It is sent as a
+/// raw unary RPC, so it shares the HTTP/2 path and its timings.
+async fn health_request(mut http_req: HttpRequest) -> HttpStat {
+    let mut parts = http_req.uri.clone().into_parts();
+    parts.path_and_query = Some(PathAndQuery::from_static(HEALTH_CHECK_PATH));
+    http_req.uri = Uri::from_parts(parts).unwrap_or(http_req.uri);
+    // An empty HealthCheckRequest names no service.
+    http_req.body = None;
+    // The verdict is in the response message, so it has to stay in memory.
+    http_req.discard_body = false;
+    http_req.output_path = None;
+    // The check dials the target directly.
+    http_req.proxy = None;
+
+    let mut stat = raw_unary(http_req).await;
+    // One metadata block, so `grpc-status` stays readable from the headers.
+    if let Some(trailers) = stat.trailers.take() {
+        stat.headers
+            .get_or_insert_with(HeaderMap::new)
+            .extend(trailers);
+    }
+    if stat.error.is_some() {
+        return stat;
+    }
+    if let Some(error) = health_rpc_error(&stat) {
+        stat.error = Some(error);
+        return stat;
+    }
+    let Some(status) = stat.body.as_deref().and_then(health_status) else {
+        stat.error = Some("invalid health check response".to_string());
+        return stat;
+    };
+    stat.body = Some(
+        format!(
+            "HealthCheckResponse {{ status: {} }}",
+            serving_status_name(status)
+        )
+        .into(),
+    );
+    if status != SERVING {
+        stat.error = Some("service not serving".to_string());
+    }
     stat
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_status_reads_field_one() {
+        // Proto3 leaves out a zero value.
+        assert_eq!(health_status(&[]), Some(0));
+        assert_eq!(health_status(&[0x08, 0x01]), Some(1));
+        assert_eq!(health_status(&[0x08, 0x02]), Some(2));
+        assert_eq!(health_status(&[0x08, 0x81, 0x01]), Some(129));
+    }
+
+    #[test]
+    fn health_status_skips_unknown_fields() {
+        // field 2 (bytes), field 3 (fixed32), field 4 (fixed64), then status.
+        let msg = [
+            0x12, 0x02, b'h', b'i', 0x1d, 1, 2, 3, 4, 0x21, 1, 2, 3, 4, 5, 6, 7, 8, 0x08, 0x01,
+        ];
+        assert_eq!(health_status(&msg), Some(1));
+    }
+
+    #[test]
+    fn health_status_rejects_malformed_messages() {
+        // Truncated varint, length past the end, and an unsupported wire type.
+        assert_eq!(health_status(&[0x08]), None);
+        assert_eq!(health_status(&[0x08, 0x80]), None);
+        assert_eq!(health_status(&[0x12, 0x05, b'h']), None);
+        assert_eq!(health_status(&[0x0b]), None);
+        assert_eq!(health_status(&[0x08; 12].map(|b| b | 0x80)), None);
+        // A gRPC frame that was not unframed (compressed or truncated) starts
+        // with a flag byte, which decodes as field number 0.
+        assert_eq!(health_status(&[0, 0, 0, 0, 2, 0x08, 0x01]), None);
+        assert_eq!(health_status(&[1, 0, 0, 0, 2, 0x08, 0x01]), None);
+    }
+
+    #[test]
+    fn serving_status_names_match_the_proto_enum() {
+        assert_eq!(serving_status_name(0), "Unknown");
+        assert_eq!(serving_status_name(1), "Serving");
+        assert_eq!(serving_status_name(2), "NotServing");
+        assert_eq!(serving_status_name(3), "ServiceUnknown");
+        assert_eq!(serving_status_name(7), "7");
+    }
+
+    #[test]
+    fn health_rpc_error_explains_the_status() {
+        let stat = |code: Option<&str>| HttpStat {
+            status: Some(http::StatusCode::OK),
+            grpc_status: code.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(health_rpc_error(&stat(Some("0"))), None);
+        assert_eq!(
+            health_rpc_error(&stat(Some("12"))).as_deref(),
+            Some("grpc-status 12 (UNIMPLEMENTED)")
+        );
+        assert_eq!(
+            health_rpc_error(&stat(Some("99"))).as_deref(),
+            Some("grpc-status 99")
+        );
+        assert_eq!(
+            health_rpc_error(&stat(None)).as_deref(),
+            Some("grpc-status missing (HTTP 200)")
+        );
+
+        let mut with_message = stat(Some("5"));
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-message", HeaderValue::from_static("no such service"));
+        with_message.trailers = Some(trailers);
+        assert_eq!(
+            health_rpc_error(&with_message).as_deref(),
+            Some("grpc-status 5 (NOT_FOUND): no such service")
+        );
+    }
 }

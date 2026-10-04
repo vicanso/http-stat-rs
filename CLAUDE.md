@@ -27,7 +27,7 @@ The library (`src/lib.rs`) exposes the public API through re-exports:
 - **`net`** (crate-internal) - Network primitives: `dns_resolve`, `tcp_connect`, `tls_handshake`, `quic_connect`. Uses `hickory-resolver` for DNS, `tokio-rustls` for TLS, `quinn`/`h3-quinn` for QUIC.
 - **`error`** - Error types using `snafu`. All network/protocol errors unified under `Error` enum.
 - **`decompress`** - Handles gzip, brotli, and zstd decompression.
-- **`grpc`** - gRPC health check support via `tonic`.
+- **`grpc`** - gRPC without a gRPC library: raw unary RPCs over the HTTP/2 path, and `grpc.health.v1.Health/Check` built on it with a hand-decoded response.
 - **`skip_verifier`** - Custom TLS certificate verifier for `-k` flag.
 
 ## Key Design Details
