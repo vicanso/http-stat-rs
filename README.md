@@ -55,20 +55,6 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 curl -fsSL https://raw.githubusercontent.com/vicanso/http-stat-rs/main/install.sh | sh
 ```
 
-### Pre-built binaries
-
-[Pre-built binaries](https://github.com/vicanso/http-stat-rs/releases) for Windows, macOS and Linux.
-
-```bash
-# Linux
-curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/httpstat-linux-musl-$(uname -m).tar.gz | tar -xzf -
-sudo mv httpstat /usr/local/bin/
-
-# macOS
-curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/httpstat-darwin-$(uname -m).tar.gz | tar -xzf -
-sudo mv httpstat /usr/local/bin/
-```
-
 ### From source
 
 ```bash
