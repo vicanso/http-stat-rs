@@ -13,13 +13,13 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        toolchain: [1.88.0, 1.89.0, stable]
+        toolchain: [1.89.0, stable]
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
         run: |
           sudo apt update
-          sudo apt install -y cmake libclang-dev wget gnupg ca-certificates lsb-release --no-install-recommends 
+          sudo apt install -y cmake libclang-dev wget gnupg ca-certificates lsb-release --no-install-recommends
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
         with:
