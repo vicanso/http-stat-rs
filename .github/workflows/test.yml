@@ -7,6 +7,8 @@ on:
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
   CARGO_TERM_COLOR: always
+  # Keep in sync with publish.yml: the musl build below uses the same image.
+  RUST_TOOLCHAIN: 1.98.1
 
 jobs:
   linux:
@@ -36,8 +38,11 @@ jobs:
         run: |
           cargo install cargo-machete@0.7.0
           cargo machete
-      # - name: Run cargo test
-      #   run: make test
+      - name: Run cargo test
+        run: make test
+      - name: Run cargo test without default features
+        if: matrix.toolchain == 'stable'
+        run: cargo test --no-default-features
       - name: Run cargo msrv
         if: matrix.toolchain == 'stable'
         run: |
@@ -57,3 +62,49 @@ jobs:
           curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
           ./upx-5.0.1-amd64_linux/upx target/release/httpstat
           ls -lh target/release/httpstat
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo test
+        run: make test
+
+  # The release builds from publish.yml, so that a tag is not the first time
+  # they run.
+  linux-musl:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: release
+        uses: addnab/docker-run-action@v3
+        with:
+          image: clux/muslrust:${{ env.RUST_TOOLCHAIN }}-stable
+          options: -v ${{ github.workspace }}:/volume
+          run: |
+            make release
+            ls -lh target/${{ matrix.target }}/release/httpstat
+            target/${{ matrix.target }}/release/httpstat --version
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: disable git eol translation
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo release
+        shell: bash
+        run: |
+          cargo build --release
+          ./target/release/httpstat.exe --version

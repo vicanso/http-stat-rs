@@ -84,6 +84,16 @@ zstd = { version = "0.14.0", default-features = false }
 mimalloc = "0.1.52"
 
 
+# Only the end-to-end tests in `tests/` use these: local servers to point the
+# binary at, and a throwaway CA for them.
+[dev-dependencies]
+hyper = { version = "1.11.1", features = ["server"] }
+hyper-util = { version = "0.1.21", features = ["server-auto"] }
+rcgen = "0.14.10"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "io-util", "time"] }
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+tonic-health = "0.14.6"
+
 [profile.release]
 codegen-units = 1
 opt-level = "z"
