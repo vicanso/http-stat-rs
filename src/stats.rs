@@ -623,6 +623,18 @@ impl HttpStat {
         }
     }
 
+    /// Whether `--include-header` / `--exclude-header` let this header (or
+    /// trailer) through. `name` is lower case, as header names are.
+    fn shows_header(&self, name: &str) -> bool {
+        if let Some(includes) = &self.include_headers {
+            includes.iter().any(|h| h == name)
+        } else if let Some(excludes) = &self.exclude_headers {
+            !excludes.iter().any(|h| h == name)
+        } else {
+            true
+        }
+    }
+
     /// Returns a semantic exit code based on the error type:
     /// - 0: Success
     /// - 1: General/unknown error
@@ -1190,7 +1202,7 @@ impl HttpStat {
         // header appeared more than once, so no value is silently dropped.
         if let Some(headers) = &self.headers {
             let mut hdr_map = Map::new();
-            for key in headers.keys() {
+            for key in headers.keys().filter(|key| self.shows_header(key.as_str())) {
                 let mut values: Vec<Value> = headers
                     .get_all(key)
                     .iter()
@@ -1208,7 +1220,10 @@ impl HttpStat {
 
         if let Some(trailers) = &self.trailers {
             let mut hdr_map = Map::new();
-            for key in trailers.keys() {
+            for key in trailers
+                .keys()
+                .filter(|key| self.shows_header(key.as_str()))
+            {
                 let mut values: Vec<Value> = trailers
                     .get_all(key)
                     .iter()
@@ -1556,15 +1571,7 @@ impl fmt::Display for HttpStat {
 
         let mut is_text = self.body_is_text;
         let mut is_json = false;
-        let show = |name: &str| {
-            if let Some(includes) = &self.include_headers {
-                includes.iter().any(|h| h == name)
-            } else if let Some(excludes) = &self.exclude_headers {
-                !excludes.iter().any(|h| h == name)
-            } else {
-                true
-            }
-        };
+        let show = |name: &str| self.shows_header(name);
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
                 let value = value.to_str().unwrap_or_default();
@@ -2053,8 +2060,16 @@ pub struct BenchmarkSummary {
 }
 
 impl BenchmarkSummary {
+    /// A request that ended in an error has no latency to report: its total
+    /// is how long it took to give up. It is left out of the statistics and
+    /// shows up in the success count instead.
     fn collect_sorted(&self, f: impl Fn(&HttpStat) -> Option<Duration>) -> Vec<Duration> {
-        let mut v: Vec<Duration> = self.stats.iter().filter_map(f).collect();
+        let mut v: Vec<Duration> = self
+            .stats
+            .iter()
+            .filter(|s| s.error.is_none())
+            .filter_map(f)
+            .collect();
         v.sort();
         v
     }
@@ -2107,10 +2122,6 @@ impl fmt::Display for BenchmarkSummary {
             .filter(|(_, v)| !v.is_empty())
             .collect();
 
-        if phases.is_empty() {
-            return Ok(());
-        }
-
         writeln!(f)?;
         writeln!(
             f,
@@ -2122,56 +2133,61 @@ impl fmt::Display for BenchmarkSummary {
         )?;
         writeln!(f)?;
 
-        let col_w = 18;
-        let label_w = 6;
+        // No request got a response: nothing to tabulate, but the success
+        // line below still has to say so.
+        if !phases.is_empty() {
+            let col_w = 18;
+            let label_w = 6;
 
-        // Header row
-        write!(f, "{:>label_w$} ", "")?;
-        for (name, _) in &phases {
-            write!(f, "{}", name.unicode_pad(col_w, Alignment::Center, true))?;
-        }
-        writeln!(f)?;
-
-        // Stats rows — p50/p95/p99 are standard percentile notation, kept
-        // as-is across locales. Only min/max/avg get translated.
-        let rows: [(&str, f64); 6] = [
-            (strs.min, 0.0),
-            (strs.max, f64::INFINITY),
-            (strs.avg, f64::NAN),
-            ("p50", 0.5),
-            ("p95", 0.95),
-            ("p99", 0.99),
-        ];
-
-        for (label, p) in &rows {
-            write!(f, "{} ", LightGreen.paint(format!("{label:>label_w$}")))?;
-            for (_, sorted) in &phases {
-                let val = if p.is_nan() {
-                    // avg
-                    if sorted.is_empty() {
-                        None
-                    } else {
-                        let sum: Duration = sorted.iter().sum();
-                        Some(sum / sorted.len() as u32)
-                    }
-                } else if *p == 0.0 {
-                    sorted.first().copied()
-                } else if p.is_infinite() {
-                    sorted.last().copied()
-                } else {
-                    Self::percentile(sorted, *p)
-                };
-                let text = match val {
-                    Some(d) => format_duration(d),
-                    None => "-".to_string(),
-                };
-                write!(
-                    f,
-                    "{}",
-                    LightCyan.paint(text.unicode_pad(col_w, Alignment::Center, true).to_string())
-                )?;
+            // Header row
+            write!(f, "{:>label_w$} ", "")?;
+            for (name, _) in &phases {
+                write!(f, "{}", name.unicode_pad(col_w, Alignment::Center, true))?;
             }
             writeln!(f)?;
+
+            // Stats rows — p50/p95/p99 are standard percentile notation, kept
+            // as-is across locales. Only min/max/avg get translated.
+            let rows: [(&str, f64); 6] = [
+                (strs.min, 0.0),
+                (strs.max, f64::INFINITY),
+                (strs.avg, f64::NAN),
+                ("p50", 0.5),
+                ("p95", 0.95),
+                ("p99", 0.99),
+            ];
+
+            for (label, p) in &rows {
+                write!(f, "{} ", LightGreen.paint(format!("{label:>label_w$}")))?;
+                for (_, sorted) in &phases {
+                    let val = if p.is_nan() {
+                        // avg
+                        if sorted.is_empty() {
+                            None
+                        } else {
+                            let sum: Duration = sorted.iter().sum();
+                            Some(sum / sorted.len() as u32)
+                        }
+                    } else if *p == 0.0 {
+                        sorted.first().copied()
+                    } else if p.is_infinite() {
+                        sorted.last().copied()
+                    } else {
+                        Self::percentile(sorted, *p)
+                    };
+                    let text = match val {
+                        Some(d) => format_duration(d),
+                        None => "-".to_string(),
+                    };
+                    write!(
+                        f,
+                        "{}",
+                        LightCyan
+                            .paint(text.unicode_pad(col_w, Alignment::Center, true).to_string())
+                    )?;
+                }
+                writeln!(f)?;
+            }
         }
 
         // Same floor as the single-request display: a body that arrives in
@@ -2550,6 +2566,73 @@ mod tests {
         };
         assert!(summary(THROUGHPUT_DISPLAY_THRESHOLD).contains("Throughput"));
         assert!(!summary(7).contains("Throughput"));
+    }
+
+    #[test]
+    fn benchmark_summary_times_only_requests_that_got_a_response() {
+        let answered = HttpStat {
+            status: Some(StatusCode::OK),
+            total: Some(Duration::from_millis(20)),
+            ..Default::default()
+        };
+        let gave_up = HttpStat {
+            error: Some("timeout error deadline has elapsed".into()),
+            total: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let summary = BenchmarkSummary {
+            stats: vec![answered.clone(), answered, gave_up.clone()],
+            lang: Lang::En,
+        };
+        // The five seconds spent giving up are not a latency sample.
+        let totals = summary.collect_sorted(|s| s.total);
+        assert_eq!(totals, [Duration::from_millis(20); 2]);
+        assert!(summary.to_string().contains("2/3"));
+
+        // With nothing to tabulate the summary still reports the failures.
+        let all_failed = BenchmarkSummary {
+            stats: vec![gave_up.clone(), gave_up],
+            lang: Lang::En,
+        }
+        .to_string();
+        assert!(all_failed.contains("Benchmark Results"), "{all_failed}");
+        assert!(all_failed.contains("0/2"), "{all_failed}");
+        assert!(!all_failed.contains("p50"), "{all_failed}");
+    }
+
+    #[test]
+    fn json_honours_the_header_filters() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert("set-cookie", HeaderValue::from_static("a=b"));
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let stat = HttpStat {
+            headers: Some(headers),
+            trailers: Some(trailers),
+            ..Default::default()
+        };
+        let names = |stat: &HttpStat, block: &str| -> Vec<String> {
+            stat.to_json()[block]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(names(&stat, "headers"), ["content-type", "set-cookie"]);
+
+        let excluded = HttpStat {
+            exclude_headers: Some(vec!["set-cookie".to_string()]),
+            ..stat.clone()
+        };
+        assert_eq!(names(&excluded, "headers"), ["content-type"]);
+        assert_eq!(names(&excluded, "trailers"), ["grpc-status"]);
+
+        let included = HttpStat {
+            include_headers: Some(vec!["grpc-status".to_string()]),
+            ..stat
+        };
+        assert!(names(&included, "headers").is_empty());
+        assert_eq!(names(&included, "trailers"), ["grpc-status"]);
     }
 
     #[test]

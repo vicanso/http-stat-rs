@@ -15,10 +15,10 @@ Always pass `--json`. The default output is drawn for a terminal: it carries col
 httpstat --json --max-time 30s https://example.com/api | jq '{status, alpn, addr, error, exit_code, timing}'
 ```
 
-- The response headers make the document long, and `--include-header` / `--exclude-header` do not apply to JSON. Project what you need with `jq`, as above.
+- The response headers make the document long. Project what you need with `jq`, as above, or name the headers to keep with `--include-header`.
 - The JSON never contains the body. Add `-o FILE` to keep it; the path comes back as `saved_to`.
-- `--max-time` is the safety net against a server that never answers (with `-n` it applies to each request). When it fires, every phase comes back `null`. `--timeout 5s` limits each phase instead and keeps the ones that finished, so use it to see where a request hangs. With neither flag, DNS, TCP and TLS each give up after 5 s, and QUIC and the response after 30 s.
-- Branch on the exit code, which a single request also reports as `exit_code`. `error` holds the reason in words: quote it to the user rather than matching on it.
+- `--max-time` is the safety net against a server that never answers (with `-n` it applies to each request). On a timeout the phases that finished are still reported, so the first `null` phase is where it hung. `--timeout 5s` limits each phase instead. With neither flag, DNS, TCP and TLS each give up after 5 s, and QUIC and the response after 30 s.
+- Branch on the exit code, which the document also reports as `exit_code`. `error` holds the reason in words: quote it to the user rather than matching on it.
 
 | Code | Meaning | Code | Meaning |
 |---|---|---|---|
@@ -55,9 +55,9 @@ Before drawing a conclusion:
 ## The document changes shape
 
 - One request: an object.
-- `--resolve IP1,IP2`: an array, one object per IP, requested at the same time. `-n` is ignored together with `--resolve`.
-- `-n N`: a summary with `count`, `success`, and `timing.<phase>` holding `min_us`, `avg_us`, `p50_us`, `p95_us`, `p99_us`, `max_us`. Phase names drop the `_us` suffix here (`timing.total.p95_us`).
-  - There is no `exit_code` or `error`: use the process exit code and `success` against `count`. Failed requests are included in the statistics.
+- `--resolve IP1,IP2`: an array, one object per IP, requested at the same time. With `-n` it is one summary per IP, each with its `addr`, run one IP after another.
+- `-n N`: a summary with `count`, `success`, `failed`, `exit_code`, and `timing.<phase>` holding `min_us`, `avg_us`, `p50_us`, `p95_us`, `p99_us`, `max_us`. Phase names drop the `_us` suffix here (`timing.total.p95_us`).
+  - When something failed, `errors` maps each reason to a count. Only requests that got a response are timed.
   - Only the first request looks the name up, so `dns_lookup` is 0 for the rest.
   - With 10 samples p95 and p99 are simply the slowest one. Raise N before quoting a tail.
 - `-n N -K`: the same summary for requests on one reused connection, plus `cold_connect` for the one-off setup. `timing.dns_lookup`, `tcp_connect` and `tls_handshake` are `null` and `timing.total` covers the request alone.
@@ -83,11 +83,11 @@ httpstat --json -k https://expired.badssl.com/ | jq .tls
 # Look for h3 in alt_svc on a normal request first, and keep the probe short
 httpstat --json --timeout 5s --http3 https://example.com/
 
-# Compare the IPs behind one hostname at a glance...
+# Compare the IPs behind one hostname; add -n 20 for a distribution per IP
 httpstat --json --resolve 1.1.1.1,1.0.0.1 https://one.one.one.one/
-# ...or with enough samples, one run per IP; SNI and Host stay as in the URL.
-# The same flag reaches a specific backend or a staging host
-httpstat --json -n 20 --connect-to one.one.one.one:443:1.0.0.1:443 https://one.one.one.one/
+
+# Reach a specific backend or a staging host; SNI and Host stay as in the URL
+httpstat --json --connect-to example.com:443:10.0.0.5:8443 https://example.com/
 
 # Pick the resolver: an IP, a preset (cloudflare, google, quad9, or with -doh / -dot), or a DoH / DoT address
 httpstat --json --dns-servers cloudflare-doh https://example.com/
@@ -110,4 +110,4 @@ httpstat --json 'grpc://localhost:50051/?service=my.pkg.Service'
 
 - Every flag: `httpstat --help`. Every JSON field, including `tcp_info`, `quic_info` and `throughput`: <https://github.com/vicanso/http-stat-rs/blob/main/JSON_SCHEMA.md>.
 - Not installed: ask before installing. `cargo install http-stat`, or `curl -fsSL https://raw.githubusercontent.com/vicanso/http-stat-rs/main/install.sh | sh`.
-- Check `httpstat --version` before relying on a newer feature. DoH / DoT addresses, `?service=` and `request_send_us` over HTTP/1.1 need 0.9.0 or later, and an older version ignores a DoH / DoT address without any error.
+- This page describes 0.9.0; check `httpstat --version`. An older version ignores a DoH / DoT address and `-n` with `--resolve` without any error, loses the phase timings when `--max-time` fires, and has no `failed` / `exit_code` / `errors` in the `-n` summary.

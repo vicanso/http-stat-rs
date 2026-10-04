@@ -154,6 +154,101 @@ fn failures_map_to_their_exit_codes() {
 }
 
 #[test]
+fn max_time_keeps_the_phases_that_finished() {
+    let origin = http_server(None);
+    let run = httpstat(&[
+        "--json",
+        "--max-time",
+        "1s",
+        &format!("http://{origin}/hang"),
+    ]);
+    let stat = run.json();
+    assert_eq!(run.code, 5, "{}", run.stdout);
+    assert!(error_of(&stat).contains("--max-time"), "{}", run.stdout);
+    // The connection was up before the server stopped answering.
+    assert_eq!(stat["addr"], origin.to_string());
+    assert!(is_duration(&stat["timing"]["tcp_connect_us"]));
+    assert!(stat["timing"]["server_processing_us"].is_null());
+}
+
+#[test]
+fn header_filters_apply_to_json() {
+    let origin = http_server(None);
+    let url = format!("http://{origin}/");
+
+    let stat = httpstat(&["--json", "--include-header", "content-type", &url]).json();
+    let names: Vec<&String> = stat["headers"].as_object().unwrap().keys().collect();
+    assert_eq!(names, ["content-type"]);
+
+    let stat = httpstat(&["--json", "--exclude-header", "x-seen-host", &url]).json();
+    let headers = stat["headers"].as_object().unwrap();
+    assert!(!headers.contains_key("x-seen-host"));
+    assert!(headers.contains_key("content-type"));
+}
+
+#[test]
+fn resolve_with_count_repeats_for_each_address() {
+    let origin = http_server(None);
+    let url = format!("http://name.test:{}/", origin.port());
+
+    for extra in [&[][..], &["-K"][..]] {
+        let args = [
+            &["--json", "--resolve", "127.0.0.1,127.0.0.1", "-n", "3"][..],
+            extra,
+            &[url.as_str()][..],
+        ]
+        .concat();
+        let run = httpstat(&args);
+        let summaries = run.json();
+        assert_eq!(run.code, 0, "{}", run.stdout);
+        let summaries = summaries.as_array().expect("one summary per address");
+        assert_eq!(summaries.len(), 2);
+        for summary in summaries {
+            assert_eq!(summary["addr"], origin.to_string());
+            assert_eq!(summary["count"], 3);
+            assert_eq!(summary["success"], 3);
+            assert!(is_duration(&summary["timing"]["total"]["p50_us"]));
+        }
+    }
+}
+
+#[test]
+fn benchmark_summary_reports_failures() {
+    let origin = http_server(None);
+
+    // A response with a failing status is a completed request: it is timed.
+    let run = httpstat(&["--json", "-n", "3", &format!("http://{origin}/status/503")]);
+    let summary = run.json();
+    assert_eq!(run.code, 7, "{}", run.stdout);
+    assert_eq!(summary["count"], 3);
+    assert_eq!(summary["success"], 0);
+    assert_eq!(summary["failed"], 3);
+    assert_eq!(summary["exit_code"], 7);
+    assert_eq!(summary["errors"]["HTTP 503"], 3);
+    assert!(is_duration(&summary["timing"]["total"]["max_us"]));
+
+    // A request that never got a response is counted, but not timed.
+    let run = httpstat(&[
+        "--json",
+        "-n",
+        "2",
+        &format!("http://127.0.0.1:{REFUSED_PORT}/"),
+    ]);
+    let summary = run.json();
+    assert_eq!(run.code, 3, "{}", run.stdout);
+    assert_eq!(summary["failed"], 2);
+    assert_eq!(summary["exit_code"], 3);
+    assert_eq!(summary["errors"].as_object().map(|e| e.len()), Some(1));
+    assert!(summary["timing"]["total"].is_null());
+
+    // Nothing failed: no `errors` block.
+    let summary = httpstat(&["--json", "-n", "2", &format!("http://{origin}/")]).json();
+    assert_eq!(summary["failed"], 0);
+    assert_eq!(summary["exit_code"], 0);
+    assert!(summary.get("errors").is_none());
+}
+
+#[test]
 fn redirects_are_followed_only_with_dash_l() {
     let origin = http_server(None);
     let url = format!("http://{origin}/redirect");
@@ -321,6 +416,8 @@ fn http3_request_and_connection_reuse() {
     assert_eq!(run.code, 0, "{}", run.stdout);
     assert_eq!(stat["status"], 200);
     assert_eq!(stat["alpn"], "h3");
+    // The same spelling as over TCP.
+    assert_eq!(stat["tls"]["version"], "tls v1.3");
     assert_eq!(stat["body_size"], HELLO.len());
     assert!(is_duration(&stat["timing"]["quic_connect_us"]));
     assert!(stat["timing"]["tcp_connect_us"].is_null());

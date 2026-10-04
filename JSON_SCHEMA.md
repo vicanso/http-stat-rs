@@ -358,10 +358,24 @@ rate; otherwise it is bytes/second (not `*_us`) under `bps_total`.
 reuses). Its fields are the one-time connect, including `quic_connect_us`
 for HTTP/3 (`null` when that phase did not run).
 
+`failed` is `count - success`, and `exit_code` is what the process exits
+with: the code of the first request that failed, or `0`. `errors` is present
+only when something failed and maps each reason to how many requests hit it:
+the error text, or `HTTP <status>` / `grpc-status <code>` for a response that
+is not a success. A request that ended in an error is counted there and left
+out of `timing`: only requests that got a response are timed.
+
+With `--resolve`, `-n` runs once per address and the document is an array of
+these summaries, each with an `addr`.
+
 ```jsonc
 {
   "count": 10,
-  "success": 10,
+  "success": 9,
+  "failed": 1,
+  "exit_code": 5,
+  "errors": { "timeout error deadline has elapsed": 1 },
+  "addr": "1.1.1.1:443", /* only with --resolve */
   "timing": {
     "dns_lookup":       { "min_us": 0, "max_us": 0, "avg_us": 0, "p50_us": 0, "p95_us": 0, "p99_us": 0 },
     "tcp_connect":      null,

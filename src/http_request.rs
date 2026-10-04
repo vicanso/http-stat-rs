@@ -37,6 +37,11 @@ use std::time::Instant;
 // Version information from Cargo.toml
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// How long DNS, TCP and TLS may each take when no timeout is given.
+const CONNECT_PHASE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The same for a QUIC handshake and for each wait on the response.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 // Handle request error and update statistics
 pub(crate) fn finish_with_error(
     mut stat: HttpStat,
@@ -168,6 +173,10 @@ pub struct HttpRequest {
     /// Stream the decoded body to this file. Set only when the caller does not
     /// need the bytes in memory (`--jq` / `--pretty` leave it empty).
     pub output_path: Option<PathBuf>,
+    /// The instant the whole request has to be done by (`--max-time`). No
+    /// phase waits past it, so a request that runs out of time still
+    /// reports the phases it finished.
+    pub deadline: Option<Instant>,
     /// Speak HTTP/2 on cleartext TCP (h2c prior knowledge). Set only for a
     /// raw `grpc://` unary call. `--http2` on `http://` stays HTTP/1.1.
     pub h2_prior_knowledge: bool,
@@ -183,6 +192,35 @@ impl HttpRequest {
         };
         self.uri.port_u16().unwrap_or(default_port)
     }
+    /// `timeout` for one phase, cut short so that it ends at `deadline`.
+    pub(crate) fn within_deadline(&self, timeout: Duration) -> Duration {
+        match self.deadline {
+            Some(deadline) => timeout.min(deadline.saturating_duration_since(Instant::now())),
+            None => timeout,
+        }
+    }
+
+    pub(crate) fn dns_limit(&self) -> Duration {
+        self.within_deadline(self.dns_timeout.unwrap_or(CONNECT_PHASE_TIMEOUT))
+    }
+
+    pub(crate) fn tcp_limit(&self) -> Duration {
+        self.within_deadline(self.tcp_timeout.unwrap_or(CONNECT_PHASE_TIMEOUT))
+    }
+
+    pub(crate) fn tls_limit(&self) -> Duration {
+        self.within_deadline(self.tls_timeout.unwrap_or(CONNECT_PHASE_TIMEOUT))
+    }
+
+    pub(crate) fn quic_limit(&self) -> Duration {
+        self.within_deadline(self.quic_timeout.unwrap_or(REQUEST_TIMEOUT))
+    }
+
+    /// For each wait on the response: its headers, then its body.
+    pub(crate) fn request_limit(&self) -> Duration {
+        self.within_deadline(self.request_timeout.unwrap_or(REQUEST_TIMEOUT))
+    }
+
     // Build HTTP request with proper headers
     pub fn builder(&self, is_http1: bool) -> Builder {
         let uri = &self.uri;

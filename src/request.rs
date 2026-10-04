@@ -409,10 +409,8 @@ fn finalize_body(
     }
 }
 
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 fn phase_timeout(req: &HttpRequest) -> Duration {
-    req.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+    req.request_limit()
 }
 
 static INIT: Once = Once::new();
@@ -426,13 +424,13 @@ fn ensure_crypto_provider() {
 async fn send_http1_request(
     req: Request<TrackedBody>,
     stream: OriginIo,
-    request_timeout: Option<Duration>,
+    request_timeout: Duration,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
     let (stream, written) = WriteClock::track(stream);
     let (mut sender, conn) = timeout(
-        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+        request_timeout,
         hyper::client::conn::http1::handshake(TokioIo::new(stream)),
     )
     .await
@@ -446,13 +444,10 @@ async fn send_http1_request(
     });
 
     let send_start = Instant::now();
-    let resp = timeout(
-        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-        sender.send_request(req),
-    )
-    .await
-    .map_err(|e| Error::Timeout { source: e })?
-    .map_err(|e| Error::Hyper { source: e })?;
+    let resp = timeout(request_timeout, sender.send_request(req))
+        .await
+        .map_err(|e| Error::Timeout { source: e })?
+        .map_err(|e| Error::Hyper { source: e })?;
     record_send_split(stat, send_start, Instant::now(), written.last());
     Ok(resp)
 }
@@ -461,12 +456,12 @@ async fn send_http2_request(
     req: Request<TrackedBody>,
     done: Arc<OnceLock<Instant>>,
     stream: OriginIo,
-    request_timeout: Option<Duration>,
+    request_timeout: Duration,
     tx: oneshot::Sender<String>,
     stat: &mut HttpStat,
 ) -> Result<Response<Incoming>> {
     let (mut sender, conn) = timeout(
-        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+        request_timeout,
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
     )
     .await
@@ -484,13 +479,10 @@ async fn send_http2_request(
     req.headers_mut().remove("Host");
 
     let send_start = Instant::now();
-    let resp = timeout(
-        request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-        sender.send_request(req),
-    )
-    .await
-    .map_err(|e| Error::Timeout { source: e })?
-    .map_err(|e| Error::Hyper { source: e })?;
+    let resp = timeout(request_timeout, sender.send_request(req))
+        .await
+        .map_err(|e| Error::Timeout { source: e })?
+        .map_err(|e| Error::Hyper { source: e })?;
     record_send_split(stat, send_start, Instant::now(), done.get().copied());
     Ok(resp)
 }
@@ -596,7 +588,7 @@ async fn tcp_via_proxy(http_req: &HttpRequest, stat: &mut HttpStat) -> Result<Tc
         let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
         let tcp_start = Instant::now();
         let proxy_stream = timeout(
-            http_req.tcp_timeout.unwrap_or(Duration::from_secs(5)),
+            http_req.tcp_limit(),
             tokio::net::TcpStream::connect(&proxy_addr),
         )
         .await
@@ -630,7 +622,7 @@ async fn tcp_via_proxy(http_req: &HttpRequest, stat: &mut HttpStat) -> Result<Tc
                 proxy_stream,
                 vec![b"http/1.1".to_vec()],
                 http_req.skip_verify,
-                http_req.tls_timeout,
+                Some(http_req.tls_limit()),
             )
             .await?;
             let tunneled = http_connect(tls, &target_host, target_port, auth.as_deref()).await?;
@@ -667,7 +659,7 @@ async fn tcp_via_proxy(http_req: &HttpRequest, stat: &mut HttpStat) -> Result<Tc
         let resolved = dns_resolve(http_req, stat).await?;
         let (stream, probe, winner) = tcp_connect(
             resolved.addrs,
-            http_req.tcp_timeout,
+            http_req.tcp_limit(),
             http_req.bind_addr,
             stat,
         )
@@ -838,7 +830,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
                 req,
                 done,
                 Box::new(tls_stream),
-                http_req.request_timeout,
+                phase_timeout(&http_req),
                 tx,
                 &mut stat,
             )
@@ -856,7 +848,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             match send_http1_request(
                 req,
                 Box::new(tls_stream),
-                http_req.request_timeout,
+                phase_timeout(&http_req),
                 tx,
                 &mut stat,
             )
@@ -876,7 +868,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
             req,
             done,
             Box::new(ready.io),
-            http_req.request_timeout,
+            phase_timeout(&http_req),
             tx,
             &mut stat,
         )
@@ -894,7 +886,7 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
         match send_http1_request(
             req,
             Box::new(ready.io),
-            http_req.request_timeout,
+            phase_timeout(&http_req),
             tx,
             &mut stat,
         )

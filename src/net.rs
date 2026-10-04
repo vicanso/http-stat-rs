@@ -421,7 +421,7 @@ pub(crate) async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Resul
         }
     }
 
-    let dns_timeout = req.dns_timeout.unwrap_or(Duration::from_secs(5));
+    let dns_timeout = req.dns_limit();
     let dns_start = Instant::now();
 
     #[cfg(feature = "doh")]
@@ -781,7 +781,7 @@ fn filter_bind(mut addrs: Vec<SocketAddr>, bind_addr: Option<IpAddr>) -> Vec<Soc
 // that won. `stat.tcp_connect` is the wall time of the race.
 pub(crate) async fn tcp_connect(
     addrs: Vec<SocketAddr>,
-    tcp_timeout: Option<Duration>,
+    tcp_timeout: Duration,
     bind_addr: Option<IpAddr>,
     stat: &mut HttpStat,
 ) -> Result<(TcpStream, Option<TcpInfoProbe>, SocketAddr)> {
@@ -793,10 +793,9 @@ pub(crate) async fn tcp_connect(
         });
     }
     let tcp_start = Instant::now();
-    let overall = tcp_timeout.unwrap_or(Duration::from_secs(5));
     // One outer timeout. Per-attempt timers would be shorter than the 250 ms
     // stagger and would retire a candidate before the next one starts.
-    let (winner, tcp_stream) = timeout(overall, race_tcp_inner(addrs, bind_addr))
+    let (winner, tcp_stream) = timeout(tcp_timeout, race_tcp_inner(addrs, bind_addr))
         .await
         .map_err(|e| Error::Timeout { source: e })?
         .map_err(|e| Error::Io { source: e })?;
@@ -969,7 +968,7 @@ where
 
     let connector = TlsConnector::from(Arc::new(config));
     let tls_stream = timeout(
-        http_req.tls_timeout.unwrap_or(Duration::from_secs(5)),
+        http_req.tls_limit(),
         connector.connect(
             host.clone()
                 .try_into()
@@ -1196,7 +1195,7 @@ pub(crate) async fn quic_connect(
     // of the connection.
     let roots = root_store();
     let quic_start = Instant::now();
-    let overall = http_req.quic_timeout.unwrap_or(Duration::from_secs(30));
+    let overall = http_req.quic_limit();
     let addrs = filter_bind(addrs, http_req.bind_addr);
     if addrs.is_empty() {
         return Err(Error::Common {
@@ -1205,7 +1204,8 @@ pub(crate) async fn quic_connect(
         });
     }
     let config = quic_client_config(http_req, roots)?;
-    stat.tls = Some("tls 1.3".to_string());
+    // QUIC is always TLS 1.3. Same spelling as a TCP connection reports.
+    stat.tls = Some(format_tls_protocol("TLSv1_3"));
     stat.alpn = Some(ALPN_HTTP3.to_string());
 
     let connected = if addrs.len() == 1 {

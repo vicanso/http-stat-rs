@@ -12,8 +12,8 @@
 - **gRPC** — `grpc://` / `grpcs://` 在路径为空、`/` 或包含 `grpc.health.v1.Health/Check` 时做健康检查；加上 `?service=NAME` 可只检查某一个服务，而不是整个服务端。其他路径是原始 unary：body 是带长度前缀的 protobuf 帧（`-d` 是原始 protobuf，不是 JSON），`grpc-status` 来自 trailer，文本输出里列在 `Trailers：` 下。`grpcs://` 执行真实的 rustls 握手（支持 `-k` 与 mTLS）。两种调用都可以用 `-K` 和 `-c` 复用同一条 HTTP/2 连接。`--compressed` 会请求压缩的消息（`gzip`、`deflate`、`zstd`）并解码。代理的用法和 HTTP 一样；明文 `grpc://` 通过 `CONNECT` 隧道转发
 - **请求发送阶段独立计时** — 将请求体上传与服务端处理拆开，POST/PUT 上传慢不再被误判为"服务器慢"
 - **Server-Timing 解析** — 解析 RFC 8673 `Server-Timing` 响应头，把服务端报告的子阶段耗时（CDN edge / origin / worker 等）直接展开在 TTFB 之下
-- **基准测试模式** — `-n 10` 重复 N 次，输出 min/max/avg/p50/p95/p99。每一次仍然遵守 `--retry`、`--max-time` 和 `--alt-svc`。`-K` 复用一条连接，包括 HTTP/3。`-c N` 让 N 个 HTTP/2 或 HTTP/3 请求同时在途（`-c 4 -n 20` 是 20 次请求、每次最多 4 个在途；只写 `-c 4` 则跑 4 次）。HTTP/1.1 不能多路复用，`-c` 会改成串行
-- **多 IP 并发测试** — `--resolve` 同时测试多个 IP，结果按成功/失败排序
+- **基准测试模式** — `-n 10` 重复 N 次，对拿到响应的请求输出 min/max/avg/p50/p95/p99，其余计为失败。每一次仍然遵守 `--retry`、`--max-time` 和 `--alt-svc`。`-K` 复用一条连接，包括 HTTP/3。`-c N` 让 N 个 HTTP/2 或 HTTP/3 请求同时在途（`-c 4 -n 20` 是 20 次请求、每次最多 4 个在途；只写 `-c 4` 则跑 4 次）。HTTP/1.1 不能多路复用，`-c` 会改成串行
+- **多 IP 并发测试** — `--resolve` 同时测试多个 IP，结果按成功/失败排序。配合 `-n` 时会依次对每个 IP 做基准测试，每个地址输出一份汇总
 - **透明解压** — `--compressed` 自动解码 `gzip`、`br`、`zstd` 响应
 - **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`；DoH/DoT 预设：`google-doh`、`cloudflare-doh`、`quad9-doh`、`google-dot`、`cloudflare-dot`、`quad9-dot`；其他解析服务器可以直接写 DoH 地址（`https://dns.example.com/dns-query`）或 DoT 地址（`tls://dns.example.com`）。用 `--connect-to` 指明解析服务器的主机名，可以固定连接它时使用的地址
 - **国际化域名** — URL 里的 Unicode 主机名（`https://münchen.de/`）会在请求前转成 Punycode
@@ -30,7 +30,7 @@
 - **Alt-Svc 自动升级** — `--alt-svc` 在响应广告 `h3`（RFC 7838）时用 HTTP/3 再试一次。成功的端点记在 `~/.httpstat/alt-svc.json`（`ma=0` 不写入；省略 `ma` 按 24 小时）。`-K` / `-c` 在基准测试前先做一次不计入次数的探测。升级失败会丢掉缓存并保留原始结果。`--http3` 遇到未被绕过的代理会直接拒绝
 - **JSON 字段选择器** — `--jq '.items[].name'` 直接从响应体提取所需字段（支持 `.a.b`、`.[0]`、`.[]`）；遇到不支持的语法或非 JSON 响应体会明确报错，而不是静默输出完整 body
 - **JSON 格式化输出** — `--pretty` 原地美化响应体；配合 `--jq` 使用，输出更聚焦、更易读
-- **响应头过滤** — `--include-header` 只显示关注的响应头；`--exclude-header` 隐藏噪音字段
+- **响应头过滤** — `--include-header` 只显示关注的响应头；`--exclude-header` 隐藏噪音字段。两者对 `--json` 同样生效
 - **curl 风格操作** — 熟悉的参数（`-H`、`-X`、`-d`、`-L`、`-k`、`-o`、`-4`/`-6`），无缝上手
 - **Waterfall 图表** — `--waterfall` 将每个阶段渲染为横向进度条，瓶颈一目了然（类似 Chrome DevTools Network 面板）
 - **`--connect-to`** — 在 TCP 层将 `HOST1:PORT1` 重定向到 `HOST2:PORT2`，TLS SNI 和 `Host` 头保持不变，与 curl 的 `--connect-to` 一致
@@ -38,7 +38,7 @@
 - **源 IP 绑定** — `--bind <IP>` 将出站连接绑定到指定本地地址，多网卡环境、策略路由或验证特定网卡可达性时不可或缺
 - **mTLS（双向 TLS）** — `--cert`/`--key` 发送客户端证书，适用于零信任网络和服务网格
 - **配置文件** — `~/.httpstatrc` 设置持久化默认值（DNS、超时、请求头等），CLI 参数始终优先
-- **细粒度超时** — `--timeout` 作用于每个阶段，包括等待响应头与响应体传输，服务器只连接不应答也无法把进程吊死；`--connect-timeout` 仅限制连接阶段（DNS + TCP + TLS/QUIC）；`--max-time` 是整次操作的墙钟预算，包括响应体、重定向、重试、退避和 Alt-Svc 升级
+- **细粒度超时** — `--timeout` 作用于每个阶段，包括等待响应头与响应体传输，服务器只连接不应答也无法把进程吊死；`--connect-timeout` 仅限制连接阶段（DNS + TCP + TLS/QUIC）；`--max-time` 是整次操作的墙钟预算，包括响应体、重定向、重试、退避和 Alt-Svc 升级；超出预算的请求仍会报告已完成阶段的耗时
 - **自动重试** — `--retry N` 对瞬时失败（超时、连接错误、HTTP 408/429/500/502/503/504）按指数退避重试，或用 `--retry-delay` 指定固定间隔；适合不稳定的 CI 门禁
 - **响应体大小上限** — `--max-filesize` 在超限时直接中止传输（默认 1GB，`0` 表示不限）。压缩的响应体解压后也不能超过这个上限。单次请求且没有 `--jq` / `--pretty` 时，`-o` 把解码后的响应体流式写到磁盘；否则仍在内存中缓冲。解压耗时单独报告，不并进内容传输
 - **语义化退出码** — DNS、TCP、TLS、超时、4xx、5xx 各有独立退出码，脚本判断更便捷

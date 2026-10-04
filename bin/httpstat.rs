@@ -25,7 +25,7 @@ use http_stat::{
     CookieJar, DnsCache, HttpConnection, HttpRequest, HttpStat, Lang, RedirectHop, ALPN_HTTP1,
     ALPN_HTTP2, ALPN_HTTP3,
 };
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -743,6 +743,21 @@ async fn do_request(
     stat
 }
 
+/// Why a request did not succeed, in a few words: its error, or else the
+/// status it came back with.
+fn failure_reason(stat: &HttpStat) -> String {
+    if let Some(error) = &stat.error {
+        return error.clone();
+    }
+    if let (true, Some(code)) = (stat.is_grpc, &stat.grpc_status) {
+        return format!("grpc-status {code}");
+    }
+    match stat.status {
+        Some(status) => format!("HTTP {}", status.as_u16()),
+        None => "request failed".to_string(),
+    }
+}
+
 fn benchmark_to_json(stats: &[HttpStat], connect_stat: Option<&HttpStat>) -> serde_json::Value {
     let dur_us = |d: Option<std::time::Duration>| -> serde_json::Value {
         d.map_or(serde_json::Value::Null, |d| {
@@ -750,8 +765,14 @@ fn benchmark_to_json(stats: &[HttpStat], connect_stat: Option<&HttpStat>) -> ser
         })
     };
 
+    // A request that ended in an error has no latency to report: its total
+    // is how long it took to give up. It is counted, not averaged.
     let calc = |f: fn(&HttpStat) -> Option<std::time::Duration>| -> Vec<std::time::Duration> {
-        let mut v: Vec<std::time::Duration> = stats.iter().filter_map(f).collect();
+        let mut v: Vec<std::time::Duration> = stats
+            .iter()
+            .filter(|s| s.error.is_none())
+            .filter_map(f)
+            .collect();
         v.sort();
         v
     };
@@ -780,10 +801,22 @@ fn benchmark_to_json(stats: &[HttpStat], connect_stat: Option<&HttpStat>) -> ser
 
     let success = stats.iter().filter(|s| s.is_success()).count();
     let total = stats.len();
+    // What the process exits with: the first failure decides.
+    let exit_code = stats
+        .iter()
+        .map(|s| s.exit_code())
+        .find(|code| *code != 0)
+        .unwrap_or(0);
+    let mut errors = std::collections::BTreeMap::<String, usize>::new();
+    for stat in stats.iter().filter(|s| !s.is_success()) {
+        *errors.entry(failure_reason(stat)).or_default() += 1;
+    }
 
     let mut obj = serde_json::json!({
         "count": total,
         "success": success,
+        "failed": total - success,
+        "exit_code": exit_code,
         "timing": {
             "dns_lookup": stat_obj(&calc(|s| s.dns_lookup)),
             "tcp_connect": stat_obj(&calc(|s| s.tcp_connect)),
@@ -795,6 +828,10 @@ fn benchmark_to_json(stats: &[HttpStat], connect_stat: Option<&HttpStat>) -> ser
             "total": stat_obj(&calc(|s| s.total)),
         },
     });
+
+    if !errors.is_empty() {
+        obj["errors"] = serde_json::json!(errors);
+    }
 
     let mut rates: Vec<f64> = stats.iter().filter_map(|s| s.throughput_bps()).collect();
     rates.sort_by(|a, b| a.total_cmp(b));
@@ -891,17 +928,35 @@ fn resolve_max_filesize(arg: Option<&str>) -> Option<usize> {
     }
 }
 
-/// Synthesize the `HttpStat` returned when `--max-time` is exceeded. The error
-/// text contains "timeout" so `exit_code()` maps it to the timeout code (5).
+/// How far past `--max-time` the timers around a request wait. The library
+/// ends every phase at the deadline itself and reports what it had finished;
+/// these timers are the backstop for a wait it does not bound.
+const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The error for a request that ran out of `--max-time`. It contains
+/// "timeout" so `exit_code()` maps it to the timeout code (5).
+fn max_time_message(d: std::time::Duration) -> String {
+    format!("timeout: exceeded --max-time of {}", format_duration(d))
+}
+
+/// Synthesize the `HttpStat` returned when `--max-time` is exceeded and the
+/// request itself has nothing to report.
 fn max_time_error_stat(d: std::time::Duration) -> HttpStat {
     HttpStat {
         total: Some(d),
-        error: Some(format!(
-            "timeout: exceeded --max-time of {}",
-            format_duration(d)
-        )),
+        error: Some(max_time_message(d)),
         ..Default::default()
     }
+}
+
+/// The result of an attempt that ended at the `--max-time` deadline. The
+/// phase that was cut short there reports a plain timeout: name the limit
+/// that caused it, and keep the phases that had finished.
+fn out_of_time(mut stat: HttpStat, limit: std::time::Duration) -> HttpStat {
+    if !stat.is_success() && stat.exit_code() == 5 {
+        stat.error = Some(max_time_message(limit));
+    }
+    stat
 }
 
 /// Run `fut` under an optional overall wall-clock deadline. When `max_time`
@@ -912,7 +967,7 @@ where
     F: std::future::Future<Output = HttpStat>,
 {
     match max_time {
-        Some(d) => match tokio::time::timeout(d, fut).await {
+        Some(d) => match tokio::time::timeout(d + DEADLINE_GRACE, fut).await {
             Ok(stat) => stat,
             Err(_) => max_time_error_stat(d),
         },
@@ -1011,7 +1066,12 @@ where
             if left.is_zero() {
                 return max_time_error_stat(budget.limit);
             }
-            match tokio::time::timeout(left, fut).await {
+            match tokio::time::timeout(left + DEADLINE_GRACE, fut).await {
+                // Out of time: this attempt is the result, with whatever
+                // phases it got through.
+                Ok(stat) if Instant::now() >= budget.deadline => {
+                    return out_of_time(stat, budget.limit);
+                }
                 Ok(stat) => stat,
                 Err(_) => return max_time_error_stat(budget.limit),
             }
@@ -1172,6 +1232,7 @@ async fn run_request(mut req: HttpRequest, opts: &RunOpts) -> HttpStat {
     }
 
     let budget = fresh_budget(opts.max_time);
+    req.deadline = budget.map(|b| b.deadline);
     let stat = run_with_retry(
         || {
             with_max_time(
@@ -1255,6 +1316,8 @@ async fn indexed_multiplex(
     retry_delay: Option<std::time::Duration>,
     budget: Option<TimeBudget>,
 ) -> (usize, HttpStat) {
+    let mut req = req;
+    req.deadline = budget.map(|b| b.deadline);
     let stat = run_with_retry(
         || {
             let shared = Arc::clone(&shared);
@@ -1364,7 +1427,8 @@ async fn sequential_reused(
         let mut stat = run_with_retry(
             {
                 let shared = Arc::clone(&shared);
-                let req = req.clone();
+                let mut req = req.clone();
+                req.deadline = budget.map(|b| b.deadline);
                 let max_time = opts.max_time;
                 move || {
                     let shared = Arc::clone(&shared);
@@ -1456,6 +1520,84 @@ async fn concurrent_reused(
         stats.push(stat);
     }
     (stats, exit_code)
+}
+
+struct BenchOpts {
+    count: usize,
+    concurrency: usize,
+    /// `-K`, or `-c` above 1: every request goes over one connection.
+    reuse_conn: bool,
+    lang: Lang,
+    json_output: bool,
+}
+
+/// What `-n` produced for one target.
+enum Benchmark {
+    Ran {
+        stats: Vec<HttpStat>,
+        /// The connection setup, when the requests shared a connection.
+        cold_connect: Option<HttpStat>,
+        exit_code: i32,
+    },
+    /// `-K` / `-c` never got a connection.
+    ConnectFailed(HttpStat),
+}
+
+/// Run `-n` requests for `req`, on one reused connection or on a fresh one
+/// each time. Progress lines are printed as requests finish.
+async fn run_benchmark(mut req: HttpRequest, bench: &BenchOpts, opts: &RunOpts) -> Benchmark {
+    let BenchOpts {
+        count,
+        concurrency,
+        lang,
+        json_output,
+        ..
+    } = *bench;
+    if bench.reuse_conn {
+        learn_alt_svc_for_reuse(&mut req, opts).await;
+        let (connect_stat, conn) = connect(&req).await;
+        let Some(conn) = conn else {
+            return Benchmark::ConnectFailed(connect_stat);
+        };
+        let (stats, exit_code) = if concurrency > 1 && conn.multiplexes() {
+            concurrent_reused(conn, &req, count, opts, &connect_stat, lang, json_output).await
+        } else {
+            if concurrency > 1 {
+                eprintln!(
+                    "httpstat: HTTP/1.1 cannot multiplex; running -c {concurrency} sequentially"
+                );
+            }
+            sequential_reused(conn, &req, count, opts, &connect_stat, lang, json_output).await
+        };
+        return Benchmark::Ran {
+            stats,
+            cold_connect: Some(connect_stat),
+            exit_code,
+        };
+    }
+    // Each iteration is a new connection, but it still goes through retry
+    // and Alt-Svc. The shared TLS session store and DNS cache live on `req`.
+    let width = count.to_string().len();
+    let mut stats = Vec::with_capacity(count);
+    let mut exit_code = 0i32;
+    for i in 0..count {
+        let mut stat = run_request(req.clone(), opts).await;
+        stat.silent = true;
+        stat.lang = lang;
+        stat.body = None;
+        if !json_output {
+            print!("[{:>width$}/{count}] {stat}", i + 1);
+        }
+        if exit_code == 0 {
+            exit_code = stat.exit_code();
+        }
+        stats.push(stat);
+    }
+    Benchmark::Ran {
+        stats,
+        cold_connect: None,
+        exit_code,
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1775,10 +1917,22 @@ async fn main() {
     let json_output = args.json;
     let mut exit_code = 0i32;
 
+    let bench = BenchOpts {
+        count,
+        concurrency,
+        reuse_conn,
+        lang,
+        json_output,
+    };
+    // Display options that also shape the JSON document.
+    let json_view = |stat: &mut HttpStat| {
+        stat.include_headers.clone_from(&include_headers);
+        stat.exclude_headers.clone_from(&exclude_headers);
+    };
+
     if let Some(resolve) = args.resolve {
-        let ips = resolve.split(',').collect::<Vec<&str>>();
-        let mut futs = vec![];
-        for ip in ips {
+        let mut ips = vec![];
+        for ip in resolve.split(',') {
             let ip = ip.trim();
             if ip.is_empty() {
                 continue;
@@ -1787,14 +1941,62 @@ async fn main() {
                 eprintln!("httpstat: invalid --resolve IP '{ip}'");
                 std::process::exit(1);
             };
-            let mut req = req.clone();
-            req.resolve = Some(ip);
-            futs.push(run_request(req, &run_opts));
+            ips.push(ip);
         }
-        if futs.is_empty() {
+        if ips.is_empty() {
             eprintln!("httpstat: --resolve produced no addresses");
             std::process::exit(1);
         }
+        if count > 1 {
+            // -n for each address in turn, so that the runs do not compete.
+            // The JSON document is one summary per address.
+            let port = req.get_port();
+            let mut summaries = Vec::with_capacity(ips.len());
+            for ip in ips {
+                let mut req = req.clone();
+                req.resolve = Some(ip);
+                let (code, summary) = match run_benchmark(req, &bench, &run_opts).await {
+                    Benchmark::Ran {
+                        stats,
+                        cold_connect,
+                        exit_code,
+                    } => {
+                        let mut summary = benchmark_to_json(&stats, cold_connect.as_ref());
+                        summary["addr"] = serde_json::json!(SocketAddr::new(ip, port).to_string());
+                        if !json_output {
+                            print_benchmark(stats, cold_connect.as_ref(), lang, false);
+                        }
+                        (exit_code, summary)
+                    }
+                    Benchmark::ConnectFailed(mut stat) => {
+                        if !json_output {
+                            println!("{stat}");
+                        }
+                        json_view(&mut stat);
+                        (stat.exit_code(), stat.to_json())
+                    }
+                };
+                if exit_code == 0 {
+                    exit_code = code;
+                }
+                summaries.push(summary);
+            }
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summaries).unwrap_or_default()
+                );
+            }
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            return;
+        }
+        let futs = ips.into_iter().map(|ip| {
+            let mut req = req.clone();
+            req.resolve = Some(ip);
+            run_request(req, &run_opts)
+        });
         let mut stats_list = futures::future::join_all(futs).await;
         // error request last
         stats_list.sort_by(|item1, item2| {
@@ -1803,6 +2005,7 @@ async fn main() {
             value1.cmp(&value2)
         });
         if json_output {
+            stats_list.iter_mut().for_each(json_view);
             let arr: Vec<_> = stats_list.iter().map(|s| s.to_json()).collect();
             println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
             for s in &stats_list {
@@ -1833,75 +2036,33 @@ async fn main() {
                 }
             }
         }
-    } else if reuse_conn {
-        learn_alt_svc_for_reuse(&mut req, &run_opts).await;
-        let (connect_stat, conn) = connect(&req).await;
-        if let Some(conn) = conn {
-            let (stats, code) = if concurrency > 1 && conn.multiplexes() {
-                concurrent_reused(
-                    conn,
-                    &req,
-                    count,
-                    &run_opts,
-                    &connect_stat,
-                    lang,
-                    json_output,
-                )
-                .await
-            } else {
-                if concurrency > 1 {
-                    eprintln!(
-                        "httpstat: HTTP/1.1 cannot multiplex; running -c {concurrency} sequentially"
-                    );
-                }
-                sequential_reused(
-                    conn,
-                    &req,
-                    count,
-                    &run_opts,
-                    &connect_stat,
-                    lang,
-                    json_output,
-                )
-                .await
-            };
-            if exit_code == 0 {
-                exit_code = code;
-            }
-            print_benchmark(stats, Some(&connect_stat), lang, json_output);
-        } else {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&connect_stat.to_json()).unwrap_or_default()
-                );
-            } else {
-                println!("{connect_stat}");
-            }
-            exit_code = connect_stat.exit_code();
-        }
     } else if count > 1 {
-        // Each iteration is a new connection, but it still goes through retry
-        // and Alt-Svc. The shared TLS session store and DNS cache live on `req`.
-        let width = count.to_string().len();
-        let mut stats = Vec::with_capacity(count);
-        for i in 0..count {
-            let mut stat = run_request(req.clone(), &run_opts).await;
-            stat.silent = true;
-            stat.lang = lang;
-            stat.body = None;
-            if !json_output {
-                print!("[{:>width$}/{count}] {stat}", i + 1);
+        match run_benchmark(req, &bench, &run_opts).await {
+            Benchmark::Ran {
+                stats,
+                cold_connect,
+                exit_code: code,
+            } => {
+                exit_code = code;
+                print_benchmark(stats, cold_connect.as_ref(), lang, json_output);
             }
-            if exit_code == 0 {
-                exit_code = stat.exit_code();
+            Benchmark::ConnectFailed(mut connect_stat) => {
+                if json_output {
+                    json_view(&mut connect_stat);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&connect_stat.to_json()).unwrap_or_default()
+                    );
+                } else {
+                    println!("{connect_stat}");
+                }
+                exit_code = connect_stat.exit_code();
             }
-            stats.push(stat);
         }
-        print_benchmark(stats, None, lang, json_output);
     } else {
         let mut stat = run_request(req, &run_opts).await;
         if json_output {
+            json_view(&mut stat);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&stat.to_json()).unwrap_or_default()
