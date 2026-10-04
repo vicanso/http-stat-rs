@@ -19,6 +19,9 @@ use super::dns_msg::{encode_query, parse_records, QTYPE_A, QTYPE_AAAA};
 use super::error::{Error, Result};
 use super::happy::{self, race_tcp_inner};
 use super::http_request::ConnectTo;
+use super::proxy::ProxyConfig;
+#[cfg(feature = "doh")]
+use super::request::{OriginIo, TrackedBody};
 use super::skip_verifier::CapturingVerifier;
 use super::stats::{format_time, Certificate, HttpStat, ALPN_HTTP2, ALPN_HTTP3};
 use super::tcp_info::TcpInfoProbe;
@@ -30,15 +33,21 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
+#[cfg(feature = "doh")]
+use http_body_util::BodyExt;
+#[cfg(feature = "doh")]
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "doh")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
@@ -65,12 +74,97 @@ pub(crate) struct Resolved {
     pub cache_port: u16,
 }
 
+/// A DNS-over-HTTPS or DNS-over-TLS resolver.
 #[cfg(feature = "doh")]
-struct SecurePreset {
-    ip: IpAddr,
+#[derive(Debug, PartialEq)]
+struct SecureDns {
+    /// Name (or IP) on the resolver's certificate: TLS SNI and DoH `Host`.
+    host: String,
+    /// Address to dial. The presets pin one; a custom resolver is looked up
+    /// by `host` through the system resolver.
+    ip: Option<IpAddr>,
     port: u16,
-    sni: &'static str,
+    /// DoH request target.
+    path: String,
     dot: bool,
+}
+
+#[cfg(feature = "doh")]
+const DOH_PATH: &str = "/dns-query";
+
+#[cfg(feature = "doh")]
+impl SecureDns {
+    fn preset(host: &str, ip: [u8; 4], dot: bool) -> Self {
+        Self {
+            host: host.to_string(),
+            ip: Some(IpAddr::from(ip)),
+            port: if dot { 853 } else { 443 },
+            path: DOH_PATH.to_string(),
+            dot,
+        }
+    }
+
+    /// A preset name, a DoH URL (`https://host[:port][/path]`) or a DoT
+    /// address (`tls://host[:port]`).
+    fn parse(server: &str) -> Option<Self> {
+        let (provider, dot) = match server.rsplit_once('-') {
+            Some((provider, "doh")) => (provider, false),
+            Some((provider, "dot")) => (provider, true),
+            _ => return Self::parse_url(server),
+        };
+        match provider {
+            "google" => Some(Self::preset("dns.google", [8, 8, 8, 8], dot)),
+            "cloudflare" => Some(Self::preset("cloudflare-dns.com", [1, 1, 1, 1], dot)),
+            "quad9" => Some(Self::preset("dns.quad9.net", [9, 9, 9, 9], dot)),
+            _ => Self::parse_url(server),
+        }
+    }
+
+    fn parse_url(server: &str) -> Option<Self> {
+        let dot = Self::is_url(server)?;
+        let uri = server.parse::<http::Uri>().ok()?;
+        // `Uri::host` keeps the brackets of an IPv6 literal.
+        let host = uri.host()?.trim_matches(['[', ']']);
+        if host.is_empty() {
+            return None;
+        }
+        let path = match uri.path_and_query().map(|p| p.as_str()) {
+            Some(path) if !dot && path != "/" && !path.is_empty() => path,
+            _ => DOH_PATH,
+        };
+        Some(Self {
+            host: host.to_string(),
+            ip: host.parse().ok(),
+            port: uri.port_u16().unwrap_or(if dot { 853 } else { 443 }),
+            path: path.to_string(),
+            dot,
+        })
+    }
+
+    /// `Some(dot)` when `server` is written as a DoH or DoT URL.
+    fn is_url(server: &str) -> Option<bool> {
+        if server.starts_with("https://") {
+            Some(false)
+        } else if server.starts_with("tls://") {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// `Host` header value for DoH.
+    fn authority(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        if self.port == 443 {
+            host
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
 }
 
 // Format TLS protocol version for display
@@ -266,7 +360,7 @@ pub(crate) async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Resul
     let provider = TokioRuntimeProvider::default();
     let mut server_config: Option<ResolverConfig> = None;
     #[cfg(feature = "doh")]
-    let mut secure: Option<SecurePreset> = None;
+    let mut secure: Option<SecureDns> = None;
     if let Some(dns_servers) = &req.dns_servers {
         let mut plain_ips: Vec<IpAddr> = vec![];
         for server in dns_servers {
@@ -286,73 +380,23 @@ pub(crate) async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Resul
                     plain_ips.clear();
                     break;
                 }
-                #[cfg(feature = "doh")]
-                "google-doh" => {
-                    secure = Some(SecurePreset {
-                        ip: IpAddr::from([8, 8, 8, 8]),
-                        port: 443,
-                        sni: "dns.google",
-                        dot: false,
-                    });
-                    plain_ips.clear();
-                    break;
-                }
-                #[cfg(feature = "doh")]
-                "cloudflare-doh" => {
-                    secure = Some(SecurePreset {
-                        ip: IpAddr::from([1, 1, 1, 1]),
-                        port: 443,
-                        sni: "cloudflare-dns.com",
-                        dot: false,
-                    });
-                    plain_ips.clear();
-                    break;
-                }
-                #[cfg(feature = "doh")]
-                "quad9-doh" => {
-                    secure = Some(SecurePreset {
-                        ip: IpAddr::from([9, 9, 9, 9]),
-                        port: 443,
-                        sni: "dns.quad9.net",
-                        dot: false,
-                    });
-                    plain_ips.clear();
-                    break;
-                }
-                #[cfg(feature = "doh")]
-                "google-dot" => {
-                    secure = Some(SecurePreset {
-                        ip: IpAddr::from([8, 8, 8, 8]),
-                        port: 853,
-                        sni: "dns.google",
-                        dot: true,
-                    });
-                    plain_ips.clear();
-                    break;
-                }
-                #[cfg(feature = "doh")]
-                "cloudflare-dot" => {
-                    secure = Some(SecurePreset {
-                        ip: IpAddr::from([1, 1, 1, 1]),
-                        port: 853,
-                        sni: "cloudflare-dns.com",
-                        dot: true,
-                    });
-                    plain_ips.clear();
-                    break;
-                }
-                #[cfg(feature = "doh")]
-                "quad9-dot" => {
-                    secure = Some(SecurePreset {
-                        ip: IpAddr::from([9, 9, 9, 9]),
-                        port: 853,
-                        sni: "dns.quad9.net",
-                        dot: true,
-                    });
-                    plain_ips.clear();
-                    break;
-                }
                 _ => {
+                    #[cfg(feature = "doh")]
+                    {
+                        if let Some(dns) = SecureDns::parse(server) {
+                            secure = Some(dns);
+                            plain_ips.clear();
+                            break;
+                        }
+                        // Written as a DoH/DoT URL but not usable as one:
+                        // do not fall back to another resolver silently.
+                        if SecureDns::is_url(server).is_some() {
+                            return Err(Error::Common {
+                                category: "dns".to_string(),
+                                message: format!("invalid dns server {server}"),
+                            });
+                        }
+                    }
                     if let Ok(addr) = server.parse::<IpAddr>() {
                         plain_ips.push(addr);
                     }
@@ -378,14 +422,14 @@ pub(crate) async fn dns_resolve(req: &HttpRequest, stat: &mut HttpStat) -> Resul
     let dns_start = Instant::now();
 
     #[cfg(feature = "doh")]
-    if let Some(preset) = secure {
+    if let Some(dns) = secure {
         return resolve_secure(
             req,
             stat,
             host,
             lookup_host,
             port,
-            preset,
+            dns,
             dns_timeout,
             dns_start,
         )
@@ -425,21 +469,41 @@ async fn resolve_secure(
     host: String,
     lookup_host: String,
     port: u16,
-    preset: SecurePreset,
+    dns: SecureDns,
     dns_timeout: Duration,
     dns_start: Instant,
 ) -> Result<Resolved> {
     let work = async {
-        let tcp = TcpStream::connect((preset.ip, preset.port))
-            .await
-            .map_err(|e| Error::Io { source: e })?;
-        let alpn = if preset.dot {
+        let tcp = match dns.ip {
+            Some(ip) => TcpStream::connect((ip, dns.port)).await,
+            None => TcpStream::connect((dns.host.as_str(), dns.port)).await,
+        }
+        .map_err(|e| Error::Io { source: e })?;
+        let alpn = if dns.dot {
             vec![b"dot".to_vec()]
         } else {
-            vec![b"http/1.1".to_vec()]
+            // RFC 8484 recommends HTTP/2, and some resolvers speak nothing
+            // else.
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         };
-        let mut tls = tls_connect_stream(preset.sni, tcp, alpn, false, None).await?;
+        let tls = tls_connect_stream(&dns.host, tcp, alpn, false, None).await?;
         let connect_at = dns_start.elapsed();
+        let mut transport = if dns.dot {
+            SecureTransport::Dot(tls)
+        } else if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+            let io: OriginIo = Box::new(tls);
+            let (sender, conn) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+                    .await
+                    .map_err(|e| Error::Hyper { source: e })?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            SecureTransport::Doh2(sender)
+        } else {
+            SecureTransport::Doh1(tls)
+        };
+        let authority = dns.authority();
         let qtypes: Vec<u16> = match req.ip_version {
             Some(4) => vec![QTYPE_A],
             Some(6) => vec![QTYPE_AAAA],
@@ -450,10 +514,14 @@ async fn resolve_secure(
         let mut last_err: Option<Error> = None;
         for (i, qtype) in qtypes.into_iter().enumerate() {
             let query = encode_query((i as u16) + 1, &lookup_host, qtype);
-            let result = if preset.dot {
-                dot_exchange(&mut tls, &query).await
-            } else {
-                doh_exchange(&mut tls, preset.sni, &query).await
+            let result = match &mut transport {
+                SecureTransport::Dot(tls) => dot_exchange(tls, &query).await,
+                SecureTransport::Doh1(tls) => {
+                    doh_exchange(tls, &authority, &dns.path, &query).await
+                }
+                SecureTransport::Doh2(sender) => {
+                    doh2_exchange(sender, &authority, &dns.path, &query).await
+                }
             };
             match result {
                 Ok(msg) => match parse_records(&msg) {
@@ -497,13 +565,68 @@ async fn resolve_secure(
     finish_lookup(req, stat, host, lookup_host, port, ips, until)
 }
 
+/// The connection to a DoH/DoT resolver once TLS is up.
 #[cfg(feature = "doh")]
-async fn doh_exchange<S>(stream: &mut S, host: &str, query: &[u8]) -> Result<Vec<u8>>
+enum SecureTransport {
+    Dot(TlsStream<TcpStream>),
+    /// DoH over HTTP/1.1, for a resolver that does not negotiate `h2`.
+    Doh1(TlsStream<TcpStream>),
+    Doh2(hyper::client::conn::http2::SendRequest<TrackedBody>),
+}
+
+/// One DoH query over HTTP/2.
+#[cfg(feature = "doh")]
+async fn doh2_exchange(
+    sender: &mut hyper::client::conn::http2::SendRequest<TrackedBody>,
+    authority: &str,
+    path: &str,
+    query: &[u8],
+) -> Result<Vec<u8>> {
+    let (body, _) = TrackedBody::new(bytes::Bytes::copy_from_slice(query));
+    let request = http::Request::post(format!("https://{authority}{path}"))
+        .header(http::header::CONTENT_TYPE, "application/dns-message")
+        .header(http::header::ACCEPT, "application/dns-message")
+        .body(body)
+        .map_err(|e| Error::Http { source: e })?;
+    sender
+        .ready()
+        .await
+        .map_err(|e| Error::Hyper { source: e })?;
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| Error::Hyper { source: e })?;
+    if response.status() != http::StatusCode::OK {
+        return Err(Error::Common {
+            category: "dns".to_string(),
+            message: format!("doh status {}", response.status().as_u16()),
+        });
+    }
+    let mut body = response.into_body();
+    let mut message = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| Error::Hyper { source: e })?;
+        if let Ok(data) = frame.into_data() {
+            message.extend_from_slice(&data);
+            // A DNS message is at most 65535 bytes.
+            if message.len() > usize::from(u16::MAX) {
+                return Err(Error::Common {
+                    category: "dns".to_string(),
+                    message: "doh response too large".to_string(),
+                });
+            }
+        }
+    }
+    Ok(message)
+}
+
+#[cfg(feature = "doh")]
+async fn doh_exchange<S>(stream: &mut S, host: &str, path: &str, query: &[u8]) -> Result<Vec<u8>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let req = format!(
-        "POST /dns-query HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         query.len()
     );
     stream
@@ -653,12 +776,50 @@ pub(crate) async fn tcp_connect(
     Ok((tcp_stream, probe, winner))
 }
 
-fn load_roots() -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
+static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
+
+/// The platform trust store, read once per process. Reading it is slow
+/// (about 80 ms on macOS), so callers fetch it before they start a phase
+/// timer.
+fn root_store() -> Arc<RootCertStore> {
+    ROOTS
+        .get_or_init(|| {
+            let mut roots = RootCertStore::empty();
+            for cert in rustls_native_certs::load_native_certs().certs {
+                let _ = roots.add(cert);
+            }
+            Arc::new(roots)
+        })
+        .clone()
+}
+
+/// Whether `req` opens a TLS or QUIC session: to the origin, to an
+/// `https://` proxy, or to a DoH/DoT resolver.
+fn uses_tls(req: &HttpRequest) -> bool {
+    #[cfg(feature = "doh")]
+    let secure_dns = req
+        .dns_servers
+        .iter()
+        .flatten()
+        .any(|s| SecureDns::parse(s).is_some());
+    #[cfg(not(feature = "doh"))]
+    let secure_dns = false;
+    matches!(req.uri.scheme_str(), Some("https" | "grpcs"))
+        || req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3)
+        || req
+            .proxy
+            .as_deref()
+            .and_then(ProxyConfig::parse)
+            .is_some_and(|p| p.tls)
+        || secure_dns
+}
+
+/// Read the trust store ahead of a request that needs it, so the cost stays
+/// out of `total` as well as out of the individual phases.
+pub(crate) fn preload_roots(req: &HttpRequest) {
+    if uses_tls(req) {
+        root_store();
     }
-    roots
 }
 
 fn client_auth(
@@ -698,8 +859,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     ensure_crypto_provider();
-    let roots = load_roots();
-    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let builder = ClientConfig::builder().with_root_certificates(root_store());
     let mut config = builder.with_no_client_auth();
     if skip_verify {
         config
@@ -735,9 +895,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     ensure_crypto_provider();
+    // Fetched before the clock starts: reading the trust store is not part
+    // of the handshake.
+    let roots = root_store();
     let tls_start = Instant::now();
-    let root_store = load_roots();
-    let builder = ClientConfig::builder().with_root_certificates(root_store.clone());
+    let builder = ClientConfig::builder().with_root_certificates(roots.clone());
     let mut config = client_auth(
         builder,
         http_req.client_cert.as_deref(),
@@ -750,7 +912,7 @@ where
             .set_certificate_verifier(Arc::new(SkipVerifier));
         None
     } else {
-        let inner = WebPkiServerVerifier::builder(Arc::new(root_store))
+        let inner = WebPkiServerVerifier::builder(roots)
             .build()
             .map_err(|e| Error::Common {
                 category: "tls".to_string(),
@@ -837,9 +999,11 @@ pub(crate) struct QuicConnect {
     pub early: Option<quinn::ZeroRttAccepted>,
 }
 
-fn quic_client_config(http_req: &HttpRequest) -> Result<quinn::ClientConfig> {
+fn quic_client_config(
+    http_req: &HttpRequest,
+    roots: Arc<RootCertStore>,
+) -> Result<quinn::ClientConfig> {
     ensure_crypto_provider();
-    let roots = load_roots();
     let builder = ClientConfig::builder().with_root_certificates(roots);
     let mut config = client_auth(
         builder,
@@ -997,6 +1161,9 @@ pub(crate) async fn quic_connect(
     http_req: &HttpRequest,
     stat: &mut HttpStat,
 ) -> Result<QuicConnect> {
+    // Fetched before the clock starts: reading the trust store is not part
+    // of the connection.
+    let roots = root_store();
     let quic_start = Instant::now();
     let overall = http_req.quic_timeout.unwrap_or(Duration::from_secs(30));
     let addrs = filter_bind(addrs, http_req.bind_addr);
@@ -1006,7 +1173,7 @@ pub(crate) async fn quic_connect(
             message: "no address matches --bind".to_string(),
         });
     }
-    let config = quic_client_config(http_req)?;
+    let config = quic_client_config(http_req, roots)?;
     stat.tls = Some("tls 1.3".to_string());
     stat.alpn = Some(ALPN_HTTP3.to_string());
 
@@ -1052,4 +1219,152 @@ pub(crate) async fn quic_connect(
         conn,
         early: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(url: &str) -> HttpRequest {
+        HttpRequest::try_from(url).unwrap()
+    }
+
+    #[test]
+    fn root_store_is_read_once() {
+        assert!(Arc::ptr_eq(&root_store(), &root_store()));
+    }
+
+    #[test]
+    fn uses_tls_follows_the_origin_scheme() {
+        assert!(uses_tls(&req("https://example.com/")));
+        assert!(uses_tls(&req("grpcs://example.com/")));
+        assert!(!uses_tls(&req("http://example.com/")));
+        assert!(!uses_tls(&req("grpc://example.com/")));
+    }
+
+    #[test]
+    fn uses_tls_for_http3() {
+        let mut http3 = req("http://example.com/");
+        http3.alpn_protocols = vec![ALPN_HTTP3.to_string()];
+        assert!(uses_tls(&http3));
+    }
+
+    #[test]
+    fn uses_tls_for_an_https_proxy_only() {
+        let mut proxied = req("http://example.com/");
+        proxied.proxy = Some("https://proxy.local:8443".to_string());
+        assert!(uses_tls(&proxied));
+        for plain in ["http://proxy.local:8080", "socks5://proxy.local:1080"] {
+            proxied.proxy = Some(plain.to_string());
+            assert!(!uses_tls(&proxied), "{plain}");
+        }
+    }
+
+    #[test]
+    fn uses_tls_for_secure_dns_presets() {
+        let mut dns = req("http://example.com/");
+        dns.dns_servers = Some(vec!["1.1.1.1".to_string(), "cloudflare".to_string()]);
+        assert!(!uses_tls(&dns));
+        for secure in [
+            "cloudflare-doh",
+            "quad9-dot",
+            "https://dns.example.com/dns-query",
+            "tls://dns.example.com",
+        ] {
+            dns.dns_servers = Some(vec![secure.to_string()]);
+            assert_eq!(uses_tls(&dns), cfg!(feature = "doh"), "{secure}");
+        }
+    }
+
+    #[cfg(feature = "doh")]
+    #[test]
+    fn secure_dns_presets_pin_an_address() {
+        let doh = SecureDns::parse("google-doh").unwrap();
+        assert_eq!(
+            doh,
+            SecureDns {
+                host: "dns.google".to_string(),
+                ip: Some(IpAddr::from([8, 8, 8, 8])),
+                port: 443,
+                path: "/dns-query".to_string(),
+                dot: false,
+            }
+        );
+        let dot = SecureDns::parse("quad9-dot").unwrap();
+        assert_eq!(
+            (dot.host.as_str(), dot.ip, dot.port, dot.dot),
+            ("dns.quad9.net", Some(IpAddr::from([9, 9, 9, 9])), 853, true)
+        );
+        for name in [
+            "cloudflare-doh",
+            "cloudflare-dot",
+            "quad9-doh",
+            "google-dot",
+        ] {
+            assert!(SecureDns::parse(name).is_some(), "{name}");
+        }
+    }
+
+    #[cfg(feature = "doh")]
+    #[test]
+    fn secure_dns_parses_doh_urls() {
+        let dns = SecureDns::parse("https://dns.example.com").unwrap();
+        assert_eq!(
+            (
+                dns.host.as_str(),
+                dns.ip,
+                dns.port,
+                dns.path.as_str(),
+                dns.dot
+            ),
+            ("dns.example.com", None, 443, "/dns-query", false)
+        );
+        assert_eq!(dns.authority(), "dns.example.com");
+
+        let dns = SecureDns::parse("https://my-doh.example.com:8443/custom/abc?x=1").unwrap();
+        assert_eq!(
+            (dns.host.as_str(), dns.port, dns.path.as_str()),
+            ("my-doh.example.com", 8443, "/custom/abc?x=1")
+        );
+        assert_eq!(dns.authority(), "my-doh.example.com:8443");
+
+        // An IP literal is dialed directly, with no lookup of its own.
+        let dns = SecureDns::parse("https://1.1.1.1/dns-query").unwrap();
+        assert_eq!(dns.ip, Some(IpAddr::from([1, 1, 1, 1])));
+        let dns = SecureDns::parse("https://[2606:4700:4700::1111]/dns-query").unwrap();
+        assert_eq!(dns.host, "2606:4700:4700::1111");
+        assert!(dns.ip.is_some_and(|ip| ip.is_ipv6()));
+        assert_eq!(dns.authority(), "[2606:4700:4700::1111]");
+    }
+
+    #[cfg(feature = "doh")]
+    #[test]
+    fn secure_dns_parses_dot_addresses() {
+        let dns = SecureDns::parse("tls://dns.example.com").unwrap();
+        assert_eq!(
+            (dns.host.as_str(), dns.ip, dns.port, dns.dot),
+            ("dns.example.com", None, 853, true)
+        );
+        let dns = SecureDns::parse("tls://9.9.9.9:8853").unwrap();
+        assert_eq!(
+            (dns.ip, dns.port, dns.dot),
+            (Some(IpAddr::from([9, 9, 9, 9])), 8853, true)
+        );
+    }
+
+    #[cfg(feature = "doh")]
+    #[test]
+    fn secure_dns_ignores_everything_else() {
+        for server in [
+            "google",
+            "1.1.1.1",
+            "unknown-doh",
+            "http://dns.example.com/dns-query",
+            "https://",
+            "tls://",
+            "",
+        ] {
+            assert_eq!(SecureDns::parse(server), None, "{server}");
+        }
+    }
 }

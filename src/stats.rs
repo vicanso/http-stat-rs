@@ -262,6 +262,9 @@ pub struct HttpStat {
     pub cert_domains: Option<Vec<String>>,
     pub certificates: Option<Vec<Certificate>>,
     pub body: Option<Bytes>,
+    /// The body is text whatever `Content-Type` says: it was written by
+    /// httpstat itself (the gRPC health check verdict).
+    pub body_is_text: bool,
     pub body_size: Option<usize>,
     pub headers: Option<HeaderMap<HeaderValue>>,
     pub error: Option<String>,
@@ -658,8 +661,10 @@ impl HttpStat {
         if self.dns_attempted && self.dns_lookup.is_none() {
             return 2;
         }
-        // TCP failure: tcp/quic connection phase never completed
-        if self.tcp_connect.is_none() && self.quic_connect.is_none() {
+        // TCP failure: tcp/quic connection phase never completed. A response
+        // status means the request ran on a connection that was already up
+        // (`-K`), so whatever failed came after the connect.
+        if self.status.is_none() && self.tcp_connect.is_none() && self.quic_connect.is_none() {
             return 3;
         }
         // TLS failure
@@ -1549,8 +1554,17 @@ impl fmt::Display for HttpStat {
             writeln!(f)?;
         }
 
-        let mut is_text = false;
+        let mut is_text = self.body_is_text;
         let mut is_json = false;
+        let show = |name: &str| {
+            if let Some(includes) = &self.include_headers {
+                includes.iter().any(|h| h == name)
+            } else if let Some(excludes) = &self.exclude_headers {
+                !excludes.iter().any(|h| h == name)
+            } else {
+                true
+            }
+        };
         if let Some(headers) = &self.headers {
             for (key, value) in headers.iter() {
                 let value = value.to_str().unwrap_or_default();
@@ -1562,15 +1576,7 @@ impl fmt::Display for HttpStat {
                         is_json = true;
                     }
                 }
-                let key_lower = key.as_str();
-                let show = if let Some(includes) = &self.include_headers {
-                    includes.iter().any(|h| h == key_lower)
-                } else if let Some(excludes) = &self.exclude_headers {
-                    !excludes.iter().any(|h| h == key_lower)
-                } else {
-                    true
-                };
-                if show {
+                if show(key.as_str()) {
                     writeln!(
                         f,
                         "{}: {}",
@@ -1580,6 +1586,24 @@ impl fmt::Display for HttpStat {
                 }
             }
             writeln!(f)?;
+        }
+        if let Some(trailers) = &self.trailers {
+            let shown: Vec<_> = trailers
+                .iter()
+                .filter(|(key, _)| show(key.as_str()))
+                .collect();
+            if !shown.is_empty() {
+                writeln!(f, "{}", LightGreen.paint(s.trailers_heading))?;
+                for (key, value) in shown {
+                    writeln!(
+                        f,
+                        "{}: {}",
+                        key.to_string().to_train_case(),
+                        LightCyan.paint(value.to_str().unwrap_or_default())
+                    )?;
+                }
+                writeln!(f)?;
+            }
         }
 
         // Server-Timing breakdown (what the server says happened inside Server Processing).
@@ -2144,9 +2168,15 @@ impl fmt::Display for BenchmarkSummary {
             writeln!(f)?;
         }
 
+        // Same floor as the single-request display: a body that arrives in
+        // one burst has no transfer rate worth reporting.
         let mut rates: Vec<f64> = self
             .stats
             .iter()
+            .filter(|s| {
+                s.wire_body_size
+                    .is_some_and(|wire| wire >= THROUGHPUT_DISPLAY_THRESHOLD)
+            })
             .filter_map(|s| s.throughput_bps())
             .collect();
         if !rates.is_empty() {
@@ -2458,6 +2488,62 @@ mod tests {
         };
         assert!(!bad.is_success());
         assert_eq!(bad.exit_code(), 1);
+    }
+
+    #[test]
+    fn error_after_a_response_on_a_reused_connection_is_not_a_tcp_failure() {
+        // `-K` requests carry no connect timing of their own.
+        let mut stat = HttpStat {
+            is_grpc: true,
+            grpc_status: Some("0".into()),
+            error: Some("service not serving".into()),
+            ..Default::default()
+        };
+        assert_eq!(stat.exit_code(), 3);
+        stat.status = Some(StatusCode::OK);
+        assert_eq!(stat.exit_code(), 1);
+    }
+
+    #[test]
+    fn trailers_are_listed_under_their_own_heading() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let stat = HttpStat {
+            status: Some(StatusCode::OK),
+            headers: Some(HeaderMap::new()),
+            trailers: Some(trailers),
+            ..Default::default()
+        };
+        let text = stat.to_string();
+        assert!(text.contains("Trailers:"), "{text}");
+        assert!(text.contains("Grpc-Status: "), "{text}");
+
+        // The header filters apply to trailers too.
+        let filtered = HttpStat {
+            exclude_headers: Some(vec!["grpc-status".to_string()]),
+            ..stat
+        };
+        assert!(!filtered.to_string().contains("Trailers:"));
+    }
+
+    #[test]
+    fn benchmark_summary_reports_throughput_only_for_large_bodies() {
+        let summary = |wire: usize| {
+            let stat = HttpStat {
+                status: Some(StatusCode::OK),
+                total: Some(Duration::from_millis(20)),
+                content_transfer: Some(Duration::from_millis(10)),
+                wire_body_size: Some(wire),
+                ..Default::default()
+            };
+            BenchmarkSummary {
+                stats: vec![stat.clone(), stat],
+                lang: Lang::En,
+            }
+            .to_string()
+        };
+        assert!(summary(THROUGHPUT_DISPLAY_THRESHOLD).contains("Throughput"));
+        assert!(!summary(7).contains("Throughput"));
     }
 
     #[test]

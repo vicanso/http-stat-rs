@@ -9,13 +9,14 @@
 ## 亮点
 
 - **HTTP/1.1、HTTP/2 和 HTTP/3 (QUIC)** — 全面支持现代协议，一个参数即可切换
-- **gRPC** — `grpc://` / `grpcs://` 在路径为空、`/` 或包含 `grpc.health.v1.Health/Check` 时做健康检查。其他路径是原始 unary：body 是带长度前缀的 protobuf 帧（`-d` 是原始 protobuf，不是 JSON），`grpc-status` 来自 trailer。`grpcs://` 执行真实的 rustls 握手（支持 `-k` 与 mTLS）
+- **gRPC** — `grpc://` / `grpcs://` 在路径为空、`/` 或包含 `grpc.health.v1.Health/Check` 时做健康检查；加上 `?service=NAME` 可只检查某一个服务，而不是整个服务端。其他路径是原始 unary：body 是带长度前缀的 protobuf 帧（`-d` 是原始 protobuf，不是 JSON），`grpc-status` 来自 trailer，文本输出里列在 `Trailers：` 下。`grpcs://` 执行真实的 rustls 握手（支持 `-k` 与 mTLS）。两种调用都可以用 `-K` 和 `-c` 复用同一条 HTTP/2 连接
 - **请求发送阶段独立计时** — 将请求体上传与服务端处理拆开，POST/PUT 上传慢不再被误判为"服务器慢"
 - **Server-Timing 解析** — 解析 RFC 8673 `Server-Timing` 响应头，把服务端报告的子阶段耗时（CDN edge / origin / worker 等）直接展开在 TTFB 之下
 - **基准测试模式** — `-n 10` 重复 N 次，输出 min/max/avg/p50/p95/p99。每一次仍然遵守 `--retry`、`--max-time` 和 `--alt-svc`。`-K` 复用一条连接，包括 HTTP/3。`-c N` 让 N 个 HTTP/2 或 HTTP/3 请求同时在途（`-c 4 -n 20` 是 20 次请求、每次最多 4 个在途；只写 `-c 4` 则跑 4 次）。HTTP/1.1 不能多路复用，`-c` 会改成串行
 - **多 IP 并发测试** — `--resolve` 同时测试多个 IP，结果按成功/失败排序
 - **透明解压** — `--compressed` 自动解码 `gzip`、`br`、`zstd` 响应
-- **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`；DoH/DoT 预设：`google-doh`、`cloudflare-doh`、`quad9-doh`、`google-dot`、`cloudflare-dot`、`quad9-dot`
+- **自定义 DNS** — 指定 DNS 服务器 IP 或使用内置预设：`google`、`cloudflare`、`quad9`；DoH/DoT 预设：`google-doh`、`cloudflare-doh`、`quad9-doh`、`google-dot`、`cloudflare-dot`、`quad9-dot`；其他解析服务器可以直接写 DoH 地址（`https://dns.example.com/dns-query`）或 DoT 地址（`tls://dns.example.com`）
+- **国际化域名** — URL 里的 Unicode 主机名（`https://münchen.de/`）会在请求前转成 Punycode
 - **DoH/DoT 阶段拆分** — 使用 DoH 或 DoT 时，DNS 一列会拆成 `DNS Connect`（到解析服务器的 TCP+TLS 握手）与 `DNS Query`，让你看出"DoH 慢"是慢在连 DNS 服务器还是慢在查询本身
 - **内核 TCP 统计** — Linux、macOS 和 Windows 会在连接建立后和读完响应体后再采样一次。`--verbose` 或 `--tcp-info` 展示 RTT、MSS、cwnd 以及本次请求期间的重传，用来区分丢包、TCP 慢启动和应用层延迟。Windows 上的重传计数是字节（`BytesRetrans`），不是报文段。经 HTTP/SOCKS 代理时，采样的是客户端到代理的 socket，不是到源站。
 - **下载吞吐 + 慢启动拆分** — 响应体大于 1 MiB 时，会在 `Body size` 旁加一行 `Throughput: X MB/s`；`--verbose` 下进一步拆成"首 100 KB"与"后续"两段速率，可以把"TCP 慢启动主导"和"服务器流式推得慢"两类问题区分开。
@@ -124,6 +125,9 @@ echo '{"key":"value"}' | httpstat -X POST -d @- -H 'Content-Type: application/js
 # gRPC 健康检查
 httpstat grpc://localhost:50051
 
+# 只检查某一个 gRPC 服务
+httpstat 'grpc://localhost:50051/?service=my.pkg.Service'
+
 # 详细模式 — 展示完整证书链和请求头
 httpstat -v https://github.com
 
@@ -144,6 +148,10 @@ httpstat --dns-servers=cloudflare-doh https://example.com
 
 # DNS-over-TLS
 httpstat --dns-servers=google-dot https://example.com
+
+# 其他 DoH 或 DoT 解析服务器
+httpstat --dns-servers=https://dns.example.com/dns-query https://example.com
+httpstat --dns-servers=tls://dns.example.com https://example.com
 
 # JSON 响应格式化输出
 httpstat --pretty https://httpbin.org/get
@@ -240,7 +248,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
       --http1                      使用 HTTP/1.1
       --alt-svc                    若响应通过 Alt-Svc 广告 HTTP/3，则用 h3 重试一次
   -s                               静默模式，仅输出连接地址和结果
-      --dns-servers <DNS_SERVERS>  指定 DNS 服务器，格式：8.8.8.8,8.8.4.4；预设：google、cloudflare、quad9、google-doh、cloudflare-doh、quad9-doh、google-dot、cloudflare-dot、quad9-dot
+      --dns-servers <DNS_SERVERS>  指定 DNS 服务器：IP（8.8.8.8,8.8.4.4）、预设（google、cloudflare、quad9，或加上 -doh / -dot 后缀）、DoH 地址（https://dns.example.com/dns-query）或 DoT 地址（tls://dns.example.com）
   -v, --verbose                    详细模式
       --pretty                     格式化输出模式
       --waterfall                  以 waterfall 条形图展示各阶段耗时
@@ -323,7 +331,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
 | 6 | HTTP 4xx 客户端错误 |
 | 7 | HTTP 5xx 服务端错误 |
 
-gRPC 只有 `grpc-status` 为 `0` 才算成功。HTTP 200 且 grpc-status 不是 `0` 时退出码为 `1`，`error` 保持为空。
+gRPC 只有 `grpc-status` 为 `0` 才算成功。HTTP 200 且 grpc-status 不是 `0` 时退出码为 `1`；原始 unary 调用的 `error` 保持为空，健康检查的 `error` 会写明原因。
 
 ## 许可证
 

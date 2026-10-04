@@ -18,10 +18,10 @@ use super::body_io::{BodyPump, DrainedBody};
 use super::decompress::decompress;
 use super::error::{Error, Result};
 use super::finish_with_error;
-use super::grpc::grpc_request;
+use super::grpc::{self, grpc_request};
 use super::net::{
-    capture_quic_certs, dns_resolve, quic_connect, tcp_connect, tls_connect_stream, tls_handshake,
-    QuicConnect,
+    capture_quic_certs, dns_resolve, preload_roots, quic_connect, tcp_connect, tls_connect_stream,
+    tls_handshake, QuicConnect,
 };
 use super::proxy::{basic_auth_header, http_connect, socks5_connect, ProxyConfig, ProxyKind};
 use super::quic_info::QuicInfo;
@@ -101,14 +101,14 @@ impl AsyncWrite for BoxedIo {
     }
 }
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
-/// The stream hyper drives: cleartext, or TLS to the origin. Erased to one
-/// type so the HTTP/1.1 and HTTP/2 client stacks are compiled once rather
-/// than once per transport.
-type OriginIo = Box<dyn Io>;
+/// The stream hyper drives: cleartext, TLS to the origin, or TLS to a DoH
+/// resolver. Erased to one type so the HTTP/1.1 and HTTP/2 client stacks
+/// are compiled once rather than once per transport.
+pub(crate) type OriginIo = Box<dyn Io>;
 
 /// Request body that records the `Instant` at which hyper finished consuming it.
 pub(crate) struct TrackedBody {
@@ -816,8 +816,8 @@ async fn http1_2_request(mut http_req: HttpRequest) -> HttpStat {
 /// Performs an HTTP request and returns detailed statistics about the request lifecycle.
 pub async fn request(http_req: HttpRequest) -> HttpStat {
     ensure_crypto_provider();
-    let is_grpc = matches!(http_req.uri.scheme_str().unwrap_or(""), "grpc" | "grpcs");
-    if is_grpc {
+    preload_roots(&http_req);
+    if grpc::is_grpc(&http_req) {
         grpc_request(http_req).await
     } else if http_req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3) {
         http3_request(http_req).await
@@ -1029,6 +1029,13 @@ async fn connect_h3(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection>
 /// HTTP/3 keeps the `quinn::Endpoint` alive for the handle's lifetime.
 pub async fn connect(http_req: &HttpRequest) -> (HttpStat, Option<HttpConnection>) {
     ensure_crypto_provider();
+    preload_roots(http_req);
+    if grpc::is_grpc(http_req) {
+        // gRPC runs over HTTP/2: connect for the request that carries it.
+        // Boxed so the grpc:// → connect() cycle stays a finite future.
+        let (http_req, _) = grpc::prepare(http_req.clone());
+        return Box::pin(connect(&http_req)).await;
+    }
     if http_req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3) {
         return connect_h3(http_req).await;
     }
@@ -1179,6 +1186,14 @@ async fn exchange_h3(
 impl HttpConnection {
     /// Send a request on the existing connection.
     pub async fn send(&mut self, http_req: &HttpRequest) -> HttpStat {
+        if grpc::is_grpc(http_req) {
+            let (http_req, call) = grpc::prepare(http_req.clone());
+            return grpc::finish(self.exchange(&http_req).await, &call);
+        }
+        self.exchange(http_req).await
+    }
+
+    async fn exchange(&mut self, http_req: &HttpRequest) -> HttpStat {
         let start = Instant::now();
         let stat = HttpStat {
             tcp_info_post_connect: self.last_tcp_info.clone(),
@@ -1213,7 +1228,15 @@ impl HttpConnection {
 impl HttpWorker {
     /// One request on a cloned sender. Skips TCP/QUIC path deltas: those
     /// counters are connection-wide and race when several workers send.
-    pub async fn send(mut self, http_req: &HttpRequest) -> HttpStat {
+    pub async fn send(self, http_req: &HttpRequest) -> HttpStat {
+        if grpc::is_grpc(http_req) {
+            let (http_req, call) = grpc::prepare(http_req.clone());
+            return grpc::finish(self.exchange(&http_req).await, &call);
+        }
+        self.exchange(http_req).await
+    }
+
+    async fn exchange(mut self, http_req: &HttpRequest) -> HttpStat {
         let start = Instant::now();
         let stat = HttpStat::default();
         match &mut self.kind {

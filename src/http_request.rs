@@ -26,6 +26,7 @@ use http::Uri;
 use http::{HeaderMap, Method};
 use http_body_util::Full;
 use rustls::client::{ClientSessionMemoryCache, ClientSessionStore};
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -259,6 +260,39 @@ pub fn new_tls_session_store(capacity: usize) -> Arc<dyn ClientSessionStore> {
 }
 
 // Convert string URL to HttpRequest
+/// Rewrite a non-ASCII host as Punycode (IDNA): `http::Uri` only takes
+/// ASCII. `url` starts with a scheme. A URL whose host is already ASCII
+/// comes back untouched.
+fn punycode_host(url: &str) -> Result<Cow<'_, str>> {
+    let Some(scheme_end) = url.find("://") else {
+        return Ok(Cow::Borrowed(url));
+    };
+    let start = scheme_end + 3;
+    let end = url[start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| start + i);
+    // Skip `user:pass@`, then split off a trailing `:port`.
+    let host_start = url[start..end].rfind('@').map_or(start, |i| start + i + 1);
+    let authority = &url[host_start..end];
+    let host_len = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host.len(),
+        _ => authority.len(),
+    };
+    let host = &authority[..host_len];
+    if host.is_ascii() {
+        return Ok(Cow::Borrowed(url));
+    }
+    let ascii = idna::domain_to_ascii(host).map_err(|_| Error::Common {
+        category: "uri".to_string(),
+        message: format!("invalid international domain name {host}"),
+    })?;
+    Ok(Cow::Owned(format!(
+        "{}{ascii}{}",
+        &url[..host_start],
+        &url[host_start + host_len..]
+    )))
+}
+
 impl TryFrom<&str> for HttpRequest {
     type Error = Error;
 
@@ -270,7 +304,9 @@ impl TryFrom<&str> for HttpRequest {
         } else {
             format!("http://{url}")
         };
-        let uri = value.parse::<Uri>().map_err(|e| Error::Uri { source: e })?;
+        let uri = punycode_host(&value)?
+            .parse::<Uri>()
+            .map_err(|e| Error::Uri { source: e })?;
         Ok(Self {
             uri,
             alpn_protocols: vec![ALPN_HTTP2.to_string(), ALPN_HTTP1.to_string()],
@@ -386,6 +422,48 @@ mod tests {
             HttpRequest::try_from("http://x:8080").unwrap().get_port(),
             8080
         );
+    }
+
+    #[test]
+    fn try_from_converts_a_unicode_host_to_punycode() {
+        let host = |url: &str| {
+            let req = HttpRequest::try_from(url).unwrap();
+            (req.uri.host().unwrap().to_string(), req.uri.to_string())
+        };
+        assert_eq!(host("https://münchen.de/").0, "xn--mnchen-3ya.de");
+        // No scheme, upper case, and a decomposed `ü` all map to the same name.
+        assert_eq!(host("MÜNCHEN.de").0, "xn--mnchen-3ya.de");
+        assert_eq!(host("http://mu\u{308}nchen.de").0, "xn--mnchen-3ya.de");
+        assert_eq!(host("http://例え.jp/").0, "xn--r8jz45g.jp");
+        // Userinfo, port, path and query stay where they are.
+        assert_eq!(
+            host("https://user:pw@bücher.example:8443/a/b?c=d").1,
+            "https://user:pw@xn--bcher-kva.example:8443/a/b?c=d"
+        );
+    }
+
+    #[test]
+    fn try_from_leaves_an_ascii_host_untouched() {
+        for url in [
+            "http://Example.COM/Path",
+            "http://[::1]:8080/",
+            "https://user@example.com:8443/?q=1",
+            "grpc://svc:50051",
+        ] {
+            assert!(
+                matches!(punycode_host(url).unwrap(), Cow::Borrowed(_)),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_an_invalid_international_name() {
+        // A label may not start with a combining mark.
+        assert!(matches!(
+            HttpRequest::try_from("http://\u{301}abc.com/"),
+            Err(Error::Common { .. })
+        ));
     }
 
     // ---- builder ----

@@ -121,6 +121,7 @@ pub struct Strings {
 
     // Server-Timing summary line
     pub server_timing_heading: &'static str,
+    pub trailers_heading: &'static str,
     pub st_sum_of: &'static str,
     pub st_unaccounted: &'static str,
 
@@ -205,6 +206,7 @@ pub const EN: Strings = Strings {
     cert_chain: "Certificate Chain",
 
     server_timing_heading: "Server-Timing:",
+    trailers_heading: "Trailers:",
     st_sum_of: "of",
     st_unaccounted: "unaccounted",
 
@@ -285,6 +287,7 @@ pub const ZH: Strings = Strings {
     cert_chain: "证书链",
 
     server_timing_heading: "Server-Timing：",
+    trailers_heading: "Trailers：",
     st_sum_of: "占",
     st_unaccounted: "未统计",
 

@@ -11,13 +11,14 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 ## Highlights
 
 - **HTTP/1.1, HTTP/2 & HTTP/3 (QUIC)** — first-class support for all modern protocols, switch with a single flag
-- **gRPC** — `grpc://` / `grpcs://` with an empty path, `/`, or `grpc.health.v1.Health/Check` runs a health check. Any other path is a raw unary RPC: the body is a length-prefixed protobuf frame (`-d` is raw protobuf, not JSON), and `grpc-status` comes from the trailers. `grpcs://` performs a real rustls handshake (honoring `-k` and mTLS)
+- **gRPC** — `grpc://` / `grpcs://` with an empty path, `/`, or `grpc.health.v1.Health/Check` runs a health check; add `?service=NAME` to check one service instead of the whole server. Any other path is a raw unary RPC: the body is a length-prefixed protobuf frame (`-d` is raw protobuf, not JSON), and `grpc-status` comes from the trailers, which are listed under `Trailers:`. `grpcs://` performs a real rustls handshake (honoring `-k` and mTLS). `-K` and `-c` reuse one HTTP/2 connection for either kind of call
 - **Request Send phase** — request body upload is timed separately from Server Processing, so a slow POST upload no longer hides as "server is slow"
 - **Server-Timing inspection** — parses the `Server-Timing` response header (RFC 8673) and displays the server-reported breakdown *inside* TTFB (CDN edge vs origin vs worker, etc.)
 - **Benchmark mode** — `-n 10` repeats N times with min/max/avg/p50/p95/p99. Each iteration still honors `--retry`, `--max-time`, and `--alt-svc`. `-K` reuses one connection, including HTTP/3. `-c N` keeps N HTTP/2 or HTTP/3 requests in flight (`-c 4 -n 20` is 20 requests, 4 at a time; `-c 4` alone runs 4). HTTP/1.1 cannot multiplex and runs `-c` one after another
 - **Multi-IP concurrent testing** — `--resolve` tests multiple IPs in parallel, results sorted by success
 - **Transparent decompression** — auto-decodes `gzip`, `br`, `zstd` responses with `--compressed`
-- **Custom DNS** — specify DNS servers by IP or use built-in presets: `google`, `cloudflare`, `quad9`; DoH/DoT presets: `google-doh`, `cloudflare-doh`, `quad9-doh`, `google-dot`, `cloudflare-dot`, `quad9-dot`
+- **Custom DNS** — specify DNS servers by IP or use built-in presets: `google`, `cloudflare`, `quad9`; DoH/DoT presets: `google-doh`, `cloudflare-doh`, `quad9-doh`, `google-dot`, `cloudflare-dot`, `quad9-dot`; or any other resolver as a DoH URL (`https://dns.example.com/dns-query`) or a DoT address (`tls://dns.example.com`)
+- **International domain names** — a Unicode host in the URL (`https://münchen.de/`) is converted to Punycode before the request is made
 - **DoH/DoT phase split** — when DoH or DoT is in use, the DNS column splits into `DNS Connect` (TCP+TLS to the resolver) and `DNS Query`, so you can tell whether "DoH is slow" means slow handshake to the resolver or slow query processing
 - **Kernel TCP statistics** — on Linux, macOS, and Windows, samples TCP info right after connect and again after the response body is read. Shown under `--verbose` or with `--tcp-info`; surfaces RTT, MSS, cwnd, and retransmits during the request, which isolates "Content Transfer slow" into packet loss vs TCP slow start vs application latency. On Windows the retransmit counter is bytes (`BytesRetrans`), not segments. Through an HTTP/SOCKS proxy the sample reflects the client↔proxy socket, not the origin.
 - **Download throughput with slow-start split** — for response bodies larger than 1 MiB, a `Throughput: X MB/s` line is shown next to `Body size`. Under `--verbose`, it also breaks down into "first 100 KB" vs "tail" so you can tell TCP slow-start–dominated downloads from servers that simply stream slowly the whole way.
@@ -126,6 +127,9 @@ echo '{"key":"value"}' | httpstat -X POST -d @- -H 'Content-Type: application/js
 # gRPC health check
 httpstat grpc://localhost:50051
 
+# gRPC health check for one service
+httpstat 'grpc://localhost:50051/?service=my.pkg.Service'
+
 # Verbose mode — full cert chain + request headers
 httpstat -v https://github.com
 
@@ -146,6 +150,10 @@ httpstat --dns-servers=cloudflare-doh https://example.com
 
 # DNS-over-TLS
 httpstat --dns-servers=google-dot https://example.com
+
+# Any other DoH or DoT resolver
+httpstat --dns-servers=https://dns.example.com/dns-query https://example.com
+httpstat --dns-servers=tls://dns.example.com https://example.com
 
 # Pretty-print JSON response
 httpstat --pretty https://httpbin.org/get
@@ -242,7 +250,7 @@ Options:
       --http1                      use http/1.1
       --alt-svc                    if the response advertises HTTP/3 via Alt-Svc, retry once over h3
   -s                               silent mode, only output the connect address and result
-      --dns-servers <DNS_SERVERS>  dns server address to use, format: 8.8.8.8,8.8.4.4; presets: google, cloudflare, quad9, google-doh, cloudflare-doh, quad9-doh, google-dot, cloudflare-dot, quad9-dot
+      --dns-servers <DNS_SERVERS>  dns servers to use: IPs (8.8.8.8,8.8.4.4), a preset (google, cloudflare, quad9, or one with -doh / -dot appended), a DoH URL (https://dns.example.com/dns-query) or a DoT address (tls://dns.example.com)
   -v, --verbose                    verbose mode
       --pretty                     pretty mode
       --waterfall                  show timing as a waterfall bar chart
@@ -325,7 +333,7 @@ Create `~/.httpstatrc` as a JSON object — any field can be omitted. CLI flags 
 | 6 | HTTP 4xx client error |
 | 7 | HTTP 5xx server error |
 
-A gRPC call succeeds only when `grpc-status` is `0`. HTTP 200 with any other grpc-status exits `1` and leaves `error` unset.
+A gRPC call succeeds only when `grpc-status` is `0`. HTTP 200 with any other grpc-status exits `1`; a raw unary call leaves `error` unset, a health check sets it to the reason.
 
 ## License
 

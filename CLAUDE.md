@@ -13,7 +13,7 @@ A pure Rust CLI tool (`httpstat`) that visualizes HTTP request statistics (timin
 - **Run tests**: `cargo test` (or `make test`)
 - **Lint**: `make lint` (runs `typos` + `cargo clippy --all-targets --all -- --deny=warnings`)
 - **Check outdated deps**: `cargo outdated`
-- **Check MSRV**: `cargo msrv list` (minimum Rust version: 1.82)
+- **Check MSRV**: `cargo msrv list` (minimum Rust version: 1.88)
 
 ## Architecture
 
@@ -24,10 +24,10 @@ The library (`src/lib.rs`) exposes the public API through re-exports:
 - **`request::request(HttpRequest) -> HttpStat`** - Main entry point. Routes to `http1_2_request`, `http3_request`, or `grpc_request` based on ALPN/scheme. Handles response body decompression automatically.
 - **`http_request::HttpRequest`** - Request configuration struct (URI, method, headers, timeouts, ALPN protocols, DNS/IP settings). Implements `TryFrom<&str>` for URL parsing. Default ALPN is `[h2, http/1.1]`.
 - **`stats::HttpStat`** - Result struct with per-phase timing (`dns_lookup`, `tcp_connect`, `tls_handshake`, `quic_connect`, `server_processing`, `content_transfer`, `total`), response data, TLS/cert info, and errors. Implements `Display` for the colorized terminal output visualization.
-- **`net`** (crate-internal) - Network primitives: `dns_resolve`, `tcp_connect`, `tls_handshake`, `quic_connect`. Uses `hickory-resolver` for DNS, `tokio-rustls` for TLS, `quinn`/`h3-quinn` for QUIC.
+- **`net`** (crate-internal) - Network primitives: `dns_resolve`, `tcp_connect`, `tls_handshake`, `quic_connect`. Uses `hickory-resolver` for DNS, `tokio-rustls` for TLS, `quinn`/`h3-quinn` for QUIC. DoH/DoT is hand-rolled here (`SecureDns`): presets, `https://` URLs and `tls://` addresses.
 - **`error`** - Error types using `snafu`. All network/protocol errors unified under `Error` enum.
 - **`decompress`** - Handles gzip, brotli, and zstd decompression.
-- **`grpc`** - gRPC without a gRPC library: raw unary RPCs over the HTTP/2 path, and `grpc.health.v1.Health/Check` built on it with a hand-decoded response.
+- **`grpc`** - gRPC without a gRPC library: `prepare` rewrites a `grpc://` request into the HTTP/2 request that carries it and `finish` reads the outcome, so one-shot requests and reused connections (`-K`, `-c`) share the same code. `grpc.health.v1.Health/Check` is built on it with a hand-decoded response.
 - **`skip_verifier`** - Custom TLS certificate verifier for `-k` flag.
 
 ## Key Design Details
@@ -37,3 +37,4 @@ The library (`src/lib.rs`) exposes the public API through re-exports:
 - The `--resolve` flag tests multiple IPs simultaneously, sorting results so errors appear last.
 - Redirect following (`-L`) is implemented manually. `--max-redirs` caps the chain (default 10) and a repeated method+URI is treated as a loop.
 - URL schemes `grpc://` and `grpcs://` route to gRPC health check path.
+- The platform trust store is read once per process (`net::root_store`) and before any timer starts: reading it takes about 80 ms on macOS. `request()` and `connect()` preload it when `net::uses_tls` says the request needs it, so a new code path that opens TLS or QUIC has to be covered there.

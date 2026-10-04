@@ -15,6 +15,7 @@
 // This file implements HTTP request functionality with support for HTTP/1.1, HTTP/2, and HTTP/3
 // It includes features like DNS resolution, TLS handshake, and request/response handling
 
+use crate::proxy::percent_decode;
 use crate::{HttpRequest, HttpStat, ALPN_HTTP2};
 use bytes::{Bytes, BytesMut};
 use http::header::{HeaderMap, HeaderValue};
@@ -73,10 +74,49 @@ fn apply_grpc_status(stat: &mut HttpStat) {
     stat.grpc_status = grpc_trailer(stat, "grpc-status");
 }
 
-/// Raw unary RPC. The scheme is rewritten before `request()` so this does not
-/// recurse. Cleartext `grpc://` uses h2c prior knowledge; `--http2 http://`
-/// is unchanged.
-async fn raw_unary(mut http_req: HttpRequest) -> HttpStat {
+/// Which RPC a `grpc://` / `grpcs://` request stands for.
+pub(crate) enum GrpcCall {
+    /// A raw unary RPC to the method in the URL path.
+    Unary,
+    /// `grpc.health.v1.Health/Check`.
+    HealthCheck,
+}
+
+pub(crate) fn is_grpc(http_req: &HttpRequest) -> bool {
+    matches!(http_req.uri.scheme_str(), Some("grpc" | "grpcs"))
+}
+
+/// The `service` query parameter of a health check URL, or `""` for the
+/// server as a whole.
+fn health_service(query: Option<&str>) -> &str {
+    query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .find_map(|pair| pair.strip_prefix("service="))
+        .unwrap_or("")
+}
+
+/// A `grpc.health.v1.HealthCheckRequest`: `service` is field 1. Proto3
+/// leaves out an empty string.
+fn health_check_request(service: &str) -> Bytes {
+    let mut msg = Vec::new();
+    if !service.is_empty() {
+        msg.push(0x0a);
+        write_varint(&mut msg, service.len() as u64);
+        msg.extend_from_slice(service.as_bytes());
+    }
+    Bytes::from(msg)
+}
+
+/// Turn a `grpc://` / `grpcs://` request into the HTTP/2 request that
+/// carries it. Cleartext `grpc://` uses h2c prior knowledge; `--http2
+/// http://` is unchanged.
+pub(crate) fn prepare(mut http_req: HttpRequest) -> (HttpRequest, GrpcCall) {
+    let call = if is_health_path(http_req.uri.path()) {
+        GrpcCall::HealthCheck
+    } else {
+        GrpcCall::Unary
+    };
     let cleartext = http_req.uri.scheme_str() == Some("grpc");
     let mut parts = http_req.uri.clone().into_parts();
     parts.scheme = Some(if cleartext {
@@ -84,8 +124,22 @@ async fn raw_unary(mut http_req: HttpRequest) -> HttpStat {
     } else {
         http::uri::Scheme::HTTPS
     });
-    if parts.path_and_query.is_none() {
-        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    match call {
+        GrpcCall::HealthCheck => {
+            http_req.body = Some(health_check_request(health_service(http_req.uri.query())));
+            parts.path_and_query = Some(PathAndQuery::from_static(HEALTH_CHECK_PATH));
+            // The verdict is in the response message, so it has to stay in
+            // memory.
+            http_req.discard_body = false;
+            http_req.output_path = None;
+            // The check dials the target directly.
+            http_req.proxy = None;
+        }
+        GrpcCall::Unary => {
+            if parts.path_and_query.is_none() {
+                parts.path_and_query = Some(PathAndQuery::from_static("/"));
+            }
+        }
     }
     http_req.uri = Uri::from_parts(parts).unwrap_or(http_req.uri);
     http_req.alpn_protocols = vec![ALPN_HTTP2.to_string()];
@@ -106,10 +160,11 @@ async fn raw_unary(mut http_req: HttpRequest) -> HttpStat {
     );
     headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
     http_req.headers = Some(headers);
+    (http_req, call)
+}
 
-    // Boxed so the grpc:// → request() → raw_unary cycle stays a finite future.
-    // The scheme was rewritten above, so this call takes the HTTP path.
-    let mut stat = Box::pin(crate::request::request(http_req)).await;
+/// Read the gRPC outcome out of the HTTP/2 response to a prepared request.
+pub(crate) fn finish(mut stat: HttpStat, call: &GrpcCall) -> HttpStat {
     stat.is_grpc = true;
     if let Some(body) = stat.body.clone() {
         if let Some(unframed) = unframe_grpc(&body) {
@@ -118,14 +173,26 @@ async fn raw_unary(mut http_req: HttpRequest) -> HttpStat {
         }
     }
     apply_grpc_status(&mut stat);
+    if let GrpcCall::HealthCheck = call {
+        finish_health_check(&mut stat);
+    }
     stat
 }
 
 pub(crate) async fn grpc_request(http_req: HttpRequest) -> HttpStat {
-    if !is_health_path(http_req.uri.path()) {
-        return raw_unary(http_req).await;
+    let (http_req, call) = prepare(http_req);
+    // Boxed so the grpc:// → request() → grpc_request cycle stays a finite
+    // future. `prepare` rewrote the scheme, so this call takes the HTTP path.
+    let stat = Box::pin(crate::request::request(http_req)).await;
+    finish(stat, &call)
+}
+
+fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push(value as u8 | 0x80);
+        value >>= 7;
     }
-    health_request(http_req).await
+    buf.push(value as u8);
 }
 
 fn read_varint(buf: &mut &[u8]) -> Option<u64> {
@@ -221,27 +288,15 @@ fn health_rpc_error(stat: &HttpStat) -> Option<String> {
     if let Some(name) = grpc_code_name(code) {
         error.push_str(&format!(" ({name})"));
     }
+    // `grpc-message` is percent-encoded on the wire.
     if let Some(message) = grpc_trailer(stat, "grpc-message").filter(|m| !m.is_empty()) {
-        error.push_str(&format!(": {message}"));
+        error.push_str(&format!(": {}", percent_decode(&message)));
     }
     Some(error)
 }
 
-/// `grpc.health.v1.Health/Check` for the server as a whole. It is sent as a
-/// raw unary RPC, so it shares the HTTP/2 path and its timings.
-async fn health_request(mut http_req: HttpRequest) -> HttpStat {
-    let mut parts = http_req.uri.clone().into_parts();
-    parts.path_and_query = Some(PathAndQuery::from_static(HEALTH_CHECK_PATH));
-    http_req.uri = Uri::from_parts(parts).unwrap_or(http_req.uri);
-    // An empty HealthCheckRequest names no service.
-    http_req.body = None;
-    // The verdict is in the response message, so it has to stay in memory.
-    http_req.discard_body = false;
-    http_req.output_path = None;
-    // The check dials the target directly.
-    http_req.proxy = None;
-
-    let mut stat = raw_unary(http_req).await;
+/// Turn the response to `grpc.health.v1.Health/Check` into a verdict.
+fn finish_health_check(stat: &mut HttpStat) {
     // One metadata block, so `grpc-status` stays readable from the headers.
     if let Some(trailers) = stat.trailers.take() {
         stat.headers
@@ -249,15 +304,15 @@ async fn health_request(mut http_req: HttpRequest) -> HttpStat {
             .extend(trailers);
     }
     if stat.error.is_some() {
-        return stat;
+        return;
     }
-    if let Some(error) = health_rpc_error(&stat) {
+    if let Some(error) = health_rpc_error(stat) {
         stat.error = Some(error);
-        return stat;
+        return;
     }
     let Some(status) = stat.body.as_deref().and_then(health_status) else {
         stat.error = Some("invalid health check response".to_string());
-        return stat;
+        return;
     };
     stat.body = Some(
         format!(
@@ -266,10 +321,10 @@ async fn health_request(mut http_req: HttpRequest) -> HttpStat {
         )
         .into(),
     );
+    stat.body_is_text = true;
     if status != SERVING {
         stat.error = Some("service not serving".to_string());
     }
-    stat
 }
 
 #[cfg(test)]
@@ -340,11 +395,119 @@ mod tests {
 
         let mut with_message = stat(Some("5"));
         let mut trailers = HeaderMap::new();
-        trailers.insert("grpc-message", HeaderValue::from_static("no such service"));
+        trailers.insert(
+            "grpc-message",
+            HeaderValue::from_static("service%20not%20registered"),
+        );
         with_message.trailers = Some(trailers);
         assert_eq!(
             health_rpc_error(&with_message).as_deref(),
-            Some("grpc-status 5 (NOT_FOUND): no such service")
+            Some("grpc-status 5 (NOT_FOUND): service not registered")
         );
+    }
+
+    #[test]
+    fn health_service_comes_from_the_query() {
+        assert_eq!(health_service(None), "");
+        assert_eq!(health_service(Some("")), "");
+        assert_eq!(health_service(Some("service=pkg.Svc")), "pkg.Svc");
+        assert_eq!(health_service(Some("a=1&service=pkg.Svc&b=2")), "pkg.Svc");
+        assert_eq!(health_service(Some("myservice=x")), "");
+    }
+
+    #[test]
+    fn health_check_request_encodes_the_service_name() {
+        assert!(health_check_request("").is_empty());
+        assert_eq!(
+            health_check_request("ab").as_ref(),
+            [0x0a, 0x02, b'a', b'b']
+        );
+        // A length past 127 needs a two-byte varint.
+        let long = "x".repeat(200);
+        let msg = health_check_request(&long);
+        assert_eq!(&msg[..3], [0x0a, 0xc8, 0x01]);
+        assert_eq!(msg.len(), 3 + 200);
+    }
+
+    #[test]
+    fn prepare_builds_a_health_check() {
+        let mut req = HttpRequest::try_from("grpc://svc.local:50051/?service=pkg.Svc").unwrap();
+        req.body = Some(Bytes::from_static(b"ignored"));
+        req.discard_body = true;
+        req.proxy = Some("http://proxy.local:8080".to_string());
+        let (wire, call) = prepare(req);
+        assert!(matches!(call, GrpcCall::HealthCheck));
+        assert_eq!(
+            wire.uri.to_string(),
+            "http://svc.local:50051/grpc.health.v1.Health/Check"
+        );
+        assert_eq!(wire.method.as_deref(), Some("POST"));
+        assert!(wire.h2_prior_knowledge);
+        assert!(!wire.discard_body);
+        assert!(wire.proxy.is_none());
+        // 5-byte gRPC frame header, then the HealthCheckRequest.
+        let mut expected = vec![0, 0, 0, 0, 9, 0x0a, 7];
+        expected.extend_from_slice(b"pkg.Svc");
+        assert_eq!(wire.body.as_deref(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn prepare_keeps_a_unary_call_as_written() {
+        let mut req = HttpRequest::try_from("grpcs://svc.local/pkg.Svc/Method").unwrap();
+        req.body = Some(Bytes::from_static(&[0x08, 0x01]));
+        req.discard_body = true;
+        let (wire, call) = prepare(req);
+        assert!(matches!(call, GrpcCall::Unary));
+        assert_eq!(wire.uri.to_string(), "https://svc.local/pkg.Svc/Method");
+        assert!(!wire.h2_prior_knowledge);
+        assert!(wire.discard_body);
+        assert_eq!(wire.alpn_protocols, [ALPN_HTTP2]);
+        assert_eq!(
+            wire.body.as_deref(),
+            Some([0, 0, 0, 0, 2, 0x08, 0x01].as_slice())
+        );
+    }
+
+    #[test]
+    fn finish_reads_the_health_verdict() {
+        let response = |message: &'static [u8]| {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("application/grpc"));
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+            HttpStat {
+                status: Some(http::StatusCode::OK),
+                headers: Some(headers),
+                trailers: Some(trailers),
+                body: Some(Bytes::from_static(message)),
+                ..Default::default()
+            }
+        };
+        let serving = finish(
+            response(&[0, 0, 0, 0, 2, 0x08, 0x01]),
+            &GrpcCall::HealthCheck,
+        );
+        assert!(serving.is_success());
+        assert!(serving.body_is_text);
+        assert_eq!(
+            serving.body.as_deref(),
+            Some(b"HealthCheckResponse { status: Serving }".as_slice())
+        );
+        // Trailers are folded into the headers for a health check.
+        assert!(serving.trailers.is_none());
+        assert_eq!(serving.headers.unwrap().get("grpc-status").unwrap(), "0");
+
+        let down = finish(
+            response(&[0, 0, 0, 0, 2, 0x08, 0x02]),
+            &GrpcCall::HealthCheck,
+        );
+        assert_eq!(down.error.as_deref(), Some("service not serving"));
+
+        // A raw unary call keeps the message bytes and its trailers.
+        let unary = finish(response(&[0, 0, 0, 0, 2, 0x08, 0x01]), &GrpcCall::Unary);
+        assert!(unary.is_success());
+        assert!(!unary.body_is_text);
+        assert_eq!(unary.body.as_deref(), Some([0x08, 0x01].as_slice()));
+        assert!(unary.trailers.is_some());
     }
 }

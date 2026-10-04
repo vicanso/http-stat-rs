@@ -251,7 +251,7 @@ classify failures without parsing the `error` string.
 
 | Code | Meaning | When |
 | --- | --- | --- |
-| `0` | Success | HTTP 1xx/2xx/3xx (>= 400 is treated as failure). A gRPC call also requires `grpc-status` `0`; HTTP 200 with any other grpc-status is exit `1` and leaves `error` null. |
+| `0` | Success | HTTP 1xx/2xx/3xx (>= 400 is treated as failure). A gRPC call also requires `grpc-status` `0`; HTTP 200 with any other grpc-status is exit `1`. A raw unary call leaves `error` null, a health check sets it to the reason. |
 | `1` | Generic error | Unclassified failure. |
 | `2` | DNS failure | `dns_lookup` phase never completed. |
 | `3` | TCP/QUIC failure | Connect phase never completed. |

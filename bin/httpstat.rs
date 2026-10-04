@@ -136,7 +136,7 @@ struct Args {
     /// DNS servers
     #[arg(
         long = "dns-servers",
-        help = "dns server address to use, format: 8.8.8.8,8.8.4.4"
+        help = "dns servers to use: IPs (8.8.8.8,8.8.4.4), a preset (google, cloudflare, quad9, or one with -doh / -dot appended), a DoH URL (https://dns.example.com/dns-query) or a DoT address (tls://dns.example.com)"
     )]
     dns_servers: Option<String>,
     /// Verbose mode
