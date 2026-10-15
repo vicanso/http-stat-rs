@@ -162,13 +162,6 @@ mod linux {
     use std::time::{Duration, Instant};
 
     #[repr(C)]
-    struct CmsgHdr {
-        cmsg_len: usize,
-        cmsg_level: i32,
-        cmsg_type: i32,
-    }
-
-    #[repr(C)]
     struct SockExtendedErr {
         ee_errno: u32,
         ee_origin: u8,
@@ -506,12 +499,13 @@ mod linux {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = mem::size_of_val(&cbuf);
+        // glibc uses `size_t`; musl uses `socklen_t`.
+        msg.msg_controllen = mem::size_of_val(&cbuf) as _;
         let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE) };
         if n < 0 {
             return None;
         }
-        let len = msg.msg_controllen.min(mem::size_of_val(&cbuf));
+        let len = (msg.msg_controllen as usize).min(mem::size_of_val(&cbuf));
         let bytes = unsafe { std::slice::from_raw_parts(cbuf.as_ptr().cast::<u8>(), len) };
         parse_control(bytes)
     }
@@ -541,16 +535,18 @@ mod linux {
     }
 
     fn parse_control(buf: &[u8]) -> Option<IcmpReply> {
-        let hdr_size = mem::size_of::<CmsgHdr>();
+        let hdr_size = mem::size_of::<libc::cmsghdr>();
         let mut off = 0usize;
         while off + hdr_size <= buf.len() {
-            let hdr = unsafe { ptr::read_unaligned(buf.as_ptr().add(off).cast::<CmsgHdr>()) };
-            if hdr.cmsg_len < hdr_size {
+            let hdr = unsafe { ptr::read_unaligned(buf.as_ptr().add(off).cast::<libc::cmsghdr>()) };
+            // musl's `cmsg_len` is `socklen_t`, glibc's is `size_t`.
+            let cmsg_len = hdr.cmsg_len as usize;
+            if cmsg_len < hdr_size {
                 break;
             }
             let data = off + align(hdr_size);
             let ee_end = data + mem::size_of::<SockExtendedErr>();
-            let msg_end = off + hdr.cmsg_len;
+            let msg_end = off + cmsg_len;
             let is_err = (hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_RECVERR)
                 || (hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_RECVERR);
             if is_err && ee_end <= buf.len() && ee_end <= msg_end {
@@ -624,16 +620,15 @@ mod linux {
             offender[6] = 2;
             offender[7] = 1;
             let data_len = mem::size_of::<SockExtendedErr>() + offender.len();
-            let hdr_size = mem::size_of::<CmsgHdr>();
+            let hdr_size = mem::size_of::<libc::cmsghdr>();
             let cmsg_len = hdr_size + data_len;
             let mut buf = vec![0u8; align(cmsg_len)];
-            let hdr = CmsgHdr {
-                cmsg_len,
-                cmsg_level: libc::IPPROTO_IP,
-                cmsg_type: libc::IP_RECVERR,
-            };
+            let mut hdr: libc::cmsghdr = unsafe { mem::zeroed() };
+            hdr.cmsg_len = cmsg_len as _;
+            hdr.cmsg_level = libc::IPPROTO_IP;
+            hdr.cmsg_type = libc::IP_RECVERR;
             unsafe {
-                ptr::write_unaligned(buf.as_mut_ptr().cast::<CmsgHdr>(), hdr);
+                ptr::write_unaligned(buf.as_mut_ptr().cast::<libc::cmsghdr>(), hdr);
                 ptr::write_unaligned(
                     buf.as_mut_ptr()
                         .add(align(hdr_size))
