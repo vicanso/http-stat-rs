@@ -19,6 +19,7 @@
 - **国际化域名** — URL 里的 Unicode 主机名（`https://münchen.de/`）会在请求前转成 Punycode
 - **DoH/DoT 阶段拆分** — 使用 DoH 或 DoT 时，DNS 一列会拆成 `DNS Connect`（到解析服务器的 TCP+TLS 握手）与 `DNS Query`，让你看出"DoH 慢"是慢在连 DNS 服务器还是慢在查询本身。走 HTTP/2 时 A 和 AAAA 两个查询会同时发出
 - **内核 TCP 统计** — Linux、macOS 和 Windows 会在连接建立后和读完响应体后再采样一次。`--verbose` 或 `--tcp-info` 展示 RTT、MSS、cwnd 以及本次请求期间的重传，用来区分丢包、TCP 慢启动和应用层延迟。Windows 上的重传计数是字节（`BytesRetrans`），不是报文段。经 HTTP/SOCKS 代理时，采样的是客户端到代理的 socket，不是到源站。
+- **路由跟踪** — `--route` 在计时完成之后，列出到这次所连地址的每一跳。走代理时只跟踪到代理。跳的耗时不计入 `tcp_connect`、`quic_connect` 或 `total`。Linux 对 HTTP/3 发 UDP、其余发 TCP，并用 `IP_RECVERR` 读 ICMP。macOS 用不需要 root 的 ICMP Echo。Windows 会说明无法跟踪，而不会编一条路径。
 - **下载吞吐 + 慢启动拆分** — 响应体大于 1 MiB 时，会在 `Body size` 旁加一行 `Throughput: X MB/s`；`--verbose` 下进一步拆成"首 100 KB"与"后续"两段速率，可以把"TCP 慢启动主导"和"服务器流式推得慢"两类问题区分开。
 - **中英双语输出** — `--lang en|zh` 显式指定显示语言；不指定时自动读取 `LC_ALL` / `LC_MESSAGES` / `LANG`（`zh*` 走中文），无匹配则回退英文。JSON 输出始终保持英文键，避免影响下游脚本。
 - **JSON 输出** — `--json` 方便脚本集成、CI/CD 流水线和监控系统对接。完整的输出契约见 [JSON_SCHEMA.md](./JSON_SCHEMA.md)，包含退出码、可选字段以及可直接复用的 `jq` 配方
@@ -253,6 +254,7 @@ httpstat 以美观清晰的方式展示 curl(1) 的统计信息。
       --pretty                     格式化输出模式
       --waterfall                  以 waterfall 条形图展示各阶段耗时
       --tcp-info                   显示内核 TCP_INFO 统计（RTT、cwnd、重传）；Linux、macOS 和 Windows
+      --route                      跟踪到所连地址的每一跳（Linux 用 TCP 或 UDP，macOS 用 ICMP）；不计入各阶段耗时
       --lang <LANG>                显示语言：en | zh（默认跟随系统）
       --timeout <TIMEOUT>          超时时间（作用于每个阶段：DNS、TCP、TLS、请求、QUIC）
       --connect-timeout <DUR>      仅连接阶段的超时（DNS + TCP + TLS/QUIC），例如 5s
@@ -321,6 +323,7 @@ cp -r http-stat-rs/skills/httpstat ~/.claude/skills/
   "json": false,
   "waterfall": false,
   "tcp_info": false,
+  "route": false,
   "reuse": false,
   "lang": "zh",
   "proxy": "http://proxy.example:8080",

@@ -1,0 +1,3 @@
+[default.extend-words]
+# libc `msghdr.msg_controllen`. Not a misspelling of "controller".
+controllen = "controllen"

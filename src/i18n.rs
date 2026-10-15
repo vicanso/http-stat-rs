@@ -165,6 +165,7 @@ pub struct Strings {
     pub quic_heading: &'static str,
     pub candidates: &'static str,
     pub quic_lost: &'static str,
+    pub route_heading: &'static str,
 }
 
 pub const EN: Strings = Strings {
@@ -246,6 +247,7 @@ pub const EN: Strings = Strings {
     quic_heading: "QUIC:",
     candidates: "Candidates",
     quic_lost: "lost",
+    route_heading: "Route:",
 };
 
 pub const ZH: Strings = Strings {
@@ -327,6 +329,7 @@ pub const ZH: Strings = Strings {
     quic_heading: "QUIC：",
     candidates: "候选地址",
     quic_lost: "丢包",
+    route_heading: "路由：",
 };
 
 #[cfg(test)]

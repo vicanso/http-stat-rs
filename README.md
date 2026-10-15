@@ -21,6 +21,7 @@ A **zero-dependency, single-binary** HTTP diagnostics tool written in pure Rust.
 - **International domain names** — a Unicode host in the URL (`https://münchen.de/`) is converted to Punycode before the request is made
 - **DoH/DoT phase split** — when DoH or DoT is in use, the DNS column splits into `DNS Connect` (TCP+TLS to the resolver) and `DNS Query`, so you can tell whether "DoH is slow" means slow handshake to the resolver or slow query processing. Over HTTP/2 the A and AAAA queries are sent together
 - **Kernel TCP statistics** — on Linux, macOS, and Windows, samples TCP info right after connect and again after the response body is read. Shown under `--verbose` or with `--tcp-info`; surfaces RTT, MSS, cwnd, and retransmits during the request, which isolates "Content Transfer slow" into packet loss vs TCP slow start vs application latency. On Windows the retransmit counter is bytes (`BytesRetrans`), not segments. Through an HTTP/SOCKS proxy the sample reflects the client↔proxy socket, not the origin.
+- **Route trace** — `--route` lists hops to the address this request connected to, after the timings are done. A proxy is traced only as far as the proxy. Hop times are not added to `tcp_connect`, `quic_connect`, or `total`. Linux sends TCP, or UDP for HTTP/3, and reads ICMP with `IP_RECVERR`. macOS sends ICMP echo on an unprivileged socket. Windows says the trace is unavailable instead of printing a guessed path.
 - **Download throughput with slow-start split** — for response bodies larger than 1 MiB, a `Throughput: X MB/s` line is shown next to `Body size`. Under `--verbose`, it also breaks down into "first 100 KB" vs "tail" so you can tell TCP slow-start–dominated downloads from servers that simply stream slowly the whole way.
 - **Bilingual output (English / Simplified Chinese)** — `--lang en|zh` overrides the display language; when omitted, the locale is sniffed from `LC_ALL` / `LC_MESSAGES` / `LANG` (anything starting with `zh` → Chinese), with English as the safe fallback. JSON output keeps English keys so machine consumers aren't affected by user locale.
 - **JSON output** — `--json` for scripting, CI/CD pipelines, and monitoring integration. The full output contract is documented in [JSON_SCHEMA.md](./JSON_SCHEMA.md), including exit codes, optional blocks, and ready-to-use `jq` recipes
@@ -255,6 +256,7 @@ Options:
       --pretty                     pretty mode
       --waterfall                  show timing as a waterfall bar chart
       --tcp-info                   show kernel TCP_INFO stats (RTT, cwnd, retransmits); Linux, macOS, and Windows
+      --route                      trace hops to the connected address (TCP or UDP on Linux, ICMP on macOS); not included in phase timings
       --lang <LANG>                display language: en | zh (default: system)
       --timeout <TIMEOUT>          timeout for every phase (DNS, TCP, TLS, request, QUIC)
       --connect-timeout <DUR>      max time for the connection phase only (DNS + TCP + TLS/QUIC), e.g. 5s
@@ -323,6 +325,7 @@ Create `~/.httpstatrc` as a JSON object — any field can be omitted. CLI flags 
   "json": false,
   "waterfall": false,
   "tcp_info": false,
+  "route": false,
   "reuse": false,
   "lang": "en",
   "proxy": "http://proxy.example:8080",

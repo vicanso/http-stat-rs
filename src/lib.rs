@@ -13,6 +13,7 @@ mod net;
 mod proxy;
 mod quic_info;
 mod request;
+mod route;
 mod skip_verifier;
 mod stats;
 mod tcp_info;
@@ -27,6 +28,10 @@ pub use i18n::Lang;
 pub use proxy::proxy_bypassed;
 pub use quic_info::{QuicInfo, QuicInfoDelta};
 pub use request::*;
+pub use route::{
+    trace_route, RouteError, RouteHop, RouteProto, ROUTE_MACOS_DENIED, ROUTE_NO_ADDR,
+    ROUTE_UNAVAILABLE,
+};
 pub(crate) use skip_verifier::*;
 pub use stats::*;
 pub use tcp_info::{TcpInfo, TcpInfoDelta, TcpInfoProbe};

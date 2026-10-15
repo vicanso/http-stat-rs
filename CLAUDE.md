@@ -39,4 +39,5 @@ The library (`src/lib.rs`) exposes the public API through re-exports:
 - The `--resolve` flag tests multiple IPs simultaneously, sorting results so errors appear last.
 - Redirect following (`-L`) is implemented manually. `--max-redirs` caps the chain (default 10) and a repeated method+URI is treated as a loop.
 - URL schemes `grpc://` and `grpcs://` route to gRPC health check path.
+- `--route` traces the connected address after timings are recorded. Linux uses TCP, or UDP for HTTP/3, and reads hop ICMP with `IP_RECVERR`. macOS sends ICMP echo on an unprivileged datagram socket. Windows sets `route_error` and does not invent hops. Hop times stay out of `tcp_connect`, `quic_connect`, and `total`. A proxy is traced only as far as the proxy.
 - The platform trust store is read once per process (`net::root_store`) and before any timer starts: reading it takes about 80 ms on macOS. `request()` and `connect()` preload it when `net::uses_tls` says the request needs it, so a new code path that opens TLS or QUIC has to be covered there.

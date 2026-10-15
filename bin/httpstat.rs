@@ -21,9 +21,9 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::StatusCode;
 use http::Uri;
 use http_stat::{
-    connect, format_duration, proxy_bypassed, request, AltSvcCache, BenchmarkSummary, ConnectTo,
-    CookieJar, DnsCache, HttpConnection, HttpRequest, HttpStat, Lang, RedirectHop, ALPN_HTTP1,
-    ALPN_HTTP2, ALPN_HTTP3,
+    connect, format_duration, format_route, proxy_bypassed, request, trace_route, AltSvcCache,
+    BenchmarkSummary, ConnectTo, CookieJar, DnsCache, HttpConnection, HttpRequest, HttpStat, Lang,
+    RedirectHop, RouteProto, ALPN_HTTP1, ALPN_HTTP2, ALPN_HTTP3, ROUTE_NO_ADDR,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -164,6 +164,13 @@ struct Args {
         help = "show kernel TCP_INFO stats (RTT, cwnd, retransmits); Linux, macOS, and Windows"
     )]
     tcp_info: bool,
+
+    /// Trace hops to the address this request connected to.
+    #[arg(
+        long = "route",
+        help = "trace hops to the connected address (TCP or UDP on Linux, ICMP on macOS); not included in phase timings"
+    )]
+    route: bool,
 
     /// Display language. Accepts `en` / `zh` (case-insensitive). When
     /// omitted, falls back to LC_ALL / LC_MESSAGES / LANG, then English.
@@ -362,6 +369,7 @@ fn apply_config(args: &mut Args, cfg: &serde_json::Map<String, serde_json::Value
     cfg_bool!(alt_svc);
     cfg_bool!(waterfall);
     cfg_bool!(tcp_info);
+    cfg_bool!(route);
     cfg_bool!(reuse);
     // Optional strings: config fills in when CLI left them None
     cfg_opt_str!(dns_servers);
@@ -1388,14 +1396,100 @@ fn print_cold_connect(connect_stat: &HttpStat, lang: Lang) {
     );
 }
 
+fn route_uses_udp(stat: &HttpStat, h3_requested: bool) -> bool {
+    if stat.proxy_connect.is_some() || stat.proxy_handshake.is_some() {
+        return false;
+    }
+    h3_requested || stat.quic_connect.is_some() || stat.alpn.as_deref() == Some(ALPN_HTTP3)
+}
+
+fn route_sample<'a>(stats: &'a [HttpStat], cold: Option<&'a HttpStat>) -> Option<&'a HttpStat> {
+    stats
+        .iter()
+        .find(|s| s.addr.is_some())
+        .or(cold.filter(|s| s.addr.is_some()))
+}
+
+async fn fill_route(stat: &mut HttpStat, bind: Option<IpAddr>, h3_requested: bool) {
+    let Some(addr) = stat
+        .addr
+        .as_deref()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+    else {
+        stat.route_error = Some(ROUTE_NO_ADDR.to_string());
+        return;
+    };
+    let proto = if route_uses_udp(stat, h3_requested) {
+        RouteProto::Udp
+    } else {
+        RouteProto::Tcp
+    };
+    match trace_route(addr, bind, proto).await {
+        Ok(hops) => stat.route = hops,
+        Err(err) => stat.route_error = Some(err.to_string()),
+    }
+}
+
+async fn trace_sample(
+    sample: &HttpStat,
+    bind: Option<IpAddr>,
+    h3_requested: bool,
+    lang: Lang,
+) -> HttpStat {
+    let mut stat = HttpStat {
+        addr: sample.addr.clone(),
+        quic_connect: sample.quic_connect,
+        tcp_connect: sample.tcp_connect,
+        proxy_connect: sample.proxy_connect,
+        proxy_handshake: sample.proxy_handshake,
+        alpn: sample.alpn.clone(),
+        lang,
+        ..Default::default()
+    };
+    fill_route(&mut stat, bind, h3_requested).await;
+    stat
+}
+
+/// One trace for a finished run. No connected address still reports `route_error`.
+async fn trace_connected(
+    stats: &[HttpStat],
+    cold: Option<&HttpStat>,
+    bind: Option<IpAddr>,
+    h3_requested: bool,
+    lang: Lang,
+) -> HttpStat {
+    match route_sample(stats, cold) {
+        Some(sample) => trace_sample(sample, bind, h3_requested, lang).await,
+        None => HttpStat {
+            lang,
+            route_error: Some(ROUTE_NO_ADDR.to_string()),
+            ..Default::default()
+        },
+    }
+}
+
+fn merge_route(summary: &mut serde_json::Value, traced: &HttpStat) {
+    let doc = traced.to_json();
+    if let Some(route) = doc.get("route") {
+        summary["route"] = route.clone();
+    }
+    if let Some(err) = doc.get("route_error") {
+        summary["route_error"] = err.clone();
+    }
+}
+
 fn print_benchmark(
     stats: Vec<HttpStat>,
     connect_stat: Option<&HttpStat>,
     lang: Lang,
     json_output: bool,
+    route: Option<&HttpStat>,
 ) {
     if json_output {
-        let json_val = benchmark_to_json(&stats, connect_stat);
+        let mut json_val = benchmark_to_json(&stats, connect_stat);
+        if let Some(route) = route {
+            merge_route(&mut json_val, route);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&json_val).unwrap_or_default()
@@ -1405,6 +1499,9 @@ fn print_benchmark(
         println!("{summary}");
         if let Some(connect_stat) = connect_stat {
             print_cold_connect(connect_stat, lang);
+        }
+        if let Some(route) = route {
+            print!("{}", format_route(route));
         }
     }
 }
@@ -1929,6 +2026,8 @@ async fn main() {
         stat.include_headers.clone_from(&include_headers);
         stat.exclude_headers.clone_from(&exclude_headers);
     };
+    let route_bind = req.bind_addr;
+    let route_h3 = req.alpn_protocols.iter().any(|p| p == ALPN_HTTP3);
 
     if let Some(resolve) = args.resolve {
         let mut ips = vec![];
@@ -1961,14 +2060,41 @@ async fn main() {
                         cold_connect,
                         exit_code,
                     } => {
+                        let traced = if args.route {
+                            Some(
+                                trace_connected(
+                                    &stats,
+                                    cold_connect.as_ref(),
+                                    route_bind,
+                                    route_h3,
+                                    lang,
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        };
                         let mut summary = benchmark_to_json(&stats, cold_connect.as_ref());
                         summary["addr"] = serde_json::json!(SocketAddr::new(ip, port).to_string());
+                        if let Some(traced) = &traced {
+                            merge_route(&mut summary, traced);
+                        }
                         if !json_output {
-                            print_benchmark(stats, cold_connect.as_ref(), lang, false);
+                            print_benchmark(
+                                stats,
+                                cold_connect.as_ref(),
+                                lang,
+                                false,
+                                traced.as_ref(),
+                            );
                         }
                         (exit_code, summary)
                     }
                     Benchmark::ConnectFailed(mut stat) => {
+                        if args.route {
+                            stat.lang = lang;
+                            fill_route(&mut stat, route_bind, route_h3).await;
+                        }
                         if !json_output {
                             println!("{stat}");
                         }
@@ -1998,6 +2124,11 @@ async fn main() {
             run_request(req, &run_opts)
         });
         let mut stats_list = futures::future::join_all(futs).await;
+        if args.route {
+            for stat in &mut stats_list {
+                fill_route(stat, route_bind, route_h3).await;
+            }
+        }
         // error request last
         stats_list.sort_by(|item1, item2| {
             let value1 = item1.error.is_some();
@@ -2044,9 +2175,27 @@ async fn main() {
                 exit_code: code,
             } => {
                 exit_code = code;
-                print_benchmark(stats, cold_connect.as_ref(), lang, json_output);
+                let traced = if args.route {
+                    Some(
+                        trace_connected(&stats, cold_connect.as_ref(), route_bind, route_h3, lang)
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                print_benchmark(
+                    stats,
+                    cold_connect.as_ref(),
+                    lang,
+                    json_output,
+                    traced.as_ref(),
+                );
             }
             Benchmark::ConnectFailed(mut connect_stat) => {
+                if args.route {
+                    connect_stat.lang = lang;
+                    fill_route(&mut connect_stat, route_bind, route_h3).await;
+                }
                 if json_output {
                     json_view(&mut connect_stat);
                     println!(
@@ -2061,6 +2210,9 @@ async fn main() {
         }
     } else {
         let mut stat = run_request(req, &run_opts).await;
+        if args.route {
+            fill_route(&mut stat, route_bind, route_h3).await;
+        }
         if json_output {
             json_view(&mut stat);
             println!(
@@ -2148,6 +2300,7 @@ mod tests {
             "connect_to": ["a:1:b:2"],
             "waterfall": true,
             "tcp_info": true,
+            "route": true,
             "lang": "zh",
             "reuse": true,
             "concurrency": 4,
@@ -2159,6 +2312,7 @@ mod tests {
         assert_eq!(args.connect_to, vec!["a:1:b:2".to_string()]);
         assert!(args.waterfall);
         assert!(args.tcp_info);
+        assert!(args.route);
         assert_eq!(args.lang.as_deref(), Some("zh"));
         assert!(args.reuse);
         assert_eq!(args.concurrency, Some(4));

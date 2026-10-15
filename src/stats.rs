@@ -17,6 +17,7 @@
 
 use crate::i18n::Lang;
 use crate::quic_info::{QuicInfo, QuicInfoDelta};
+use crate::route::RouteHop;
 use crate::tcp_info::{TcpInfo, TcpInfoDelta};
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -239,6 +240,11 @@ pub struct HttpStat {
     /// Happy Eyeballs candidates, in the order they were raced. Empty when
     /// there was only one address.
     pub candidates: Vec<String>,
+    /// Hop-by-hop trace of `addr`. Empty unless `--route` ran.
+    /// Not part of `tcp_connect`, `quic_connect`, or `total`.
+    pub route: Vec<RouteHop>,
+    /// Why `--route` produced no hops. The request's own `error` stays unchanged.
+    pub route_error: Option<String>,
     pub quic_info_post_connect: Option<QuicInfo>,
     pub quic_info_final: Option<QuicInfo>,
     /// Leaf certificate NotAfter as a unix timestamp. Drives the expiry warning.
@@ -1077,6 +1083,12 @@ impl HttpStat {
         if self.dns_cached {
             obj.insert("dns_cached".into(), json!(true));
         }
+        if !self.route.is_empty() {
+            obj.insert("route".into(), route_json(&self.route));
+        }
+        if let Some(err) = &self.route_error {
+            obj.insert("route_error".into(), json!(err));
+        }
 
         // Server-Timing entries (RFC 8673)
         if let Some(entries) = &self.server_timing {
@@ -1257,6 +1269,61 @@ impl HttpStat {
 
         Value::Object(obj)
     }
+}
+
+fn route_json(hops: &[RouteHop]) -> Value {
+    Value::Array(
+        hops.iter()
+            .map(|hop| {
+                json!({
+                    "ttl": hop.ttl,
+                    "addr": hop.addr,
+                    "rtt_us": hop.rtt.map(|d| d.as_micros() as u64),
+                    "timeout": hop.timeout,
+                    "reached": hop.reached,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Terminal block for `--route`. Empty when the flag was not used.
+pub fn format_route(stat: &HttpStat) -> String {
+    struct Block<'a>(&'a HttpStat);
+    impl fmt::Display for Block<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_route(f, self.0)
+        }
+    }
+    format!("{}", Block(stat))
+}
+
+fn write_route(f: &mut fmt::Formatter<'_>, stat: &HttpStat) -> fmt::Result {
+    if stat.route.is_empty() && stat.route_error.is_none() {
+        return Ok(());
+    }
+    let s = stat.lang.strings();
+    writeln!(f, "{}", LightGreen.paint(s.route_heading))?;
+    if let Some(err) = &stat.route_error {
+        writeln!(f, "  {}", LightYellow.paint(err))?;
+    }
+    for hop in &stat.route {
+        let addr = hop.addr.as_deref().unwrap_or("*");
+        if hop.timeout {
+            // `*` is the traceroute mark for a hop that sent no ICMP reply.
+            writeln!(f, "  {:>2}  {}", hop.ttl, LightCyan.paint(addr))?;
+        } else {
+            writeln!(
+                f,
+                "  {:>2}  {}  {}",
+                hop.ttl,
+                LightCyan.paint(addr),
+                format_duration(hop.rtt.unwrap_or_default())
+            )?;
+        }
+    }
+    writeln!(f)?;
+    Ok(())
 }
 
 impl fmt::Display for HttpStat {
@@ -1940,6 +2007,7 @@ impl fmt::Display for HttpStat {
                 LightCyan.paint(format_duration(chain))
             )?;
         }
+        write_route(f, self)?;
 
         if let Some(raw) = &self.body {
             let status = self.status.unwrap_or(StatusCode::OK).as_u16();
@@ -2739,6 +2807,55 @@ mod tests {
             CertExpiry::Expired { days: 2 }
         );
         assert_eq!(cert_expiry(now, now), CertExpiry::Expiring { days: 0 });
+    }
+
+    #[test]
+    fn route_json_is_separate_from_phase_timings() {
+        let stat = HttpStat {
+            tcp_connect: Some(Duration::from_millis(12)),
+            total: Some(Duration::from_millis(40)),
+            route: vec![RouteHop {
+                ttl: 1,
+                addr: Some("192.0.2.1".into()),
+                rtt: Some(Duration::from_micros(1500)),
+                timeout: false,
+                reached: true,
+            }],
+            route_error: None,
+            ..Default::default()
+        };
+        let v = stat.to_json();
+        assert_eq!(v["timing"]["tcp_connect_us"], json!(12_000));
+        assert_eq!(v["route"][0]["ttl"], json!(1));
+        assert_eq!(v["route"][0]["addr"], json!("192.0.2.1"));
+        assert_eq!(v["route"][0]["rtt_us"], json!(1500));
+        assert_eq!(v["route"][0]["reached"], json!(true));
+        assert!(v.get("route_error").is_none());
+
+        let failed = HttpStat {
+            route_error: Some("route trace is unavailable on this operating system".into()),
+            ..Default::default()
+        };
+        let err = failed.to_json();
+        assert!(err.get("route").is_none());
+        assert!(err["route_error"].as_str().unwrap().contains("unavailable"));
+        assert!(format_route(&failed).contains("unavailable"));
+
+        let silent = HttpStat {
+            route: vec![RouteHop {
+                ttl: 7,
+                addr: None,
+                rtt: None,
+                timeout: true,
+                reached: false,
+            }],
+            ..Default::default()
+        };
+        let text = format_route(&silent);
+        assert!(text.contains('*'));
+        assert!(!text.contains("timeout"));
+        assert!(!text.contains("超时"));
+        assert_eq!(silent.to_json()["route"][0]["timeout"], json!(true));
     }
 
     #[test]

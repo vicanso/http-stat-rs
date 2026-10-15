@@ -62,6 +62,7 @@ Before drawing a conclusion:
   - With 10 samples p95 and p99 are simply the slowest one. Raise N before quoting a tail.
 - `-n N -K`: the same summary for requests on one reused connection, plus `cold_connect` for the one-off setup. `timing.dns_lookup`, `tcp_connect` and `tls_handshake` are `null` and `timing.total` covers the request alone.
 - `-L`: adds `redirects`, one entry per hop with its own timings, and `timing.chain_total_us`.
+- `--route`: adds `route`, one entry per network hop to `addr`. Linux uses TCP, or UDP for HTTP/3. macOS uses ICMP echo and does not need root. A proxy stops at the proxy. Hop RTTs are not part of `timing`. A silent hop is `timeout: true` and the terminal shows `*`. Windows sets `route_error` and leaves `route` out. With `-n` the trace is once, on the summary.
 
 ## Recipes
 
@@ -100,6 +101,9 @@ httpstat --json -X POST -H 'Content-Type: application/json' -d @body.json https:
 
 # Follow redirects and time every hop
 httpstat --json -L http://example.com/
+
+# Hops between this machine and the server. Linux and macOS fill `route`; Windows sets `route_error`
+httpstat --json --route https://example.com/ | jq '{addr, route, route_error}'
 
 # gRPC health check, whole server or one service
 httpstat --json grpc://localhost:50051

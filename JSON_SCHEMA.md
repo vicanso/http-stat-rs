@@ -32,6 +32,8 @@ the terminal renderer only.
   "quic_info":     { /* present for HTTP/3 when at least one path sample was taken */ },
   "redirects":     [ /* present when -L followed at least one hop */ ],
   "candidates":    [ /* present when more than one address was raced */ ],
+  "route":         [ /* present when --route produced hops */ ],
+  "route_error":   "string | omitted",
   "dns_cached":    true,
   "server_timing": [ /* present if the server sent any Server-Timing entries */ ],
   "alt_svc":       [ /* present if the server sent any Alt-Svc entries */ ],
@@ -217,6 +219,7 @@ parseable `max-age`.
 | `saved_to` | string | Path written by streaming `-o`. Omitted when the body was not streamed to disk. |
 | `dns_cached` | boolean | Present and `true` only when `-n` served this address from the process DNS cache. Omitted on a live lookup. |
 | `candidates` | array of strings | Socket addresses in Happy Eyeballs race order (`ip:port` or `[ipv6]:port`). Omitted when there was only one address. |
+| `route_error` | string | Why `--route` produced no hops. Omitted when the trace ran or was not requested. The request's `error` is unchanged. |
 | `error` | string \| null | Human-readable error string when the request failed. |
 | `exit_code` | integer | Process exit code (see table below). Always present. |
 
@@ -242,6 +245,30 @@ phase did not run):
 | `server_processing_us` | integer \| null | Time to first response byte. |
 | `content_transfer_us` | integer \| null | Body read time. |
 | `total_us` | integer \| null | That hop's wall time. |
+
+## `route` (array)
+
+Present when `--route` traced at least one hop. This is a separate probe
+run after the request timings are recorded. It is the path to `addr` (the
+connected peer, or the resolved address when connect did not finish).
+HTTP/3 traces UDP; other requests trace TCP. A proxied request traces only
+as far as the proxy. These RTTs are not included in `timing`.
+
+On Linux each probe is one TCP or UDP packet (UDP for HTTP/3) with a rising
+TTL, and ICMP Time Exceeded is read with `IP_RECVERR`. On macOS each probe is
+an ICMP echo with a rising TTL; opening the socket does not require root. A
+hop that does not answer is `timeout: true` and the probe continues, up to 30
+hops. The terminal prints `*` for that hop and does not add a timeout label.
+Windows omits `route` and sets `route_error` to `route trace is unavailable on this operating system`.
+If macOS refuses the ICMP socket, `route_error` is `route trace on macOS could not open an ICMP socket; re-run this command with sudo`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ttl` | integer | Probe TTL, starting at 1. |
+| `addr` | string \| null | Router or destination IP. `null` when the hop timed out or the ICMP source was empty. |
+| `rtt_us` | integer \| null | Time until the reply. `null` on timeout. |
+| `timeout` | boolean | No reply arrived within 1 second. |
+| `reached` | boolean | This probe reached the destination host. |
 
 ## Exit codes
 
@@ -367,6 +394,9 @@ out of `timing`: only requests that got a response are timed.
 
 With `--resolve`, `-n` runs once per address and the document is an array of
 these summaries, each with an `addr`.
+
+`--route` adds one `route` array (or `route_error`) for the address that run
+connected to. It is not repeated per request.
 
 ```jsonc
 {
